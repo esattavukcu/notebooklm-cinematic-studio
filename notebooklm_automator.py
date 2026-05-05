@@ -328,35 +328,45 @@ def _dump_video_overview_debug(page: Page) -> None:
 
 
 def select_cinematic_video_overview(page: Page) -> None:
-    log("Sağ panelde Video Overview > Cinematic aranıyor...")
+    log("Sağ Studio panelinde 'Video' veya 'Video Overview' kartı aranıyor...")
 
-    # Source işlendikten sonra studio panelinin gelmesi için bekle
+    # Source işlendikten sonra Studio panelinin gelmesi için bekle
     page.wait_for_timeout(3000)
 
-    # 1) Video Overview kartını/customize butonunu aç
-    # NotebookLM'de Video Overview kartında bir "Customize"/ayar ikonu var.
-    # Önce customize'ı dene, olmazsa kartın kendisine tıkla.
-    customize_selectors = [
+    # "Video" ve "Video Overview" — ikisini de dene, hangisi varsa o tıklanır.
+    # Önce ARIA-label tabanlı kesin eşleşmeler, sonra metin tabanlı.
+    selectors = [
+        # ARIA label kesin eşleşme (en güvenilir)
+        '[aria-label="Video"]',
+        '[aria-label="Video Overview"]',
+        'button[aria-label="Video"]',
+        'button[aria-label="Video Overview"]',
+        # Studio kart yapısı
+        'mat-card:has-text("Video Overview")',
+        'mat-card:has-text("Video"):not(:has-text("Files")):not(:has-text("file"))',
+        # Tıklanabilir öğe
+        '[role="button"]:has-text("Video Overview")',
+        '[role="button"]:has-text("Video"):not(:has-text("Files"))',
+        'button:has-text("Video Overview")',
+        'button:has-text("Video"):not(:has-text("Files"))',
+        # Customize/options ikonu (varsa)
         'button[aria-label*="customize" i][aria-label*="video" i]',
-        'button[aria-label*="video overview options" i]',
-        'button[aria-label*="more" i][aria-label*="video" i]',
-        'mat-card:has-text("Video Overview") button[aria-label*="customize" i]',
-        'mat-card:has-text("Video Overview") button[aria-label*="more" i]',
-        'mat-card:has-text("Video Overview") button[aria-label*="settings" i]',
-        ':text("Video Overview") >> xpath=ancestor::*[self::mat-card or self::div][1]//button[contains(@aria-label,"ustomize") or contains(@aria-label,"ettings") or contains(@aria-label,"ore")]',
+        'button[aria-label*="video options" i]',
+        # En geniş — text-is exact match
+        ':text-is("Video Overview")',
+        ':text-is("Video")',
     ]
-    opened = click_first_visible(page, customize_selectors, timeout=4000)
-    if not opened:
-        # Kart üstündeki herhangi bir tıklanabilir hedefe (başlık dahil) tıkla
-        fallback_selectors = [
-            'mat-card:has-text("Video Overview")',
-            'button:has-text("Video Overview")',
-            'div[role="button"]:has-text("Video Overview")',
-            ':text("Video Overview")',
-        ]
-        click_first_visible(page, fallback_selectors, timeout=5000)
 
-    page.wait_for_timeout(2000)
+    if not click_first_visible(page, selectors, timeout=8000):
+        _dump_video_overview_debug(page)
+        raise RuntimeError(
+            "Studio'da 'Video' veya 'Video Overview' kartı bulunamadı. "
+            "Yukarıdaki VIDEO OVERVIEW DEBUG çıktısındaki gerçek metni "
+            "paylaşırsan selector ekleyebilirim."
+        )
+
+    log("Video kartı tıklandı, açılan panel bekleniyor...")
+    page.wait_for_timeout(2500)
 
     # 2) Açılan menü/dialog/expanded panelde Cinematic seçeneğini bul
     cinematic_selectors = [
@@ -394,20 +404,24 @@ def select_cinematic_video_overview(page: Page) -> None:
 
 def click_generate(page: Page) -> None:
     log("Generate butonuna basılıyor...")
+    # Önemli: "Create" tek başına çok geniş bir selector — üstteki
+    # "+ Create notebook" butonunu yanlış matchliyor. Daha spesifik olalım.
     generate_selectors = [
-        # Video Overview / Cinematic dialog içindekini önce dene
+        # Video panel içindekini önce dene
         '[role="dialog"] button:has-text("Generate")',
         'mat-dialog-container button:has-text("Generate")',
         '[aria-modal="true"] button:has-text("Generate")',
-        '[role="dialog"] button:has-text("Oluştur")',
         '[role="dialog"] button:has-text("Create video")',
-        # Sonra genel
+        '[role="dialog"] button:has-text("Oluştur")',
+        # Specific Generate buttons
+        'button[aria-label="Generate"]',
+        'button[aria-label*="generate video" i]',
+        'button:has-text("Generate"):not(:has-text("notebook"))',
+        # Üst-toplevel Generate
         'button:has-text("Generate")',
-        'button:has-text("Oluştur")',
         'button:has-text("Create video")',
-        'button:has-text("Create")',
-        '[aria-label*="generate" i]',
-        '[aria-label*="oluştur" i]',
+        'button:has-text("Oluştur")',
+        '[aria-label*="generate" i]:not([aria-label*="notebook" i])',
     ]
     if not click_first_visible(page, generate_selectors, timeout=10000):
         raise RuntimeError("'Generate' butonu bulunamadı.")

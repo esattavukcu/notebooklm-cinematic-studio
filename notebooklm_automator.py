@@ -583,19 +583,30 @@ def _save_storage_state(context, profile_dir: Path) -> bool:
 
 def run_init(profile_dir: Path) -> None:
     """Profili login için aç. Kullanıcı login olunca pencereyi kapatır.
-    Login state hem persistent profile'a hem auth.json'a kaydedilir."""
+    Login state hem persistent profile'a hem auth.json'a kaydedilir.
+    Bu modda download'lar otomatik ~/Downloads'a kaydedilir (manuel kullanım için)."""
     profile_dir.mkdir(parents=True, exist_ok=True)
     log(f"Login modu — profil: {profile_dir}")
     log("Açılan tarayıcıda Google hesabınla giriş yap, sonra pencereyi kapat.")
+    log("Bu modda indirdiğin her dosya ~/Downloads klasörüne otomatik kaydedilecek.")
     emit("init_started", profile_dir=str(profile_dir))
+
+    user_downloads = Path.home() / "Downloads"
 
     with sync_playwright() as pw:
         context = pw.chromium.launch_persistent_context(
             user_data_dir=str(profile_dir),
             headless=False,
             viewport={"width": 1280, "height": 850},
-            args=["--disable-blink-features=AutomationControlled"],
+            args=[
+                "--disable-blink-features=AutomationControlled",
+                "--disable-features=DownloadBubble,DownloadBubbleV2",
+            ],
+            accept_downloads=True,
         )
+        # Login modunda download'lar ~/Downloads'a otomatik kaydedilsin
+        _attach_download_handler(context, user_downloads)
+
         page = context.pages[0] if context.pages else context.new_page()
         page.goto(NOTEBOOKLM_URL, wait_until="domcontentloaded", timeout=60000)
         log("Tarayıcı açık. Login olduktan sonra pencereyi kapatın.")
@@ -640,7 +651,33 @@ def run_init(profile_dir: Path) -> None:
 # ------------------------------------------------------------------
 # Ana akış
 # ------------------------------------------------------------------
-def _open_browser(pw, profile_dir: Path, headless: bool):
+def _attach_download_handler(context, dest_dir: Path) -> None:
+    """Chromium'da herhangi bir download başlarsa otomatik dest_dir'e kaydet.
+
+    Bu sayede manuel tıklamalar veya bizim tıklamadığımız download'lar bile
+    kaybolmaz (Playwright default'unda non-saved download'lar uçar)."""
+    dest_dir.mkdir(parents=True, exist_ok=True)
+
+    def on_download(download):
+        try:
+            suggested = download.suggested_filename or "download.bin"
+            # Sanitize + prefix timestamp
+            safe = re.sub(r"[^\w\s.\-çğıöşüÇĞİÖŞÜ]", "", suggested, flags=re.UNICODE)
+            ts = time.strftime("%Y%m%d_%H%M%S")
+            target = dest_dir / f"{ts}_{safe}"
+            download.save_as(str(target))
+            log(f"[auto-download] kaydedildi: {target}")
+            emit("video_downloaded", path=str(target), trigger="auto_handler")
+        except Exception as e:
+            log(f"[auto-download] HATA: {e}")
+
+    try:
+        context.on("download", on_download)
+    except Exception as e:
+        log(f"download handler eklenemedi: {e}")
+
+
+def _open_browser(pw, profile_dir: Path, headless: bool, download_dir: Optional[Path] = None):
     """Profile uygun şekilde browser/context aç.
 
     auth.json varsa: non-persistent (paralel-friendly).
@@ -652,23 +689,33 @@ def _open_browser(pw, profile_dir: Path, headless: bool):
     if parallel_mode:
         browser = pw.chromium.launch(
             headless=headless,
-            args=["--disable-blink-features=AutomationControlled"],
+            args=[
+                "--disable-blink-features=AutomationControlled",
+                "--disable-features=DownloadBubble,DownloadBubbleV2",
+            ],
         )
         context = browser.new_context(
             viewport={"width": 1440, "height": 900},
             storage_state=str(auth_path),
             accept_downloads=True,
         )
-        return browser, context, parallel_mode
+    else:
+        browser = None
+        context = pw.chromium.launch_persistent_context(
+            user_data_dir=str(profile_dir),
+            headless=headless,
+            viewport={"width": 1440, "height": 900},
+            args=[
+                "--disable-blink-features=AutomationControlled",
+                "--disable-features=DownloadBubble,DownloadBubbleV2",
+            ],
+            accept_downloads=True,
+        )
 
-    context = pw.chromium.launch_persistent_context(
-        user_data_dir=str(profile_dir),
-        headless=headless,
-        viewport={"width": 1440, "height": 900},
-        args=["--disable-blink-features=AutomationControlled"],
-        accept_downloads=True,
-    )
-    return None, context, parallel_mode
+    if download_dir is not None:
+        _attach_download_handler(context, download_dir)
+
+    return browser, context, parallel_mode
 
 
 def run(
@@ -700,7 +747,7 @@ def run(
     )
 
     with sync_playwright() as pw:
-        browser, context, _ = _open_browser(pw, profile_dir, headless)
+        browser, context, _ = _open_browser(pw, profile_dir, headless, download_dir=download_dir)
         page = context.pages[0] if context.pages else context.new_page()
 
         try:
@@ -801,7 +848,7 @@ def run_check_download(
     emit("followup_started", notebook_url=notebook_url)
 
     with sync_playwright() as pw:
-        browser, context, _ = _open_browser(pw, profile_dir, headless)
+        browser, context, _ = _open_browser(pw, profile_dir, headless, download_dir=download_dir)
         page = context.pages[0] if context.pages else context.new_page()
         try:
             page.goto(notebook_url, wait_until="domcontentloaded", timeout=60000)

@@ -2,11 +2,15 @@
 
 NotebookLM'de **birden fazla Google hesabı** üzerinden, **çoklu metin kuyruğu** ile **paralel** Cinematic videolar üretir, **otomatik indirir**. Native macOS uygulaması olarak veya CLI/web olarak çalıştırılabilir.
 
-## 📦 İndir (kullanıcı için)
+## 📦 İndir (kullanıcı için — git GEREKMEZ)
 
-→ **[Latest release](https://github.com/esattavukcu/notebooklm-cinematic-studio/releases/latest)** sayfasında `NotebookLM-Cinematic-Studio-vX.Y.Z.zip` dosyasını indir, aç, **Sağ tık → Aç → Aç** (Gatekeeper bir kere sorar). İlk açılışta ~2 dk kurulum yapar.
+1. → **[Latest release](https://github.com/esattavukcu/notebooklm-cinematic-studio/releases/latest)** sayfasını aç
+2. **Assets** altında `.zip` dosyasını tıkla — indirilir
+3. Zip'i çift tıklayıp aç (`.app` çıkar)
+4. `.app`'e **Sağ tık → Aç → Aç** (Gatekeeper bir kez sorar, sonra bir daha sormaz)
+5. İlk açılışta ~2 dk kurulum yapar (Python venv + Chromium), bittiğinde uygulama açılır
 
-> **Not:** Repo private — Mustafa ya da başka biri indirmek için repo'ya **collaborator** olarak eklenmiş olmalı: [Settings → Collaborators](https://github.com/esattavukcu/notebooklm-cinematic-studio/settings/access).
+**Otomatik güncelleme:** Uygulama her açılışta GitHub'dan yeni sürüm var mı diye bakar. Varsa kendisi indirip günceller, kullanıcı yeniden kullanır gibi devam eder. Git, terminal ya da herhangi bir ekstra araç gerekmez.
 
 ## Özellikler
 
@@ -79,47 +83,32 @@ veya doğrudan:
 5. **Durum sekmesi:** Job'lar canlı: queued → running → done (veya submitted/failed). 3 sn'de bir yenilenir.
 6. **Videolar sekmesi:** İndirilen .mp4'ler. Tek tıkla download.
 
-## Auto-update (git pull)
+## Auto-update (HTTP-based)
 
 Repo: **https://github.com/esattavukcu/notebooklm-cinematic-studio**
 
-`.app` her açılışta `~/Library/Application Support/NotebookLM Cinematic Studio/` klasöründe `git pull` çalıştırır. Yeni sürüm yayınlamak için sen ana repo'ya `git push` yaparsın; ekibin uygulamayı bir sonraki açtığında otomatik güncel kod gelir.
+Launcher her açılışta GitHub Releases API'sine bakar. Yeni sürüm varsa:
+1. Yeni `.zip` indirilir (kullanıcı bekler, max ~30 sn)
+2. `.app` içinden source dosyaları `~/Library/Application Support/NotebookLM Cinematic Studio/`'a kopyalanır (data/, chrome_profiles/, .venv/ korunur)
+3. `.installed_version` güncellenir
+4. macOS bildirimi: "Güncellendi: vX.Y.Z"
+5. Uygulama yeni source ile açılır
 
-### Mustafa için — tek seferlik kurulum
-
-`.app`'i bir kere açıp kapattıktan sonra (Application Support klasörü oluşmuş olur):
-
-```bash
-cd "$HOME/Library/Application Support/NotebookLM Cinematic Studio"
-
-# Mevcut data ve profilleri yedekle
-mv data data.backup 2>/dev/null || true
-mv chrome_profiles chrome_profiles.backup 2>/dev/null || true
-
-# Repo'yu clone et
-git init
-git remote add origin https://github.com/esattavukcu/notebooklm-cinematic-studio.git
-git fetch origin main
-git reset --hard origin/main
-
-# Yedekleri geri koy
-mv data.backup data 2>/dev/null || true
-mv chrome_profiles.backup chrome_profiles 2>/dev/null || true
-```
-
-Bu kuruluyu yaptıktan sonra her `.app` açılışında `git pull` ile otomatik günceller.
+Git ya da terminal gerekmez.
 
 ### Sen — yeni sürüm yayınlamak
 
-Geliştirme yaptığın klasörde:
-
 ```bash
-git add -u
-git commit -m "fix: ..."
-git push
+# Geliştirme dizininde
+git add -u && git commit -m "fix: ..." && git push
+git tag v0.5.0 && git push --tags
 ```
 
-Git repo'sunda commit yoksa `.app` bundle source'undan çalışır (auto-update sessizce atlanır).
+Tag push'u GitHub Actions'ı tetikler. Actions macOS runner'ında `.app`'i build eder, zip'ler, otomatik release oluşturur.
+
+Mustafa app'i bir sonraki açtığında HTTP üzerinden yeni release'i indirir, kendini günceller, çalışmaya devam eder.
+
+> **Önemli:** Auto-update'in çalışması için repo **public** olmalı (GitHub API anonim erişim). Private bırakırsan launcher API'ye 401 alır, sessizce atlar — bu durumda kullanıcı her sürümde yeni `.app`'i manuel indirmek zorunda kalır.
 
 ## Mimari
 

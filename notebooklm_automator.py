@@ -693,6 +693,8 @@ def run_init(profile_dir: Path) -> None:
     Bu modda download'lar otomatik ~/Downloads'a kaydedilir (manuel kullanım için)."""
     profile_dir.mkdir(parents=True, exist_ok=True)
     log(f"Login modu — profil: {profile_dir}")
+    # Önceki çalışmadan kalan lock'ları temizle
+    _cleanup_profile_locks(profile_dir)
     log("Açılan tarayıcıda Google hesabınla giriş yap, sonra pencereyi kapat.")
     log("Bu modda indirdiğin her dosya ~/Downloads klasörüne otomatik kaydedilecek.")
     emit("init_started", profile_dir=str(profile_dir))
@@ -808,6 +810,30 @@ def _attach_download_handler(context, dest_dir: Path) -> None:
         log(f"[download-handler] kuruluş hatası: {e}")
 
 
+def _cleanup_profile_locks(profile_dir: Path) -> None:
+    """Önceki çalışmadan kalan Chromium lock dosyalarını temizle.
+
+    Chromium çakılırsa SingletonLock/SingletonCookie/SingletonSocket dosyaları
+    profil klasöründe kalır. Yeni Chromium instance bunları görüp 'profil
+    kullanılıyor' diye reddeder. Burada zorla temizleyelim.
+    """
+    if not profile_dir.exists():
+        return
+    lock_names = [
+        "SingletonLock", "SingletonCookie", "SingletonSocket",
+        "lockfile", ".org.chromium.Chromium.lock",
+    ]
+    for name in lock_names:
+        lock_file = profile_dir / name
+        try:
+            # Symlink olabilir, hem unlink hem rm dene
+            if lock_file.is_symlink() or lock_file.exists():
+                lock_file.unlink(missing_ok=True)
+                log(f"Stale lock temizlendi: {name}")
+        except Exception as e:
+            log(f"Lock silinemedi ({name}): {e}")
+
+
 def _open_browser(pw, profile_dir: Path, headless: bool, download_dir: Optional[Path] = None):
     """Profile uygun şekilde browser/context aç.
 
@@ -816,6 +842,10 @@ def _open_browser(pw, profile_dir: Path, headless: bool, download_dir: Optional[
     """
     auth_path = profile_dir / "auth.json"
     parallel_mode = auth_path.exists()
+
+    # Persistent context kullanırken profile dir'deki stale lock'ları temizle
+    if not parallel_mode:
+        _cleanup_profile_locks(profile_dir)
 
     if parallel_mode:
         browser = pw.chromium.launch(

@@ -717,8 +717,11 @@ def run_init(profile_dir: Path) -> None:
         page.goto(NOTEBOOKLM_URL, wait_until="domcontentloaded", timeout=60000)
         log("Tarayıcı açık. Login olduktan sonra pencereyi kapatın.")
 
-        # Login tespitinde periyodik olarak auth.json'a kaydet
-        # (kullanıcı pencereyi kapattığında context erişilemez olabilir)
+        # Login tespitinde periyodik olarak auth.json'a kaydet.
+        # Önemli: time.sleep yerine page.wait_for_timeout kullanıyoruz —
+        # böylece Playwright event handler'ları (özellikle download) bekleme
+        # sırasında işlenebilir. time.sleep main thread'i bloklayıp event'leri
+        # kuyruğa atıyordu.
         last_save = 0.0
         try:
             while True:
@@ -734,7 +737,12 @@ def run_init(profile_dir: Path) -> None:
                                 last_save = time.time()
                 except Exception:
                     pass
-                time.sleep(2)
+                # 2 saniye bekle — bu sırada Playwright event'leri pump edilir
+                try:
+                    page.wait_for_timeout(2000)
+                except Exception:
+                    # Page kapatıldıysa wait_for_timeout hata verebilir
+                    break
         except Exception:
             pass
 
@@ -763,24 +771,41 @@ def _attach_download_handler(context, dest_dir: Path) -> None:
     Bu sayede manuel tıklamalar veya bizim tıklamadığımız download'lar bile
     kaybolmaz (Playwright default'unda non-saved download'lar uçar)."""
     dest_dir.mkdir(parents=True, exist_ok=True)
+    log(f"[download-handler] kuruluyor — hedef klasör: {dest_dir}")
 
     def on_download(download):
+        log(f"[download-handler] EVENT TETİKLENDİ! url={download.url[:80]}")
         try:
             suggested = download.suggested_filename or "download.bin"
-            # Sanitize + prefix timestamp
+            log(f"[download-handler] suggested_filename: {suggested}")
+            # Sanitize + prefix timestamp (eğer aynı isimden varsa)
             safe = re.sub(r"[^\w\s.\-çğıöşüÇĞİÖŞÜ]", "", suggested, flags=re.UNICODE)
-            ts = time.strftime("%Y%m%d_%H%M%S")
-            target = dest_dir / f"{ts}_{safe}"
+            target = dest_dir / safe
+            if target.exists():
+                ts = time.strftime("%Y%m%d_%H%M%S")
+                target = dest_dir / f"{ts}_{safe}"
+            log(f"[download-handler] save_as başlıyor → {target}")
             download.save_as(str(target))
-            log(f"[auto-download] kaydedildi: {target}")
+            log(f"[download-handler] ✓ KAYDEDİLDİ: {target}")
+            log(f"[download-handler] dosya boyutu: {target.stat().st_size} byte")
             emit("video_downloaded", path=str(target), trigger="auto_handler")
+            # macOS bildirimi
+            try:
+                os.system(
+                    f'''osascript -e 'display notification "{target.name}" with title "İndirme tamamlandı"' '''
+                )
+            except Exception:
+                pass
         except Exception as e:
-            log(f"[auto-download] HATA: {e}")
+            log(f"[download-handler] ✗ HATA: {type(e).__name__}: {e}")
+            import traceback
+            log(traceback.format_exc())
 
     try:
         context.on("download", on_download)
+        log(f"[download-handler] event listener kayıt edildi")
     except Exception as e:
-        log(f"download handler eklenemedi: {e}")
+        log(f"[download-handler] kuruluş hatası: {e}")
 
 
 def _open_browser(pw, profile_dir: Path, headless: bool, download_dir: Optional[Path] = None):

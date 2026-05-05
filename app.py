@@ -849,8 +849,9 @@ with tab_compose:
                 if selected:
                     remaining = [d for d in drafts if d.id not in selected]
                     save_drafts(remaining)
-                    for sid in selected:
-                        st.session_state.pop(f"draft_chk_{sid}", None)
+                    # Widget key'leri (draft_chk_*) instantiate edildikten
+                    # sonra session_state'ten silinemez. Drafts silindikçe
+                    # checkbox'lar bir sonraki rerun'da otomatik kaybolur.
                     st.success(f"{len(selected)} içerik silindi.")
                     st.rerun()
 
@@ -939,9 +940,11 @@ with tab_compose:
                 if queue_after_keep:
                     remaining = [d for d in drafts_now if d.id not in selected_ids]
                     save_drafts(remaining)
-                for sid in selected_ids:
-                    st.session_state.pop(f"draft_chk_{sid}", None)
-                st.session_state["select_all_drafts"] = False
+                # NOT: widget key'leri (select_all_drafts, draft_chk_*) widget
+                # instantiate edildikten sonra session_state'ten modify edilemez.
+                # queue_after_keep=True ise drafts zaten silindi → checkbox'lar
+                # otomatik kaybolur. False ise checkbox'lar işaretli kalır,
+                # kullanıcı isterse kendisi açar.
                 st.success(f"{added} içerik kuyruğa eklendi.")
                 st.rerun()
 

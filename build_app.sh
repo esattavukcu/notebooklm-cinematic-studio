@@ -233,7 +233,7 @@ if [ ! -x ".venv/bin/python" ]; then
   "$PYTHON_BIN" -m venv .venv
   ./.venv/bin/pip install --upgrade pip --quiet
   ./.venv/bin/pip install -r requirements.txt --quiet
-  ./.venv/bin/playwright install chromium --quiet
+  ./.venv/bin/playwright install chromium  # --quiet bu CLI'da yok, çıktıyı log dosyasında bırakıyoruz
   osascript -e 'display notification "Kurulum tamam, başlatılıyor..." with title "NotebookLM Cinematic"' 2>/dev/null &
 fi
 

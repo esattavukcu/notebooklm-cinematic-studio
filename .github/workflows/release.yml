@@ -1,4 +1,4 @@
-name: Build and Release .app
+name: Release source zip
 
 on:
   push:
@@ -10,11 +10,10 @@ permissions:
   contents: write
 
 jobs:
-  build:
-    runs-on: macos-latest
+  release:
+    runs-on: ubuntu-latest
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
 
       - name: Read version from tag
         id: ver
@@ -25,21 +24,24 @@ jobs:
             VER="dev-$(date +%Y%m%d-%H%M)"
           fi
           echo "version=$VER" >> "$GITHUB_OUTPUT"
-          echo "Building version: $VER"
 
-      - name: Build .app
+      - name: Create source zip
         run: |
-          chmod +x build_app.sh
-          ./build_app.sh
-
-      - name: Zip .app
-        run: |
-          ZIP_NAME="NotebookLM-Cinematic-Studio-${{ steps.ver.outputs.version }}.zip"
-          zip -ry "$ZIP_NAME" "NotebookLM Cinematic Studio.app"
+          ZIP_NAME="notebooklm-cinematic-studio-${{ steps.ver.outputs.version }}.zip"
+          mkdir -p _dist
+          rsync -a \
+            --exclude='.git' --exclude='.github' --exclude='.venv' \
+            --exclude='__pycache__' --exclude='data' \
+            --exclude='chrome_profile' --exclude='chrome_profiles' \
+            --exclude='*.zip' --exclude='*.app' --exclude='_dist' \
+            --exclude='.installed_version' --exclude='launcher.log' \
+            --exclude='_video_frames' \
+            ./ _dist/notebooklm-cinematic-studio/
+          (cd _dist && zip -qr "../$ZIP_NAME" notebooklm-cinematic-studio)
           ls -la "$ZIP_NAME"
           echo "ZIP_NAME=$ZIP_NAME" >> $GITHUB_ENV
 
-      - name: Upload artifact (workflow_dispatch için)
+      - name: Upload artifact
         if: github.event_name == 'workflow_dispatch'
         uses: actions/upload-artifact@v4
         with:
@@ -56,9 +58,13 @@ jobs:
           body: |
             ## Kurulum
 
-            1. Aşağıdaki **NotebookLM-Cinematic-Studio-${{ steps.ver.outputs.version }}.zip** dosyasını indir.
-            2. Zip'i aç (çift tık).
-            3. **Sağ tık → Aç → Aç** ile uygulamayı çalıştır (Gatekeeper bir kere uyarır, sonra bir daha sormaz).
-            4. İlk açılışta ~2 dakika kurulum yapar (Python venv + Playwright Chromium).
+            ```bash
+            git clone https://github.com/esattavukcu/notebooklm-cinematic-studio.git
+            cd notebooklm-cinematic-studio
+            ./setup.sh
+            ./app.sh
+            ```
 
-            macOS 10.15 (Catalina) ve üzeri gerekli.
+            Tarayıcıda `http://localhost:8501` otomatik açılır.
+
+            Detaylar README'de.

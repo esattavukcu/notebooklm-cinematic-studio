@@ -1,0 +1,45 @@
+# Python
+.venv/
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+*.egg-info/
+
+# Secrets / kullanıcı verisi
+.env
+.env.local
+auth.json
+
+# Hesap profilleri (LOGIN OTURUMU İÇERİYOR — ASLA PUSH'LAMA)
+chrome_profile/
+chrome_profiles/
+
+# Çalışma verisi
+data/
+*.log
+
+# İndirilen videolar
+data/downloads/
+*.mp4
+
+# macOS
+.DS_Store
+*.swp
+
+# Build çıktıları
+*.app/
+*.zip
+build/
+dist/
+notebooklm-cinematic-studio/
+notebooklm-cinematic-studio.zip
+
+# IDE
+.vscode/
+.idea/
+
+# req hash cache
+.req.hash
+launcher.log

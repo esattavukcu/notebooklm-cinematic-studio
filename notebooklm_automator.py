@@ -51,7 +51,7 @@ def _ensure_stable_tmpdir() -> None:
 _ensure_stable_tmpdir()
 GOOGLE_EMAIL = os.getenv("GOOGLE_EMAIL", "").strip()
 GOOGLE_PASSWORD = os.getenv("GOOGLE_PASSWORD", "").strip()
-DEFAULT_TIMEOUT_MIN = int(os.getenv("GENERATION_TIMEOUT_MIN", "60"))
+DEFAULT_TIMEOUT_MIN = int(os.getenv("GENERATION_TIMEOUT_MIN", "25"))
 
 # Run-time toggles, set by parse_args / run()
 EMIT_JSON = False  # ebeveyn proses parse edebilsin diye stdout'a JSON event basar
@@ -409,67 +409,110 @@ def wait_for_video_ready(
     page: Page,
     timeout_min: int,
     fail_on_timeout: bool = True,
+    screenshot_dir: Optional[Path] = None,
+    job_id: str = "job",
 ) -> bool:
     """Video hazır olana kadar bekle. Hazırsa True döner.
 
-    fail_on_timeout=False ise süre dolduğunda exception atmaz, False döner.
-    Cinematic videolar 30-60 dk sürebilir; soft timeout önerilir.
+    Üç sinyal kullanıyor:
+    - Selector match (Download, video[src], vs.)
+    - Heuristic: 'Generating' metni bir kez görünmüş ama artık 30 sn yok
+    - Periyodik screenshot (debug için)
     """
     log(f"Video üretiminin tamamlanması bekleniyor (max {timeout_min} dk)...")
     started = time.time()
     deadline = started + timeout_min * 60
 
-    # Hazır göstergeleri (yanlış pozitif riskini azaltmak için katı seçimler)
+    # Genişletilmiş ready selectorları
     ready_selectors_strict = [
-        'video[src]',                        # gerçek video kaynağı yüklendi
+        'video[src]',
         'video source[src]',
         'a[href*=".mp4"]',
+        'a[download]',
         'button:has-text("Download")',
         'button:has-text("İndir")',
-        'button[aria-label*="download video" i]',
+        'button[aria-label*="download" i]',
+        'button[aria-label*="indir" i]',
+        '[role="menuitem"]:has-text("Download")',
+        # NotebookLM'in yeni UI'ında video player wrapper olabilir
+        '[aria-label*="play video" i]',
+        '[data-test*="video-player"]',
     ]
-    # Hâlâ üretiliyor göstergeleri (varsa hazır DEĞİLDİR)
     in_progress_texts = [
         "Generating", "Üretiliyor", "Yükleniyor", "Loading",
         "Creating video", "Video oluşturuluyor", "Hazırlanıyor",
+        "Working on it", "İşleniyor",
     ]
 
+    if screenshot_dir is not None:
+        screenshot_dir.mkdir(parents=True, exist_ok=True)
+
     last_progress_log = started
+    last_screenshot = started
+    in_progress_seen_at_least_once = False
+    in_progress_last_seen = 0.0
+
     while time.time() < deadline:
-        # 1) Hâlâ üretiliyor mu? Eğer öyle ise hazırlık göstergelerine bakma.
+        # 1) Hâlâ üretiliyor mu?
         in_progress = False
         for txt in in_progress_texts:
             try:
                 if page.locator(f'text="{txt}"').first.is_visible(timeout=300):
                     in_progress = True
+                    in_progress_seen_at_least_once = True
+                    in_progress_last_seen = time.time()
                     break
             except Exception:
                 pass
 
-        # 2) Hazır mı?
+        # 2) Selector tabanlı ready
         if not in_progress:
             for sel in ready_selectors_strict:
                 try:
                     loc = page.locator(sel).first
                     if loc.count() > 0 and loc.is_visible(timeout=400):
-                        log("Video hazır!")
+                        log(f"Video hazır! (selector: {sel})")
                         return True
                 except Exception:
                     pass
 
-        # 3) Periyodik ilerleme log'u (1 dk'da bir)
+        # 3) Heuristic: 'Generating' bir kez görünmüş ama 30 sn'dir yok → hazır say
+        if (
+            in_progress_seen_at_least_once
+            and not in_progress
+            and time.time() - in_progress_last_seen > 30
+            and time.time() - started > 60  # en az 1 dk geçmiş olsun
+        ):
+            log("Video hazır! (heuristic: 'Generating' metni 30 sn'dir yok)")
+            return True
+
+        # 4) Periyodik ilerleme log'u
         now = time.time()
         if now - last_progress_log > 60:
             elapsed = int(now - started)
-            log(f"…hâlâ bekliyor ({elapsed // 60} dk {elapsed % 60} sn geçti)")
+            seen = "evet" if in_progress_seen_at_least_once else "henüz hayır"
+            log(
+                f"…hâlâ bekliyor ({elapsed // 60} dk {elapsed % 60} sn geçti) "
+                f"| in_progress şu an: {in_progress} | bir kez görüldü: {seen}"
+            )
             last_progress_log = now
+
+        # 5) Periyodik screenshot (debug için)
+        if screenshot_dir is not None and now - last_screenshot > 90:
+            try:
+                ts = time.strftime("%H%M%S")
+                shot = screenshot_dir / f"{job_id}_{ts}.png"
+                page.screenshot(path=str(shot), full_page=False)
+                log(f"Screenshot: {shot}")
+                last_screenshot = now
+            except Exception as e:
+                log(f"Screenshot alınamadı: {e}")
 
         time.sleep(10)
 
     msg = (
         f"Video {timeout_min} dakika içinde tamamlanmadı. "
-        "NotebookLM'de üretim arka planda devam ediyor olabilir — "
-        "tarayıcıdan elle kontrol edebilirsin."
+        "Follow-up worker 10 dk'da bir kontrol edip indirmeyi deneyecek."
     )
     if fail_on_timeout:
         raise TimeoutError(msg)
@@ -927,8 +970,14 @@ def run(
             emit("step", name="click_generate")
             click_generate(page)
             emit("step", name="wait_for_video")
+            screenshot_dir = (Path(__file__).parent / "data" / "logs" / "screenshots")
+            job_id = profile_dir.name  # profile_id'yi job_id olarak kullan
             ready = wait_for_video_ready(
-                page, timeout_min, fail_on_timeout=not soft_timeout
+                page,
+                timeout_min,
+                fail_on_timeout=not soft_timeout,
+                screenshot_dir=screenshot_dir,
+                job_id=job_id,
             )
 
             notebook_url = page.url

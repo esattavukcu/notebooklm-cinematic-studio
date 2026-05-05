@@ -75,28 +75,45 @@ veya doğrudan:
 
 ## Auto-update (git pull)
 
-`.app` her açılışta `~/Library/Application Support/.../` klasöründe `git pull` çalıştırır. Yeni sürüm yayınlamak için:
+Repo: **https://github.com/esattavukcu/notebooklm-cinematic-studio**
+
+`.app` her açılışta `~/Library/Application Support/NotebookLM Cinematic Studio/` klasöründe `git pull` çalıştırır. Yeni sürüm yayınlamak için sen ana repo'ya `git push` yaparsın; ekibin uygulamayı bir sonraki açtığında otomatik güncel kod gelir.
+
+### Mustafa için — tek seferlik kurulum
+
+`.app`'i bir kere açıp kapattıktan sonra (Application Support klasörü oluşmuş olur):
 
 ```bash
-# Senin makinende — bir kere setup
 cd "$HOME/Library/Application Support/NotebookLM Cinematic Studio"
-git init
-git remote add origin git@github.com:yga-org/notebooklm-cinematic.git
-git add . && git commit -m "init"
-git push -u origin main
 
-# Mustafa'da — bir kere setup
-cd "$HOME/Library/Application Support/NotebookLM Cinematic Studio"
-rm -rf data chrome_profiles  # ya da yedekle
+# Mevcut data ve profilleri yedekle
+mv data data.backup 2>/dev/null || true
+mv chrome_profiles chrome_profiles.backup 2>/dev/null || true
+
+# Repo'yu clone et
 git init
-git remote add origin git@github.com:yga-org/notebooklm-cinematic.git
+git remote add origin https://github.com/esattavukcu/notebooklm-cinematic-studio.git
 git fetch origin main
 git reset --hard origin/main
+
+# Yedekleri geri koy
+mv data.backup data 2>/dev/null || true
+mv chrome_profiles.backup chrome_profiles 2>/dev/null || true
 ```
 
-Sonra her güncelleme `git push` yetiyor; ekibin uygulamayı bir sonraki açtığında otomatik güncel kod gelir.
+Bu kuruluyu yaptıktan sonra her `.app` açılışında `git pull` ile otomatik günceller.
 
-Git repo yoksa `.app` sessizce bundle source'undan çalışır (auto-update kapalı).
+### Sen — yeni sürüm yayınlamak
+
+Geliştirme yaptığın klasörde:
+
+```bash
+git add -u
+git commit -m "fix: ..."
+git push
+```
+
+Git repo'sunda commit yoksa `.app` bundle source'undan çalışır (auto-update sessizce atlanır).
 
 ## Mimari
 

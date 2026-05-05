@@ -1,0 +1,64 @@
+name: Build and Release .app
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: macos-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Read version from tag
+        id: ver
+        run: |
+          if [[ "${{ github.ref }}" == refs/tags/* ]]; then
+            VER="${GITHUB_REF#refs/tags/}"
+          else
+            VER="dev-$(date +%Y%m%d-%H%M)"
+          fi
+          echo "version=$VER" >> "$GITHUB_OUTPUT"
+          echo "Building version: $VER"
+
+      - name: Build .app
+        run: |
+          chmod +x build_app.sh
+          ./build_app.sh
+
+      - name: Zip .app
+        run: |
+          ZIP_NAME="NotebookLM-Cinematic-Studio-${{ steps.ver.outputs.version }}.zip"
+          zip -ry "$ZIP_NAME" "NotebookLM Cinematic Studio.app"
+          ls -la "$ZIP_NAME"
+          echo "ZIP_NAME=$ZIP_NAME" >> $GITHUB_ENV
+
+      - name: Upload artifact (workflow_dispatch için)
+        if: github.event_name == 'workflow_dispatch'
+        uses: actions/upload-artifact@v4
+        with:
+          name: notebooklm-cinematic-${{ steps.ver.outputs.version }}
+          path: ${{ env.ZIP_NAME }}
+
+      - name: Create GitHub Release
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: ${{ env.ZIP_NAME }}
+          generate_release_notes: true
+          name: ${{ steps.ver.outputs.version }}
+          body: |
+            ## Kurulum
+
+            1. Aşağıdaki **NotebookLM-Cinematic-Studio-${{ steps.ver.outputs.version }}.zip** dosyasını indir.
+            2. Zip'i aç (çift tık).
+            3. **Sağ tık → Aç → Aç** ile uygulamayı çalıştır (Gatekeeper bir kere uyarır, sonra bir daha sormaz).
+            4. İlk açılışta ~2 dakika kurulum yapar (Python venv + Playwright Chromium).
+
+            macOS 10.15 (Catalina) ve üzeri gerekli.

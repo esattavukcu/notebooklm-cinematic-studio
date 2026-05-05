@@ -2,6 +2,12 @@
 
 NotebookLM'de **birden fazla Google hesabı** üzerinden, **çoklu metin kuyruğu** ile **paralel** Cinematic videolar üretir, **otomatik indirir**. Native macOS uygulaması olarak veya CLI/web olarak çalıştırılabilir.
 
+## 📦 İndir (kullanıcı için)
+
+→ **[Latest release](https://github.com/esattavukcu/notebooklm-cinematic-studio/releases/latest)** sayfasında `NotebookLM-Cinematic-Studio-vX.Y.Z.zip` dosyasını indir, aç, **Sağ tık → Aç → Aç** (Gatekeeper bir kere sorar). İlk açılışta ~2 dk kurulum yapar.
+
+> **Not:** Repo private — Mustafa ya da başka biri indirmek için repo'ya **collaborator** olarak eklenmiş olmalı: [Settings → Collaborators](https://github.com/esattavukcu/notebooklm-cinematic-studio/settings/access).
+
 ## Özellikler
 
 - 🪪 Çoklu hesap profili — her hesap için ayrı Chromium oturumu, şifre saklanmıyor

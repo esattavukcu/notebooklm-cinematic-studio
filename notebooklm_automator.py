@@ -810,13 +810,50 @@ def run_init(profile_dir: Path) -> None:
 # ------------------------------------------------------------------
 # Ana akış
 # ------------------------------------------------------------------
+def _setup_cdp_download_behavior(context, dest_dir: Path) -> None:
+    """CDP ile Chromium'a 'tüm download'ları şu klasöre kaydet' der.
+
+    Playwright'ın Python event handler'ı tetiklenmese bile dosya iner.
+    Native Chromium download mekanizması direkt yazar."""
+
+    def configure_page(page):
+        try:
+            client = context.new_cdp_session(page)
+            client.send(
+                "Browser.setDownloadBehavior",
+                {
+                    "behavior": "allow",
+                    "downloadPath": str(dest_dir),
+                    "eventsEnabled": True,
+                },
+            )
+            log(f"[cdp] page için download path ayarlandı: {dest_dir}")
+        except Exception as e:
+            log(f"[cdp] page config hatası: {e}")
+
+    # Her yeni page için ayarla
+    try:
+        context.on("page", configure_page)
+        # Mevcut page'lere de uygula
+        for p in context.pages:
+            configure_page(p)
+        log(f"[cdp] download behavior kuruldu, klasör: {dest_dir}")
+    except Exception as e:
+        log(f"[cdp] kurulum hatası: {e}")
+
+
 def _attach_download_handler(context, dest_dir: Path) -> None:
     """Chromium'da herhangi bir download başlarsa otomatik dest_dir'e kaydet.
 
-    Bu sayede manuel tıklamalar veya bizim tıklamadığımız download'lar bile
-    kaybolmaz (Playwright default'unda non-saved download'lar uçar)."""
+    İki katmanlı:
+    1. CDP setDownloadBehavior — Chromium native olarak dest_dir'e indirir
+    2. Playwright context.on('download') — yedek katman, Playwright API'sinden
+    """
     dest_dir.mkdir(parents=True, exist_ok=True)
     log(f"[download-handler] kuruluyor — hedef klasör: {dest_dir}")
+
+    # CDP-tabanlı download path config (en güvenilir yol)
+    _setup_cdp_download_behavior(context, dest_dir)
 
     def on_download(download):
         log(f"[download-handler] EVENT TETİKLENDİ! url={download.url[:80]}")

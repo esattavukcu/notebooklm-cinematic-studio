@@ -967,7 +967,8 @@ def run(
     keep_open: bool = True,
     soft_timeout: bool = True,
     download_dir: Optional[Path] = None,
-    auto_download: bool = True,
+    auto_download: bool = False,        # default OFF — manuel indirme önerilir
+    wait_for_video: bool = False,       # default OFF — Generate sonrası bitir
 ) -> None:
     if not text.strip():
         raise ValueError("Yapıştırılacak metin boş olamaz.")
@@ -1006,26 +1007,39 @@ def run(
             select_cinematic_video_overview(page)
             emit("step", name="click_generate")
             click_generate(page)
-            emit("step", name="wait_for_video")
-            screenshot_dir = (Path(__file__).parent / "data" / "logs" / "screenshots")
-            job_id = profile_dir.name  # profile_id'yi job_id olarak kullan
-            ready = wait_for_video_ready(
-                page,
-                timeout_min,
-                fail_on_timeout=not soft_timeout,
-                screenshot_dir=screenshot_dir,
-                job_id=job_id,
-            )
 
+            # Generate'e basıldıktan kısa süre sonra notebook URL'i hazır
+            page.wait_for_timeout(2000)
             notebook_url = page.url
+
+            ready = False
             video_path: Optional[Path] = None
-            if ready and auto_download:
-                try:
-                    emit("step", name="download_video")
-                    video_path = download_video(page, download_dir, text)
-                except Exception as e:
-                    log(f"Otomatik download başarısız: {e}")
-                    emit("download_failed", error=str(e))
+
+            if wait_for_video:
+                emit("step", name="wait_for_video")
+                screenshot_dir = (Path(__file__).parent / "data" / "logs" / "screenshots")
+                job_id = profile_dir.name
+                ready = wait_for_video_ready(
+                    page,
+                    timeout_min,
+                    fail_on_timeout=not soft_timeout,
+                    screenshot_dir=screenshot_dir,
+                    job_id=job_id,
+                )
+                # En güncel URL (notebook ID belli olsun diye yeniden al)
+                notebook_url = page.url
+
+                if ready and auto_download:
+                    try:
+                        emit("step", name="download_video")
+                        video_path = download_video(page, download_dir, text)
+                    except Exception as e:
+                        log(f"Otomatik download başarısız: {e}")
+                        emit("download_failed", error=str(e))
+            else:
+                # Hızlı mod — Generate'e bastık, gerisini kullanıcı manuel halleder
+                ready = True  # video üretimi NotebookLM tarafında devam ediyor
+                log(f"Generate edildi. Manuel indirme için notebook URL: {notebook_url}")
 
             emit(
                 "job_done",
@@ -1033,21 +1047,27 @@ def run(
                 video_ready=ready,
                 video_path=str(video_path) if video_path else None,
             )
-            if ready:
-                msg = "Cinematic video hazır!" + (
-                    f" İndirildi: {video_path.name}" if video_path else ""
-                )
-                notify("NotebookLM", msg)
-                log(f"Tamamlandı. Notebook URL: {notebook_url}")
+            if wait_for_video:
+                if ready:
+                    msg = "Cinematic video hazır!" + (
+                        f" İndirildi: {video_path.name}" if video_path else ""
+                    )
+                    notify("NotebookLM", msg)
+                    log(f"Tamamlandı. Notebook URL: {notebook_url}")
+                else:
+                    notify(
+                        "NotebookLM",
+                        f"Süre doldu ama üretim devam ediyor olabilir. URL: {notebook_url}",
+                    )
+                    log(
+                        f"Süre doldu (soft timeout). Notebook URL: {notebook_url}"
+                    )
             else:
                 notify(
                     "NotebookLM",
-                    f"Süre doldu ama üretim devam ediyor olabilir. URL: {notebook_url}",
+                    "Generate edildi, NotebookLM video'yu üretiyor. Durum sekmesinden URL'i aç.",
                 )
-                log(
-                    f"Süre doldu ama hata atılmadı (soft timeout). "
-                    f"Notebook URL: {notebook_url}"
-                )
+                log(f"✓ Hızlı mod tamam. Manuel indirme: {notebook_url}")
             if keep_open:
                 log("Tarayıcıyı kapatmak için Enter'a bas...")
                 try:
@@ -1165,9 +1185,15 @@ def parse_args() -> argparse.Namespace:
         help="Süre dolarsa exception at (default: soft timeout, sadece uyarı)",
     )
     p.add_argument(
+        "--wait-and-download",
+        action="store_true",
+        help="Video hazır olana kadar bekle ve otomatik indirmeyi dene "
+             "(default: Generate'e bas, hızlı bitir, kullanıcı manuel indirir)",
+    )
+    p.add_argument(
         "--no-download",
         action="store_true",
-        help="Video hazır olunca otomatik indirme yapma",
+        help="(deprecated) Otomatik indirme zaten varsayılan olarak kapalı",
     )
     p.add_argument(
         "--check-download",
@@ -1237,7 +1263,8 @@ def main() -> None:
         keep_open=not args.no_wait_input,
         soft_timeout=not args.strict_timeout,
         download_dir=download_dir,
-        auto_download=not args.no_download,
+        auto_download=args.wait_and_download and not args.no_download,
+        wait_for_video=args.wait_and_download,
     )
 
 

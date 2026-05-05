@@ -66,6 +66,10 @@ cat > "$APP_DIR/Contents/Info.plist" <<EOF
   <true/>
   <key>NSAppleEventsUsageDescription</key>
   <string>NotebookLM otomasyonu için Chromium kontrolü gerekli.</string>
+  <key>LSMultipleInstancesProhibited</key>
+  <true/>
+  <key>LSApplicationCategoryType</key>
+  <string>public.app-category.productivity</string>
 </dict>
 </plist>
 EOF
@@ -89,6 +93,7 @@ SUPPORT="$HOME/Library/Application Support/$APP_NAME"
 LOG="$SUPPORT/launcher.log"
 BUNDLE_SRC="$(cd "$(dirname "$0")/../Resources/source" && pwd)"
 VERSION_FILE="$SUPPORT/.installed_version"
+LOCK_FILE="$SUPPORT/.app.pid"
 
 mkdir -p "$SUPPORT"
 exec >> "$LOG" 2>&1
@@ -97,6 +102,35 @@ echo ""
 echo "===== $(date) ====="
 echo "Bundle source: $BUNDLE_SRC"
 echo "Support dir: $SUPPORT"
+
+# ---- Singleton kontrolü ----
+# Mevcut instance varsa pencereyi öne getirip çık
+if [ -f "$LOCK_FILE" ]; then
+  EXISTING_PID="$(cat "$LOCK_FILE" 2>/dev/null || echo '')"
+  if [ -n "$EXISTING_PID" ] && kill -0 "$EXISTING_PID" 2>/dev/null; then
+    echo "Zaten çalışıyor (pid=$EXISTING_PID), pencere öne getiriliyor."
+    # NotebookLM penceresini öne getirmeye çalış (pywebview window adı)
+    osascript <<'OSAEOF' 2>/dev/null || true
+tell application "System Events"
+    set procs to (every process whose name contains "Python" or name contains "notebooklm")
+    repeat with p in procs
+        try
+            set frontmost of p to true
+            exit repeat
+        end try
+    end repeat
+end tell
+OSAEOF
+    exit 0
+  else
+    echo "Eski lock bulundu ama process yok, temizleniyor."
+    rm -f "$LOCK_FILE"
+  fi
+fi
+
+# Bu instance'ın PID'ini lock dosyasına yaz, çıkışta temizle
+echo $$ > "$LOCK_FILE"
+trap 'rm -f "$LOCK_FILE"; echo "Çıkış: lock temizlendi."' EXIT
 
 cd "$SUPPORT"
 

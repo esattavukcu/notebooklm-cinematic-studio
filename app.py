@@ -610,7 +610,14 @@ with st.sidebar:
                         st.rerun()
             if not p.initialized:
                 if st.button("Login başlat", key=f"login_{p.id}", type="primary"):
-                    # Aç -> kullanıcı login -> kapat -> initialized=True
+                    # Subprocess'i ayrı log dosyasına yaz, hata olursa görelim
+                    init_log = LOGS_DIR / f"init_{p.id}.log"
+                    init_log.parent.mkdir(parents=True, exist_ok=True)
+                    with init_log.open("w", encoding="utf-8") as lf:
+                        lf.write(f"=== {time.strftime('%Y-%m-%d %H:%M:%S')} ===\n")
+                        lf.write(f"sys.executable: {sys.executable}\n")
+                        lf.write(f"AUTOMATOR: {AUTOMATOR}\n")
+                        lf.write(f"profile_dir: {p.dir}\n")
                     proc = subprocess.Popen(
                         [
                             sys.executable,
@@ -618,14 +625,27 @@ with st.sidebar:
                             "--profile-dir",
                             str(p.dir),
                             "--init",
+                            "--json-events",
                         ],
                         cwd=str(ROOT),
+                        stdout=init_log.open("a", encoding="utf-8"),
+                        stderr=subprocess.STDOUT,
                     )
                     st.session_state[f"init_pid_{p.id}"] = proc.pid
-                    st.info(
-                        "Tarayıcı açıldı. Google'a giriş yap, sonra pencereyi kapat. "
-                        "Bittiğinde aşağıdaki butona bas."
-                    )
+                    # Hızlı bir kontrol: 2 sn sonra hâlâ canlı mı?
+                    time.sleep(2)
+                    if proc.poll() is not None:
+                        st.error(
+                            f"Tarayıcı başlatılamadı (subprocess exit code {proc.returncode}). "
+                            f"Log: {init_log}"
+                        )
+                        st.code(init_log.read_text(encoding="utf-8")[-2000:], language="text")
+                    else:
+                        st.info(
+                            f"Tarayıcı açıldı (pid={proc.pid}). Google'a giriş yap, sonra "
+                            "pencereyi kapat. Bittiğinde 'Login tamamlandı ✓' butonuna bas. "
+                            f"Log: `{init_log.name}` (Log sekmesinde görülebilir)"
+                        )
                 if st.button("Login tamamlandı ✓", key=f"done_{p.id}"):
                     profs = load_profiles()
                     for x in profs:
@@ -635,17 +655,29 @@ with st.sidebar:
                     st.rerun()
             else:
                 if st.button("Tekrar login (re-auth)", key=f"relogin_{p.id}"):
-                    subprocess.Popen(
+                    init_log = LOGS_DIR / f"init_{p.id}.log"
+                    init_log.parent.mkdir(parents=True, exist_ok=True)
+                    proc = subprocess.Popen(
                         [
                             sys.executable,
                             str(AUTOMATOR),
                             "--profile-dir",
                             str(p.dir),
                             "--init",
+                            "--json-events",
                         ],
                         cwd=str(ROOT),
+                        stdout=init_log.open("a", encoding="utf-8"),
+                        stderr=subprocess.STDOUT,
                     )
-                    st.info("Tarayıcı açıldı.")
+                    time.sleep(2)
+                    if proc.poll() is not None:
+                        st.error(
+                            f"Tarayıcı başlatılamadı (exit {proc.returncode}). Log: {init_log}"
+                        )
+                        st.code(init_log.read_text(encoding="utf-8")[-2000:], language="text")
+                    else:
+                        st.info(f"Tarayıcı açıldı (pid={proc.pid}).")
 
     st.divider()
     st.subheader("Yeni profil ekle")
@@ -1101,14 +1133,42 @@ with tab_videos:
 
 
 with tab_logs:
-    job_files = sorted(LOGS_DIR.glob("*.log"), key=lambda p: p.stat().st_mtime, reverse=True)
-    if not job_files:
+    # launcher.log + init log'ları + job log'ları hepsini bir arada göster
+    log_options: list[tuple[str, Path]] = []
+
+    # 1) launcher.log (auto-update + venv kurulum)
+    launcher_log = ROOT / "launcher.log"
+    if launcher_log.exists():
+        log_options.append(("[launcher] launcher.log", launcher_log))
+
+    # 2) data/logs altındaki tüm .log dosyaları (job + init + followup)
+    if LOGS_DIR.exists():
+        for f in sorted(LOGS_DIR.glob("*.log"), key=lambda p: p.stat().st_mtime, reverse=True)[:40]:
+            label = f.name
+            if label.startswith("init_"):
+                label = f"[init] {label}"
+            elif label.endswith(".followup.log"):
+                label = f"[followup] {label}"
+            else:
+                label = f"[job] {label}"
+            log_options.append((label, f))
+
+    if not log_options:
         st.info("Henüz log yok.")
     else:
-        choice = st.selectbox(
+        choice_idx = st.selectbox(
             "Log dosyası",
-            options=[f.name for f in job_files[:30]],
+            options=range(len(log_options)),
+            format_func=lambda i: log_options[i][0],
         )
-        if choice:
-            content = (LOGS_DIR / choice).read_text(encoding="utf-8", errors="replace")
-            st.code(content[-5000:], language="text")
+        chosen_path = log_options[choice_idx][1]
+        try:
+            content = chosen_path.read_text(encoding="utf-8", errors="replace")
+            st.caption(f"{chosen_path}  ·  {len(content)} karakter")
+            st.code(content[-8000:], language="text")
+        except Exception as e:
+            st.error(f"Log okunamadı: {e}")
+
+        # Finder'da göster butonu (kolay erişim için)
+        if st.button("📂 Finder'da log klasörünü aç"):
+            subprocess.Popen(["open", str(chosen_path.parent)])

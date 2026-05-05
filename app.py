@@ -9,6 +9,7 @@ NotebookLM Cinematic — Streamlit UI
 from __future__ import annotations
 
 import json
+import os
 import shutil
 import subprocess
 import sys
@@ -180,6 +181,41 @@ def usage_today_by_profile(jobs: list[Job]) -> dict[str, int]:
         if j.status in COUNTED_STATUSES:
             counts[j.profile_id] = counts.get(j.profile_id, 0) + 1
     return counts
+
+
+# ------------------------------------------------------------------
+# Stale state cleanup — Streamlit yeniden başladığında çalışır
+# ------------------------------------------------------------------
+def _pid_alive(pid: Optional[int]) -> bool:
+    """Verilen PID hâlâ çalışıyor mu kontrol et."""
+    if not pid:
+        return False
+    try:
+        os.kill(pid, 0)  # signal 0 = sadece var mı diye bak
+        return True
+    except (OSError, ProcessLookupError):
+        return False
+
+
+def cleanup_stale_jobs() -> int:
+    """Streamlit/worker yeniden başladığında, eski 'running' job'ların
+    subprocess'leri yaşıyor mu kontrol et. Ölmüşlerse 'failed' olarak işaretle.
+    Bu sayede UI'da hayalet 'running' job'lar kalmaz."""
+    jobs = load_jobs()
+    cleaned = 0
+    for j in jobs:
+        if j.status == "running" and not _pid_alive(j.pid):
+            j.status = "failed"
+            j.error = (j.error or "") + " | Streamlit restart sonrası process yok"
+            j.finished_at = time.time()
+            cleaned += 1
+    if cleaned > 0:
+        save_jobs(jobs)
+    return cleaned
+
+
+# Module load anında bir kere çalıştır
+_stale_cleaned = cleanup_stale_jobs()
 
 
 # ------------------------------------------------------------------
@@ -994,7 +1030,7 @@ with tab_status:
     cols[3].metric("⏱ Süresi geçti", counts["submitted"])
     cols[4].metric("✗ Hatalı", counts["failed"])
 
-    cols2 = st.columns([1, 1, 4])
+    cols2 = st.columns([1, 1, 1, 3])
     with cols2[0]:
         if st.button("Tamamlananları temizle", key="clean_done"):
             jobs_now = [
@@ -1004,13 +1040,38 @@ with tab_status:
             st.rerun()
     with cols2[1]:
         if st.button("Submitted'ları yeniden dene", key="retry_submitted"):
-            # followup_attempts'i sıfırla, follow-up worker tekrar denesin
             js = load_jobs()
             for j in js:
                 if j.status == "submitted":
                     j.followup_attempts = 0
             save_jobs(js)
             st.success("Tüm submitted job'lar tekrar denenecek (10 dk içinde).")
+            st.rerun()
+    with cols2[2]:
+        if st.button("⏹ Tümünü durdur", key="stop_all", help="Tüm queued/running job'ları iptal eder ve aktif Chromium subprocess'lerini öldürür."):
+            js = load_jobs()
+            killed = 0
+            for j in js:
+                if j.status == "running" and j.pid:
+                    try:
+                        os.kill(j.pid, 9)
+                        killed += 1
+                    except Exception:
+                        pass
+                if j.status in ("queued", "running"):
+                    j.status = "failed"
+                    j.error = "Kullanıcı durdurdu"
+                    j.finished_at = time.time()
+            save_jobs(js)
+            # Ayrıca tüm orphan automator subprocess'lerini öldürmeyi dene
+            try:
+                subprocess.run(
+                    ["pkill", "-9", "-f", "notebooklm_automator.py"],
+                    timeout=5, check=False,
+                )
+            except Exception:
+                pass
+            st.success(f"Durduruldu. {killed} subprocess öldürüldü, kuyruktaki tüm job'lar 'failed' işaretlendi.")
             st.rerun()
 
     if not jobs:

@@ -327,14 +327,48 @@ def _dump_video_overview_debug(page: Page) -> None:
         log(f"Video Overview dump alınamadı: {e}")
 
 
+def _force_click(page: Page, selector: str) -> bool:
+    """force=True + scroll + dispatch_event fallback ile agresif click."""
+    try:
+        loc = page.locator(selector).first
+        if loc.count() == 0:
+            return False
+        try:
+            loc.scroll_into_view_if_needed(timeout=2000)
+        except Exception:
+            pass
+        # Önce normal click force ile
+        try:
+            loc.click(force=True, timeout=3000)
+            return True
+        except Exception:
+            pass
+        # Fallback: JavaScript dispatch
+        try:
+            loc.dispatch_event("click")
+            return True
+        except Exception:
+            pass
+        # Son fallback: page.evaluate ile element.click()
+        try:
+            handle = loc.element_handle()
+            if handle:
+                handle.evaluate("el => el.click()")
+                return True
+        except Exception:
+            pass
+    except Exception:
+        pass
+    return False
+
+
 def select_cinematic_video_overview(page: Page) -> None:
     log("Sağ Studio panelinde 'Video' veya 'Video Overview' kartı aranıyor...")
 
     # Source işlendikten sonra Studio panelinin gelmesi için bekle
-    page.wait_for_timeout(3000)
+    page.wait_for_timeout(3500)
 
-    # "Video" ve "Video Overview" — ikisini de dene, hangisi varsa o tıklanır.
-    # Önce ARIA-label tabanlı kesin eşleşmeler, sonra metin tabanlı.
+    # "Video" ve "Video Overview" — ikisini de dene
     selectors = [
         # ARIA label kesin eşleşme (en güvenilir)
         '[aria-label="Video"]',
@@ -352,21 +386,76 @@ def select_cinematic_video_overview(page: Page) -> None:
         # Customize/options ikonu (varsa)
         'button[aria-label*="customize" i][aria-label*="video" i]',
         'button[aria-label*="video options" i]',
-        # En geniş — text-is exact match
-        ':text-is("Video Overview")',
-        ':text-is("Video")',
     ]
 
-    if not click_first_visible(page, selectors, timeout=8000):
+    # Hangi selector matchledi onu bulalım
+    matched_sel = None
+    for sel in selectors:
+        try:
+            loc = page.locator(sel).first
+            if loc.count() > 0 and loc.is_visible(timeout=600):
+                matched_sel = sel
+                break
+        except Exception:
+            continue
+
+    if not matched_sel:
         _dump_video_overview_debug(page)
         raise RuntimeError(
             "Studio'da 'Video' veya 'Video Overview' kartı bulunamadı. "
-            "Yukarıdaki VIDEO OVERVIEW DEBUG çıktısındaki gerçek metni "
-            "paylaşırsan selector ekleyebilirim."
+            "Yukarıdaki VIDEO OVERVIEW DEBUG çıktısını paylaş."
         )
 
-    log("Video kartı tıklandı, açılan panel bekleniyor...")
-    page.wait_for_timeout(2500)
+    log(f"Video kartı bulundu: {matched_sel}")
+
+    # Click stratejisini agresif yap: force click + dispatch_event fallback
+    # Birinci deneme — normal force click
+    clicked_ok = _force_click(page, matched_sel)
+    if not clicked_ok:
+        log("İlk click denemesi başarısız, alternatif yöntem deneniyor...")
+        # Keyboard ile fokuslayıp Enter'a bas
+        try:
+            page.locator(matched_sel).first.focus()
+            page.keyboard.press("Enter")
+            clicked_ok = True
+        except Exception as e:
+            log(f"Keyboard Enter de başarısız: {e}")
+
+    log("Video kartına click gönderildi, panel açılması bekleniyor...")
+
+    # Panel/dialog/expansion açıldı mı kontrol et
+    panel_indicators = [
+        '[role="dialog"]:visible',
+        'mat-dialog-container:visible',
+        '[aria-modal="true"]:visible',
+        # Cinematic seçim ekranı geldiyse
+        ':text-is("Cinematic"):visible',
+        # Generate butonu görünür hale geldiyse
+        '[role="dialog"] button:has-text("Generate"):visible',
+        'button[aria-label="Generate"]:visible',
+    ]
+    panel_opened = False
+    for _ in range(15):  # 15 * 500ms = 7.5 sn
+        for ind in panel_indicators:
+            try:
+                if page.locator(ind).first.is_visible(timeout=300):
+                    panel_opened = True
+                    break
+            except Exception:
+                continue
+        if panel_opened:
+            break
+        page.wait_for_timeout(500)
+
+    if not panel_opened:
+        log("⚠ Panel açıldığına dair gösterge bulunamadı. Tekrar tıklamayı deniyorum...")
+        # Bir kez daha ağır siklette tıkla — bazen ilk tıklama tooltip gösteriyor sadece
+        page.wait_for_timeout(800)
+        _force_click(page, matched_sel)
+        page.wait_for_timeout(2000)
+
+    log("Panel kontrolü tamam, Cinematic seçimine geçiliyor...")
+    page.wait_for_timeout(1500)
 
     # 2) Açılan menü/dialog/expanded panelde Cinematic seçeneğini bul
     cinematic_selectors = [

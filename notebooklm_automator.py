@@ -762,32 +762,37 @@ def run_init(profile_dir: Path) -> None:
         page.goto(NOTEBOOKLM_URL, wait_until="domcontentloaded", timeout=60000)
         log("Tarayıcı açık. Login olduktan sonra pencereyi kapatın.")
 
-        # Login tespitinde periyodik olarak auth.json'a kaydet.
-        # Önemli: time.sleep yerine page.wait_for_timeout kullanıyoruz —
-        # böylece Playwright event handler'ları (özellikle download) bekleme
-        # sırasında işlenebilir. time.sleep main thread'i bloklayıp event'leri
-        # kuyruğa atıyordu.
-        last_save = 0.0
+        # Login tespitinde sadece BIR KEZ auth.json'a kaydet, sonra sessizce
+        # pencere kapanana kadar bekle. Periyodik page.url/storage_state
+        # çağrıları Chromium'u öne getirip focus çalıyordu.
+        saved_once = [False]
+
+        def on_navigated(frame):
+            try:
+                if (
+                    frame == page.main_frame
+                    and "notebooklm.google.com" in frame.url
+                    and not saved_once[0]
+                ):
+                    if _save_storage_state(context, profile_dir):
+                        saved_once[0] = True
+            except Exception:
+                pass
+
         try:
-            while True:
-                try:
-                    if page.is_closed():
-                        break
-                except Exception:
-                    break
-                try:
-                    if "notebooklm.google.com" in page.url:
-                        if time.time() - last_save > 8:
-                            if _save_storage_state(context, profile_dir):
-                                last_save = time.time()
-                except Exception:
-                    pass
-                # 2 saniye bekle — bu sırada Playwright event'leri pump edilir
-                try:
-                    page.wait_for_timeout(2000)
-                except Exception:
-                    # Page kapatıldıysa wait_for_timeout hata verebilir
-                    break
+            page.on("framenavigated", on_navigated)
+        except Exception as e:
+            log(f"framenavigated listener eklenemedi: {e}")
+
+        # Pencere kapanana kadar sessizce bekle (polling yok, focus stealing yok)
+        try:
+            page.wait_for_event("close", timeout=0)
+        except Exception:
+            pass
+
+        # Final save (kullanıcı pencereyi kapatmadan önce login bitirememiş olabilir)
+        try:
+            _save_storage_state(context, profile_dir)
         except Exception:
             pass
 
@@ -813,30 +818,25 @@ def run_init(profile_dir: Path) -> None:
 def _setup_cdp_download_behavior(context, dest_dir: Path) -> None:
     """CDP ile Chromium'a 'tüm download'ları şu klasöre kaydet' der.
 
-    Playwright'ın Python event handler'ı tetiklenmese bile dosya iner.
-    Native Chromium download mekanizması direkt yazar."""
-
-    def configure_page(page):
-        try:
-            client = context.new_cdp_session(page)
-            client.send(
-                "Browser.setDownloadBehavior",
-                {
-                    "behavior": "allow",
-                    "downloadPath": str(dest_dir),
-                    "eventsEnabled": True,
-                },
-            )
-            log(f"[cdp] page için download path ayarlandı: {dest_dir}")
-        except Exception as e:
-            log(f"[cdp] page config hatası: {e}")
-
-    # Her yeni page için ayarla
+    Tek seferlik kurulum — sadece mevcut ilk page için ayarla. Her yeni
+    page için configure çağırmak Chromium'u öne getirip focus çalıyordu.
+    """
     try:
-        context.on("page", configure_page)
-        # Mevcut page'lere de uygula
-        for p in context.pages:
-            configure_page(p)
+        # Mevcut bir page yoksa skip — bizim akışımızda zaten başlangıçta
+        # bir page açılıyor (about:blank veya NotebookLM)
+        if not context.pages:
+            log("[cdp] aktif page yok, atlanıyor")
+            return
+        page = context.pages[0]
+        client = context.new_cdp_session(page)
+        client.send(
+            "Browser.setDownloadBehavior",
+            {
+                "behavior": "allow",
+                "downloadPath": str(dest_dir),
+                "eventsEnabled": True,
+            },
+        )
         log(f"[cdp] download behavior kuruldu, klasör: {dest_dir}")
     except Exception as e:
         log(f"[cdp] kurulum hatası: {e}")

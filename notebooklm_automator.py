@@ -485,6 +485,88 @@ def _safe_filename(text: str, max_len: int = 60) -> str:
     return cleaned[:max_len] or "video"
 
 
+def _dump_download_candidates(page: Page) -> None:
+    """Sayfada download'la ilgili olabilecek tüm element/buton/link'leri logla."""
+    try:
+        info = page.evaluate(
+            """() => {
+              const out = [];
+              const sels = ['button', 'a', '[role="button"]', '[role="menuitem"]', 'video', 'source'];
+              const seen = new Set();
+              for (const s of sels) {
+                document.querySelectorAll(s).forEach(el => {
+                  if (seen.has(el)) return;
+                  seen.add(el);
+                  const r = el.getBoundingClientRect();
+                  const txt = (el.innerText || el.textContent || '').trim().slice(0, 40);
+                  const aria = el.getAttribute('aria-label') || '';
+                  const href = el.getAttribute('href') || '';
+                  const dl = el.getAttribute('download');
+                  const src = el.getAttribute('src') || '';
+                  const blob = (txt + ' ' + aria).toLowerCase();
+                  const isVideoEl = el.tagName === 'VIDEO' || el.tagName === 'SOURCE';
+                  if (!/(download|indir|save|kaydet|export|.mp4)/i.test(blob + ' ' + href + ' ' + src) && !isVideoEl) return;
+                  out.push({
+                    tag: el.tagName.toLowerCase(),
+                    text: txt,
+                    aria,
+                    href: href.slice(0, 120),
+                    src: src.slice(0, 120),
+                    download: dl,
+                    visible: r.width > 0 && r.height > 0,
+                  });
+                });
+              }
+              return out.slice(0, 50);
+            }"""
+        )
+        log("=== DOWNLOAD ADAYLARI ===")
+        for i, el in enumerate(info):
+            log(f"  [{i}] {el}")
+        log("=== /DOWNLOAD ADAYLARI ===")
+    except Exception as e:
+        log(f"Download adayları dump alınamadı: {e}")
+
+
+def _try_download_video_element(page: Page, dest_dir: Path, filename_hint: str) -> Optional[Path]:
+    """Sayfadaki <video> elementinin src'sini bul ve direkt HTTP ile indir."""
+    try:
+        video_url = page.evaluate(
+            """() => {
+              const v = document.querySelector('video');
+              if (!v) return null;
+              if (v.src) return v.src;
+              const s = v.querySelector('source[src]');
+              return s ? s.src : null;
+            }"""
+        )
+        if not video_url:
+            log("Sayfada <video> elementi veya src bulunamadı.")
+            return None
+        if video_url.startswith("blob:"):
+            log(f"Video URL'i blob: ({video_url[:80]}...) — HTTP fetch çalışmaz.")
+            return None
+        log(f"Video src: {video_url[:120]}")
+        # Playwright context.request ile çek (cookies inherit eder)
+        try:
+            response = page.context.request.get(video_url)
+            if response.ok:
+                safe = _safe_filename(filename_hint)
+                ts = time.strftime("%Y%m%d_%H%M%S")
+                final_path = dest_dir / f"{ts}_{safe}.mp4"
+                final_path.write_bytes(response.body())
+                log(f"Video <video> elementinden indirildi: {final_path}")
+                emit("video_downloaded", path=str(final_path), trigger="video_element")
+                return final_path
+            else:
+                log(f"Video src HTTP yanıtı: {response.status}")
+        except Exception as e:
+            log(f"context.request.get hatası: {e}")
+    except Exception as e:
+        log(f"_try_download_video_element hatası: {e}")
+    return None
+
+
 def download_video(
     page: Page,
     dest_dir: Path,
@@ -494,6 +576,7 @@ def download_video(
     """Hazır video için Download butonunu bul, dosyayı dest_dir'e kaydet."""
     dest_dir.mkdir(parents=True, exist_ok=True)
     log("Download butonu aranıyor...")
+    log(f"Sayfa URL: {page.url}")
 
     direct_selectors = [
         'button:has-text("Download")',
@@ -560,13 +643,23 @@ def download_video(
                         continue
 
             if not clicked:
-                raise RuntimeError("Download butonu hiçbir yerde bulunamadı.")
+                _dump_download_candidates(page)
+                raise RuntimeError(
+                    "Download butonu hiçbir yerde bulunamadı. "
+                    "Yukarıdaki DOWNLOAD ADAYLARI listesini paylaşırsan selector'ı eklerim."
+                )
 
         download = dl_info.value
     except PWTimeout:
+        log("expect_download timeout — Download butonu tıklandı ama browser download event tetiklemedi.")
+        log("Fallback: <video> elementinden src bulup HTTP ile indirme deneniyor...")
+        video_path = _try_download_video_element(page, dest_dir, filename_hint)
+        if video_path:
+            return video_path
+        _dump_download_candidates(page)
         raise RuntimeError(
-            "Download tıklandı ama dosya gelmedi (timeout). "
-            "Belki video hazır değil ya da farklı bir akış var."
+            "Download tıklandı ama dosya gelmedi ve <video> fallback de işe yaramadı. "
+            "DOWNLOAD ADAYLARI log'unu paylaş."
         )
 
     safe = _safe_filename(filename_hint)

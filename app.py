@@ -53,6 +53,7 @@ class Profile:
     initialized: bool = False  # ilk login yapıldı mı
     daily_limit: int = 3  # NotebookLM hesap başına günlük video limiti
     max_concurrent: int = 1  # auth.json varsa 2-3 yapılabilir (paralel mod)
+    headless: bool = True  # Job çalışırken Chromium görünmez olsun (focus stealing yok)
 
     @property
     def dir(self) -> Path:
@@ -294,8 +295,10 @@ class Worker:
                         "60",
                         "--download-dir",
                         str(DOWNLOADS_DIR),
-                        job.text,
                     ]
+                    if prof.headless:
+                        cmd.append("--headless")
+                    cmd.append(job.text)
                     proc = subprocess.Popen(
                         cmd,
                         stdout=subprocess.PIPE,
@@ -599,13 +602,23 @@ with st.sidebar:
                     key=f"conc_{p.id}",
                     help=max_conc_help,
                 )
-                if new_limit != p.daily_limit or new_conc != p.max_concurrent:
+                new_headless = st.checkbox(
+                    "Arka planda çalış (görünmez)",
+                    value=bool(p.headless),
+                    key=f"hl_{p.id}",
+                    help="Job çalışırken Chromium görünmez. Ekranı bozmaz, focus çalmaz. "
+                         "Hata ayıklamak için kapatabilirsin.",
+                )
+                if (new_limit != p.daily_limit
+                        or new_conc != p.max_concurrent
+                        or new_headless != p.headless):
                     if st.button("Ayarları kaydet", key=f"save_set_{p.id}"):
                         profs = load_profiles()
                         for x in profs:
                             if x.id == p.id:
                                 x.daily_limit = int(new_limit)
                                 x.max_concurrent = int(new_conc)
+                                x.headless = bool(new_headless)
                         save_profiles(profs)
                         st.rerun()
             if not p.initialized:

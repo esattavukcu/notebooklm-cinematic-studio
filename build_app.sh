@@ -96,6 +96,14 @@ VERSION_FILE="$SUPPORT/.installed_version"
 LOCK_FILE="$SUPPORT/.app.pid"
 
 mkdir -p "$SUPPORT"
+
+# TMPDIR'ı stabil bir yere yönlendir.
+# Finder'dan açılan .app'lerde varsayılan TMPDIR (/var/folders/...) Playwright
+# için sorun çıkarıyor: 'mkdtemp ENOENT' hatası. Application Support altındaki
+# bizim kontrol ettiğimiz klasör daha güvenilir.
+export TMPDIR="$SUPPORT/tmp"
+mkdir -p "$TMPDIR"
+
 exec >> "$LOG" 2>&1
 
 echo ""

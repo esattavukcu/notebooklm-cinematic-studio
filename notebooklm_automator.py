@@ -36,6 +36,19 @@ load_dotenv()
 NOTEBOOKLM_URL = "https://notebooklm.google.com/?authuser=3&pageId=none"
 DEFAULT_PROFILE_DIR = Path(__file__).parent / "chrome_profile"
 DEFAULT_DOWNLOAD_DIR = Path(__file__).parent / "data" / "downloads"
+
+
+# TMPDIR fix: Finder'dan açılan .app'lerde TMPDIR /var/folders/... olur ve
+# Playwright bazen 'ENOENT: mkdtemp' hatası verir. Stabil bir yere yönlendir.
+def _ensure_stable_tmpdir() -> None:
+    current = os.environ.get("TMPDIR", "")
+    if not current or current.startswith("/var/folders/"):
+        stable = Path(__file__).parent / "data" / "tmp"
+        stable.mkdir(parents=True, exist_ok=True)
+        os.environ["TMPDIR"] = str(stable)
+
+
+_ensure_stable_tmpdir()
 GOOGLE_EMAIL = os.getenv("GOOGLE_EMAIL", "").strip()
 GOOGLE_PASSWORD = os.getenv("GOOGLE_PASSWORD", "").strip()
 DEFAULT_TIMEOUT_MIN = int(os.getenv("GENERATION_TIMEOUT_MIN", "60"))

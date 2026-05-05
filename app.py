@@ -553,6 +553,18 @@ st.caption(
 
 # ---------------- Sidebar: Profile yönetimi ----------------
 with st.sidebar:
+    # Hızlı erişim: NotebookLM'i normal Chrome'da aç (manuel indirme için)
+    st.markdown("### 🚀 Hızlı erişim")
+    if st.button(
+        "🌐 NotebookLM'i normal Chrome'da aç",
+        use_container_width=True,
+        help="Mac'in default browser'ında NotebookLM açılır. Manuel video indirmek için en kolay yol — download ~/Downloads'a düşer."
+    ):
+        subprocess.Popen(["open", "https://notebooklm.google.com"])
+        st.success("Açıldı! Normal Chrome'da videoları manuel indirebilirsin.")
+
+    st.divider()
+
     st.header("Hesap profilleri")
     profiles = load_profiles()
     today_counts = usage_today_by_profile(load_jobs())
@@ -1024,7 +1036,34 @@ with tab_status:
                     "Hata": (j.error or "")[:80],
                 }
             )
-        st.dataframe(rows, use_container_width=True, hide_index=True)
+        st.dataframe(
+            rows,
+            use_container_width=True,
+            hide_index=True,
+            column_config={
+                "Notebook": st.column_config.LinkColumn(
+                    "Notebook",
+                    display_text="🌐 Aç",
+                    help="Tıkla → varsayılan tarayıcında NotebookLM açılır, oradan elle indirebilirsin",
+                ),
+            },
+        )
+
+        # Notebook URL olan job'lar için ayrıca tek tıkla aç butonu
+        jobs_with_url = [j for j in jobs if j.notebook_url]
+        if jobs_with_url:
+            st.divider()
+            st.caption("📥 Manuel indirme — bu butonlar varsayılan tarayıcında açar:")
+            for j in sorted(jobs_with_url, key=lambda x: x.created_at, reverse=True)[:10]:
+                title = j.title or (j.text[:50] + "…" if len(j.text) > 50 else j.text)
+                cols = st.columns([5, 1])
+                with cols[0]:
+                    st.markdown(f"**{status_emoji(j.status)} {title}**")
+                    st.caption(j.notebook_url)
+                with cols[1]:
+                    if st.button("Aç", key=f"open_{j.id}"):
+                        subprocess.Popen(["open", j.notebook_url])
+                        st.toast(f"Açıldı: {title[:30]}")
 
         # CSV export
         import csv

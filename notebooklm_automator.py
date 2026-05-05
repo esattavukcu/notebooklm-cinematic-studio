@@ -395,14 +395,23 @@ def select_cinematic_video_overview(page: Page) -> None:
 def click_generate(page: Page) -> None:
     log("Generate butonuna basılıyor...")
     generate_selectors = [
+        # Video Overview / Cinematic dialog içindekini önce dene
+        '[role="dialog"] button:has-text("Generate")',
+        'mat-dialog-container button:has-text("Generate")',
+        '[aria-modal="true"] button:has-text("Generate")',
+        '[role="dialog"] button:has-text("Oluştur")',
+        '[role="dialog"] button:has-text("Create video")',
+        # Sonra genel
         'button:has-text("Generate")',
         'button:has-text("Oluştur")',
+        'button:has-text("Create video")',
         'button:has-text("Create")',
         '[aria-label*="generate" i]',
+        '[aria-label*="oluştur" i]',
     ]
     if not click_first_visible(page, generate_selectors, timeout=10000):
         raise RuntimeError("'Generate' butonu bulunamadı.")
-    log("Video üretimi başlatıldı.")
+    log("Video üretimi tetiklendi (click ok).")
 
 
 def wait_for_video_ready(
@@ -1008,8 +1017,37 @@ def run(
             emit("step", name="click_generate")
             click_generate(page)
 
-            # Generate'e basıldıktan kısa süre sonra notebook URL'i hazır
-            page.wait_for_timeout(2000)
+            # Generate'e basıldıktan sonra üretimin gerçekten başladığını
+            # doğrulayalım. NotebookLM'in API isteğini göndermesi için
+            # browser'ı erken kapatmayalım — istek iptal olur, video
+            # üretilmez.
+            log("Üretim başlangıcı bekleniyor...")
+            generation_confirmed = False
+            confirm_texts = [
+                "Generating", "Üretiliyor", "Creating video",
+                "Video oluşturuluyor", "Hazırlanıyor", "Working on it",
+            ]
+            deadline = time.time() + 45
+            while time.time() < deadline:
+                for txt in confirm_texts:
+                    try:
+                        if page.locator(f'text="{txt}"').first.is_visible(timeout=400):
+                            generation_confirmed = True
+                            break
+                    except Exception:
+                        pass
+                if generation_confirmed:
+                    break
+                page.wait_for_timeout(2000)
+
+            if generation_confirmed:
+                log("✓ Video üretimi başladı, NotebookLM tarafında devam ediyor.")
+            else:
+                log("⚠ 'Generating' mesajı 45 sn içinde görünmedi. "
+                    "Notebook oluştu ama üretim tetiklenmemiş olabilir.")
+
+            # NotebookLM URL'i kararlı olsun diye biraz daha bekle
+            page.wait_for_timeout(3000)
             notebook_url = page.url
 
             ready = False

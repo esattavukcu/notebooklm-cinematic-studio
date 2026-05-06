@@ -835,32 +835,120 @@ def run_harvest(
 
             # Strateji: NotebookLM Studio panelinin alt kısmında "üretilmiş içerikler"
             # listesi var. Video tamamlandıysa orada bir kart olarak gözüküyor —
-            # üzerinde ▶ play butonu, başlık, "20h" gibi yaş bilgisi.
-            # Video Overview kartına (üst tool kartı) tıklarsak customize dialog
-            # açılır (yeni video üretmek için), bu DOĞRU OLAN şey değil.
+            # üzerinde ▶ play butonu, ⋮ menü, başlık, "20h" gibi yaş bilgisi.
             #
-            # Akış:
+            # Akış (sırayla dene, biri tutarsa diğerlerini atla):
+            #   0) ⋮ menü → Download seçeneği — en temiz path, doğrudan dosyaya
+            #      iner, page.expect_download() ile yakalanır.
             #   1) Sayfada veya Studio panelinde direkt video[src] var mı?
-            #   2) Yoksa: produced-video play butonunu bul, tıkla, modal/inline
-            #      player'da video[src] çıkar
-            #   3) İkisi de yoksa: Video Overview kartına tıkla → customize dialog
-            #      veya generating indicator → "not_ready"
+            #   2) Produced-video ▶ play butonunu bul, tıkla, modal/inline
+            #      player'da video[src] çıkar, cookie ile fetch et.
+            #   3) Hiçbiri tutmadıysa: Video Overview tool kartına tıkla → ya
+            #      customize dialog (= hiç üretilmemiş) ya da generating
+            #      indicator (= hâlâ üretiliyor) gör — ikisi de "not_ready".
 
-            # 1) Sayfada zaten <video> var mı?
-            for sel in ('video[src]', 'video source[src]'):
+            # === Strateji 0: ⋮ menü → Download ===
+            menu_button_selectors = [
+                # Studio panelinde produced video item üzerinde "More" butonu
+                '[role="complementary"] [aria-label*="More" i]',
+                'aside [aria-label*="More" i]',
+                '[role="complementary"] button[aria-label*="more" i]',
+                'aside button[aria-label*="more" i]',
+                # Material Design icon-only "more_vert" butonu
+                'button:has(mat-icon:has-text("more_vert"))',
+                '[role="button"]:has(mat-icon:has-text("more_vert"))',
+                # Generic
+                'button[aria-label="More options"]',
+                'button[aria-label="More"]',
+                'button[aria-label*="seçenek" i]',  # TR: "daha fazla seçenek"
+            ]
+
+            download_menu_selectors = [
+                '[role="menuitem"]:has-text("Download")',
+                '[role="menuitem"]:has-text("İndir")',
+                'button:has-text("Download")',
+                'button:has-text("İndir")',
+                'a:has-text("Download")',
+                'a:has-text("İndir")',
+                # Material menu
+                'mat-menu-item:has-text("Download")',
+                'mat-menu-item:has-text("İndir")',
+                # Icon + text
+                '[role="menuitem"]:has(mat-icon:has-text("download"))',
+            ]
+
+            for menu_sel in menu_button_selectors:
                 try:
-                    loc = page.locator(sel).first
-                    loc.wait_for(state="attached", timeout=1500)
-                    src = loc.get_attribute("src") or ""
-                    if src and (src.startswith("http") or src.startswith("blob:")):
-                        video_url = src
-                        emitter.emit("harvest_video_inline", src=src[:120])
+                    menu_loc = page.locator(menu_sel).first
+                    menu_loc.wait_for(state="visible", timeout=1500)
+                    if not _click_with_fallback(menu_loc, page):
+                        continue
+                    emitter.emit("harvest_menu_clicked", selector=menu_sel)
+                    time.sleep(1)
+
+                    # Menu açıldı — Download seçeneğini bul ve tıklarken
+                    # download event'ini yakala
+                    for dl_sel in download_menu_selectors:
+                        try:
+                            dl_loc = page.locator(dl_sel).first
+                            dl_loc.wait_for(state="visible", timeout=2000)
+                            download_dir.mkdir(parents=True, exist_ok=True)
+                            target = download_dir / f"{job_id}.mp4"
+                            with page.expect_download(timeout=300_000) as dl_info:
+                                _click_with_fallback(dl_loc, page)
+                            dl = dl_info.value
+                            dl.save_as(str(target))
+                            size_mb = target.stat().st_size / (1024 * 1024) if target.exists() else 0
+                            emitter.emit(
+                                "harvest_downloaded",
+                                path=str(target),
+                                size_mb=round(size_mb, 2),
+                                via="menu_download",
+                            )
+                            local_path = target
+                            # Üretilen dosya adını da kayıt
+                            try:
+                                emitter.emit(
+                                    "harvest_download_meta",
+                                    suggested_filename=dl.suggested_filename,
+                                    url=dl.url,
+                                )
+                                # Eğer download URL'i HTTP ise video_url olarak da kaydet
+                                if dl.url and dl.url.startswith("http"):
+                                    video_url = dl.url
+                            except Exception:
+                                pass
+                            break
+                        except Exception:
+                            continue
+
+                    if local_path:
                         break
+                    # Menü açıldı ama download bulunamadı — escape ile kapat, devam et
+                    try:
+                        page.keyboard.press("Escape")
+                    except Exception:
+                        pass
                 except Exception:
                     continue
 
+            # === Strateji 1: video[src] direkt sayfada var mı? ===
+            # 1) Sayfada zaten <video> var mı? (sadece menü/download başaramazsa)
+            if not local_path:
+                for sel in ('video[src]', 'video source[src]'):
+                    try:
+                        loc = page.locator(sel).first
+                        loc.wait_for(state="attached", timeout=1500)
+                        src = loc.get_attribute("src") or ""
+                        if src and (src.startswith("http") or src.startswith("blob:")):
+                            video_url = src
+                            emitter.emit("harvest_video_inline", src=src[:120])
+                            break
+                    except Exception:
+                        continue
+
             # 2) Yoksa produced-video play butonunu ara ve tıkla
-            if not video_url:
+            if not video_url and not local_path:
                 produced_play_selectors = [
                     # Studio panel üretilmiş öğe play butonları
                     '[role="complementary"] [aria-label="Play"]',
@@ -912,7 +1000,7 @@ def run_harvest(
 
             # 3) Hâlâ video yok — Video Overview kartına tıklayarak durumu anla
             #    (still_generating mı, hiç üretilmemiş mi)
-            if not video_url:
+            if not video_url and not local_path:
                 voloc = _find_first_visible(page, VIDEO_OVERVIEW_SELECTORS, timeout_ms=8000)
                 if voloc is None:
                     emitter.emit("harvest_video_card_not_found")
@@ -966,42 +1054,44 @@ def run_harvest(
                     except Exception:
                         continue
 
-            if not video_url:
+            # Hâlâ ne local_path ne video_url varsa: ya hiç üretilmemiş ya
+            # da still generating — retry.
+            if not video_url and not local_path:
                 emitter.emit("harvest_video_not_found")
                 _take_screenshot(page, screenshots_dir, f"{job_id}_harvest_no_video")
                 exit_code = 2
                 return exit_code
 
-            emitter.emit("harvest_video_url_found", video_url=video_url)
+            # video_url var ama henüz indirmedik (Strateji 0 başarısız oldu,
+            # Strateji 1 veya 2 URL buldu) → Phase 2: cookie ile fetch
+            if video_url and not local_path:
+                emitter.emit("harvest_video_url_found", video_url=video_url)
+                try:
+                    download_dir.mkdir(parents=True, exist_ok=True)
+                    target = download_dir / f"{job_id}.mp4"
+                    api = context.request
+                    response = api.get(video_url, timeout=300_000)  # 5 dk timeout
+                    if response.ok:
+                        body = response.body()
+                        target.write_bytes(body)
+                        size_mb = len(body) / (1024 * 1024)
+                        local_path = target
+                        emitter.emit(
+                            "harvest_downloaded",
+                            path=str(target),
+                            size_mb=round(size_mb, 2),
+                            via="cookie_fetch",
+                        )
+                    else:
+                        emitter.emit(
+                            "harvest_download_failed",
+                            status=response.status,
+                            url=video_url[:120],
+                        )
+                except Exception as e:
+                    emitter.emit("harvest_download_error", error=str(e))
 
-            # Phase 2: video'yu cookie'ler ile indir
-            try:
-                download_dir.mkdir(parents=True, exist_ok=True)
-                local_path = download_dir / f"{job_id}.mp4"
-                # Playwright APIRequestContext browser cookie'lerini otomatik kullanır
-                api = context.request
-                response = api.get(video_url, timeout=300_000)  # 5 dk timeout
-                if response.ok:
-                    body = response.body()
-                    local_path.write_bytes(body)
-                    size_mb = len(body) / (1024 * 1024)
-                    emitter.emit(
-                        "harvest_downloaded",
-                        path=str(local_path),
-                        size_mb=round(size_mb, 2),
-                    )
-                else:
-                    emitter.emit(
-                        "harvest_download_failed",
-                        status=response.status,
-                        url=video_url,
-                    )
-                    local_path = None
-            except Exception as e:
-                emitter.emit("harvest_download_error", error=str(e))
-                local_path = None
-
-            exit_code = 0
+            exit_code = 0 if local_path else 2
         except RuntimeError:
             # Zaten emit edildi
             pass

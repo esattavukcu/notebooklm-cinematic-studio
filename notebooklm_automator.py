@@ -199,6 +199,16 @@ DESCRIPTION_INPUT_SELECTORS = [
 # NotebookLM bazen authuser query param'ı redirect eder. authuser=N: account index.
 DEFAULT_HOMEPAGE = "https://notebooklm.google.com/"
 
+# Eğer Playwright'ın bundled Chromium'u o OS için yoksa (ör. Ubuntu 26.04
+# henüz Playwright tarafından desteklenmiyor), env var ile sistem Chrome'una
+# yönlendirilebilir. Tipik değer: /usr/bin/google-chrome-stable
+_SYSTEM_BROWSER_EXEC = os.environ.get("PLAYWRIGHT_CHROMIUM_EXECUTABLE_PATH", "").strip()
+
+
+def _launch_kwargs_extra() -> dict:
+    """Eğer env var set edilmişse executable_path'i launch kwargs'lara ekle."""
+    return {"executable_path": _SYSTEM_BROWSER_EXEC} if _SYSTEM_BROWSER_EXEC else {}
+
 
 # ---------------------------------------------------------------------------
 # Yardımcı: bir selector listesinde ilk eşleşeni bul (timeout küçük). Hiçbiri
@@ -277,6 +287,7 @@ def run_init(profile_dir: Path, authuser: int, emitter: EventEmitter) -> int:
                 "--disable-features=DownloadBubble,DownloadBubbleV2",
             ],
             accept_downloads=True,
+            **_launch_kwargs_extra(),
         )
         # Yeni veya mevcut sayfa
         page = context.pages[0] if context.pages else context.new_page()
@@ -555,7 +566,7 @@ def run_automation(
         try:
             if auth_json.exists():
                 emitter.emit("launch_mode", mode="storage_state")
-                browser = pw.chromium.launch(headless=headless, args=launch_args)
+                browser = pw.chromium.launch(headless=headless, args=launch_args, **_launch_kwargs_extra())
                 context = browser.new_context(
                     storage_state=str(auth_json),
                     accept_downloads=True,
@@ -567,6 +578,7 @@ def run_automation(
                     headless=headless,
                     args=launch_args,
                     accept_downloads=True,
+                    **_launch_kwargs_extra(),
                 )
 
             page = context.pages[0] if context.pages else context.new_page()
@@ -803,7 +815,7 @@ def run_harvest(
         try:
             if auth_json.exists():
                 emitter.emit("harvest_launch", mode="storage_state")
-                browser = pw.chromium.launch(headless=headless, args=launch_args)
+                browser = pw.chromium.launch(headless=headless, args=launch_args, **_launch_kwargs_extra())
                 context = browser.new_context(
                     storage_state=str(auth_json),
                     accept_downloads=True,
@@ -815,6 +827,7 @@ def run_harvest(
                     headless=headless,
                     args=launch_args,
                     accept_downloads=True,
+                    **_launch_kwargs_extra(),
                 )
 
             page = context.pages[0] if context.pages else context.new_page()

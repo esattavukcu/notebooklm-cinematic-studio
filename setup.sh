@@ -28,7 +28,14 @@ echo "==> Bağımlılıklar yükleniyor..."
 pip install -r requirements.txt
 
 echo "==> Playwright Chromium indiriliyor (ilk seferde 100-150MB)..."
-python -m playwright install chromium
+if ! python -m playwright install chromium 2>&1; then
+  echo ""
+  echo "    ⚠ Playwright bundled Chromium bu OS için desteklenmiyor."
+  echo "    ⚠ Sistem Chrome'u kurman + .env'e PLAYWRIGHT_CHROMIUM_EXECUTABLE_PATH"
+  echo "      eklemen gerekecek. Detay: deploy/README.md → 'Sorun giderme'"
+  echo ""
+  echo "    Kurulum devam ediyor (eksik browser sonradan halledilebilir)..."
+fi
 
 echo "==> Veri klasörleri hazırlanıyor..."
 mkdir -p data/logs/screenshots chrome_profiles data/downloads

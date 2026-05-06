@@ -623,7 +623,31 @@ class Worker:
             if url:
                 target.notebook_url = url
         elif etype == "quota_exceeded":
-            target.error = "NotebookLM günlük Cinematic kotası dolmuş — yarın resetlenir veya başka hesap kullan."
+            # Bu profilin kotası dolmuş — bugün için bir failed kayıt bırak ki
+            # _quota_blocked_today() bu profili pas geçsin. Ama job'un kendisini
+            # queued'a döndür, başka profile dispatch edilsin.
+            quota_marker = Job(
+                id=uuid.uuid4().hex[:12],
+                title=f"[KOTA] {target.title[:50]}",
+                text="(quota detection marker)",
+                profile_id=target.profile_id,
+                profile_name=target.profile_name,
+                status="failed",
+                error="NotebookLM günlük Cinematic kotası dolmuş — yarın resetlenir.",
+                started_at=time.time(),
+                finished_at=time.time(),
+                submitted_by="system",
+            )
+            jobs.append(quota_marker)
+            # Asıl job'u queued'a geri al — Worker başka profile dene
+            target.status = "queued"
+            target.profile_id = ""
+            target.profile_name = ""
+            target.started_at = 0.0
+            target.finished_at = 0.0
+            target.notebook_url = ""  # eski profilin oluşturduğu notebook'u unut
+            target.pid = 0
+            launcher_log(f"Job {target.id} requeued: {target.profile_name} kotası dolu, başka profile denenecek.")
         elif etype in ("login_required_headless", "login_timeout"):
             target.error = (
                 "Hesap login süresi geçmiş veya hiç yapılmamış. "
@@ -647,15 +671,20 @@ class Worker:
             except Exception:
                 pass
         elif etype == "automation_complete":
-            url = evt.get("notebook_url", "") or target.notebook_url
-            target.notebook_url = url
-            if int(evt.get("exit_code", 1)) == 0:
-                target.status = "done" if url else "submitted"
+            # Eğer quota_exceeded başka event tarafından zaten queued'a alındıysa
+            # (kota auto-retry), bu event'i skip et — yoksa failed'e override eder.
+            if target.status == "queued":
+                pass  # already requeued, no-op
             else:
-                target.status = "failed"
-                if not target.error:
-                    target.error = "automator exit_code != 0"
-            target.finished_at = time.time()
+                url = evt.get("notebook_url", "") or target.notebook_url
+                target.notebook_url = url
+                if int(evt.get("exit_code", 1)) == 0:
+                    target.status = "done" if url else "submitted"
+                else:
+                    target.status = "failed"
+                    if not target.error:
+                        target.error = "automator exit_code != 0"
+                target.finished_at = time.time()
         elif etype == "automation_error":
             target.error = str(evt.get("error", ""))[:500]
         save_jobs(jobs)

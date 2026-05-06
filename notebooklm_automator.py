@@ -749,17 +749,210 @@ def run_automation(
 
 
 # ---------------------------------------------------------------------------
+# HARVEST: video üretimi tamamlanmış notebook'a tekrar gir, video URL'ini
+# bul, indir. Phase 1 (URL) + Phase 2 (download) tek subprocess'te.
+# ---------------------------------------------------------------------------
+def run_harvest(
+    notebook_url: str,
+    profile_dir: Path,
+    authuser: int,
+    headless: bool,
+    emitter: EventEmitter,
+    job_id: str,
+    download_dir: Path,
+    screenshots_dir: Path,
+) -> int:
+    from playwright.sync_api import sync_playwright
+
+    profile_dir.mkdir(parents=True, exist_ok=True)
+    cleanup_profile_locks(profile_dir)
+    _ensure_stable_tmpdir(profile_dir)
+
+    auth_json = profile_dir / "auth.json"
+    exit_code = 1
+    video_url: Optional[str] = None
+    local_path: Optional[Path] = None
+
+    # Hâlâ üretim göstergesi var mı kontrolü için
+    not_ready_indicators = [
+        'text=/generating/i',
+        'text=/üretiliyor/i',
+        'text=/oluşturuluyor/i',
+        'text=/preparing/i',
+        '[role="progressbar"]',
+        'mat-spinner',
+    ]
+
+    # Video player selectorları — modal veya inline
+    video_player_selectors = [
+        'video[src]',
+        '[role="dialog"] video',
+        'mat-dialog-container video',
+        '.cdk-overlay-pane video',
+        'video',  # son çare
+    ]
+
+    with sync_playwright() as pw:
+        browser = None
+        context = None
+        launch_args = [
+            "--disable-blink-features=AutomationControlled",
+            "--disable-features=DownloadBubble,DownloadBubbleV2",
+        ]
+
+        try:
+            if auth_json.exists():
+                emitter.emit("harvest_launch", mode="storage_state")
+                browser = pw.chromium.launch(headless=headless, args=launch_args)
+                context = browser.new_context(
+                    storage_state=str(auth_json),
+                    accept_downloads=True,
+                )
+            else:
+                emitter.emit("harvest_launch", mode="persistent")
+                context = pw.chromium.launch_persistent_context(
+                    user_data_dir=str(profile_dir),
+                    headless=headless,
+                    args=launch_args,
+                    accept_downloads=True,
+                )
+
+            page = context.pages[0] if context.pages else context.new_page()
+
+            emitter.emit("harvest_navigating", url=notebook_url)
+            page.goto(notebook_url, wait_until="domcontentloaded", timeout=60000)
+
+            # Login redirect kontrolü
+            time.sleep(1.5)
+            cur_url = page.url or ""
+            if "accounts.google.com" in cur_url or "/signin" in cur_url:
+                emitter.emit("harvest_login_required", url=cur_url)
+                _take_screenshot(page, screenshots_dir, f"{job_id}_harvest_login")
+                raise RuntimeError("login_required")
+
+            # Studio panelin yüklenmesini bekle
+            time.sleep(3)
+
+            # Video Overview kartını bul ve tıkla
+            voloc = _find_first_visible(page, VIDEO_OVERVIEW_SELECTORS, timeout_ms=15000)
+            if voloc is None:
+                emitter.emit("harvest_video_card_not_found")
+                _take_screenshot(page, screenshots_dir, f"{job_id}_harvest_no_card")
+                raise RuntimeError("video_card_not_found")
+
+            _click_with_fallback(voloc, page)
+            time.sleep(2)
+
+            # Önce hâlâ üretiliyor mu kontrol et (still generating)
+            still_generating = False
+            for sel in not_ready_indicators:
+                try:
+                    if page.locator(sel).first.is_visible(timeout=500):
+                        still_generating = True
+                        break
+                except Exception:
+                    continue
+
+            if still_generating:
+                emitter.emit("harvest_not_ready", reason="still_generating")
+                _take_screenshot(page, screenshots_dir, f"{job_id}_harvest_not_ready")
+                exit_code = 2  # caller bunu retry sinyali olarak kullanır
+                return exit_code
+
+            # Video player'i ara
+            for sel in video_player_selectors:
+                try:
+                    locator = page.locator(sel).first
+                    locator.wait_for(state="visible", timeout=4000)
+                    src = locator.get_attribute("src") or ""
+                    if not src:
+                        # source child elementinden dene
+                        try:
+                            src = page.locator(f"{sel} source").first.get_attribute("src") or ""
+                        except Exception:
+                            pass
+                    if src and src.startswith("http"):
+                        video_url = src
+                        break
+                except Exception:
+                    continue
+
+            if not video_url:
+                emitter.emit("harvest_video_not_found")
+                _take_screenshot(page, screenshots_dir, f"{job_id}_harvest_no_video")
+                exit_code = 2  # belki birazdan hazır olur
+                return exit_code
+
+            emitter.emit("harvest_video_url_found", video_url=video_url)
+
+            # Phase 2: video'yu cookie'ler ile indir
+            try:
+                download_dir.mkdir(parents=True, exist_ok=True)
+                local_path = download_dir / f"{job_id}.mp4"
+                # Playwright APIRequestContext browser cookie'lerini otomatik kullanır
+                api = context.request
+                response = api.get(video_url, timeout=300_000)  # 5 dk timeout
+                if response.ok:
+                    body = response.body()
+                    local_path.write_bytes(body)
+                    size_mb = len(body) / (1024 * 1024)
+                    emitter.emit(
+                        "harvest_downloaded",
+                        path=str(local_path),
+                        size_mb=round(size_mb, 2),
+                    )
+                else:
+                    emitter.emit(
+                        "harvest_download_failed",
+                        status=response.status,
+                        url=video_url,
+                    )
+                    local_path = None
+            except Exception as e:
+                emitter.emit("harvest_download_error", error=str(e))
+                local_path = None
+
+            exit_code = 0
+        except RuntimeError:
+            # Zaten emit edildi
+            pass
+        except Exception as e:
+            emitter.emit("harvest_error", error=str(e), trace=traceback.format_exc())
+            exit_code = 1
+        finally:
+            try:
+                if context is not None:
+                    context.close()
+            except Exception:
+                pass
+            try:
+                if browser is not None:
+                    browser.close()
+            except Exception:
+                pass
+
+    emitter.emit(
+        "harvest_complete",
+        exit_code=exit_code,
+        video_url=video_url or "",
+        local_path=str(local_path) if local_path else "",
+    )
+    return exit_code
+
+
+# ---------------------------------------------------------------------------
 # CLI
 # ---------------------------------------------------------------------------
 def main(argv: Optional[list[str]] = None) -> int:
     parser = argparse.ArgumentParser(description="NotebookLM Cinematic automator")
-    parser.add_argument("text", nargs="?", default="", help="Kaynak metin")
+    parser.add_argument("text", nargs="?", default="", help="Kaynak metin (automation modunda)")
     parser.add_argument("--profile-dir", required=True, help="Chromium user_data_dir")
     parser.add_argument("--authuser", type=int, default=0, help="Google account index (?authuser=N)")
     parser.add_argument("--headless", action="store_true", help="Headless çalış")
     parser.add_argument("--no-headless", dest="headless", action="store_false")
     parser.set_defaults(headless=True)
     parser.add_argument("--init", action="store_true", help="Login init modu")
+    parser.add_argument("--harvest", default="", help="Harvest modu: notebook URL'i ver, video bul/indir")
     parser.add_argument("--wait-input", dest="wait_input", action="store_true")
     parser.add_argument("--no-wait-input", dest="wait_input", action="store_false")
     parser.set_defaults(wait_input=False)
@@ -787,6 +980,18 @@ def main(argv: Optional[list[str]] = None) -> int:
 
     if args.init:
         return run_init(profile_dir, args.authuser, emitter)
+
+    if args.harvest:
+        return run_harvest(
+            notebook_url=args.harvest,
+            profile_dir=profile_dir,
+            authuser=args.authuser,
+            headless=args.headless,
+            emitter=emitter,
+            job_id=args.job_id,
+            download_dir=download_dir,
+            screenshots_dir=screenshots_dir,
+        )
 
     if not args.text.strip():
         emitter.emit("error", message="text boş — automation modunda gerekli")

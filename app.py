@@ -58,6 +58,18 @@ TERMINAL_STATUSES = {"done", "failed", "submitted", "stopped"}
 DISPATCH_INTERVAL_SEC = 2.0
 JOB_LOG_TAIL_LINES = 400
 
+# Harvest module config
+HARVEST_FIRST_DELAY_SEC = 30 * 60       # done olduktan ne kadar sonra ilk denemeyi yap
+HARVEST_RETRY_INTERVAL_SEC = 10 * 60    # not_ready olursa kaç dk sonra tekrar dene
+HARVEST_MAX_ATTEMPTS = 8                # toplam ~30 + 8*10 = 110 dk içinde vazgeç
+HARVEST_CHECK_INTERVAL_SEC = 60         # Worker kaç sn'de bir harvest round yapsın
+
+# Azure Blob upload config (env-var gated)
+AZURE_CONN = os.environ.get("AZURE_STORAGE_CONNECTION_STRING", "").strip()
+AZURE_CONTAINER = os.environ.get("AZURE_CONTAINER", "cinematic-videos").strip()
+AZURE_BLOB_PREFIX = os.environ.get("AZURE_BLOB_PREFIX", "videos/").strip()
+AZURE_ENABLED = bool(AZURE_CONN)
+
 PYTHON_BIN = sys.executable  # venv'in içindeki python
 
 # ---------------------------------------------------------------------------
@@ -139,6 +151,14 @@ class Job:
     finished_at: float = 0.0
     created_at: float = field(default_factory=time.time)
     submitted_by: str = ""           # Kullanıcının kendi adı (user view session_state'inden)
+    # Harvest (video collection) fields
+    video_url: str = ""              # NotebookLM tarafındaki direkt <video src> URL
+    video_local_path: str = ""       # data/downloads/<job_id>.mp4 (relative)
+    video_remote_url: str = ""       # Azure Blob URL (uploaded sonrası)
+    harvest_status: str = "pending"  # pending | checking | ready | downloaded | uploaded | expired | skip
+    harvest_attempts: int = 0
+    next_harvest_at: float = 0.0
+    harvest_error: str = ""
 
 
 # ---------------------------------------------------------------------------
@@ -241,6 +261,47 @@ def init_log_path(profile_id: str) -> Path:
     return LOGS_DIR / f"init_{profile_id}.log"
 
 
+def harvest_log_path(job_id: str) -> Path:
+    return LOGS_DIR / f"harvest_{job_id}.log"
+
+
+# ---------------------------------------------------------------------------
+# Azure Blob upload (Phase 3) — env var ile gated, opsiyonel.
+# AZURE_STORAGE_CONNECTION_STRING ve AZURE_CONTAINER set edilmediyse skip.
+# ---------------------------------------------------------------------------
+def upload_to_azure(local_path: Path, job_id: str) -> tuple[bool, str, str]:
+    """Returns (success, remote_url_or_empty, error_or_empty)."""
+    if not AZURE_ENABLED:
+        return False, "", "azure_disabled"
+    try:
+        # azure-storage-blob opsiyonel — eksikse graceful fail
+        from azure.storage.blob import BlobServiceClient, ContentSettings
+    except ImportError:
+        return False, "", "azure-storage-blob package not installed"
+
+    try:
+        blob_name = f"{AZURE_BLOB_PREFIX.rstrip('/')}/{job_id}.mp4"
+        svc = BlobServiceClient.from_connection_string(AZURE_CONN)
+        container = svc.get_container_client(AZURE_CONTAINER)
+        # Container yoksa oluşturmaya çalış (yetkisi varsa). Yoksa next call fail eder.
+        try:
+            container.create_container()
+        except Exception:
+            pass
+        blob = container.get_blob_client(blob_name)
+        with local_path.open("rb") as f:
+            blob.upload_blob(
+                f,
+                overwrite=True,
+                content_settings=ContentSettings(content_type="video/mp4"),
+            )
+        # Public URL — container public ise direkt çalışır.
+        # Private container kullanıyorsa SAS token gerekecek; şimdilik base URL döndürüyoruz.
+        return True, blob.url, ""
+    except Exception as e:
+        return False, "", str(e)[:300]
+
+
 # ---------------------------------------------------------------------------
 # Worker — background dispatcher thread
 # ---------------------------------------------------------------------------
@@ -293,11 +354,16 @@ class Worker:
         return False
 
     def _loop(self) -> None:
+        last_harvest_check = 0.0
         while not self._stop_evt.is_set():
             try:
                 self._auto_init_check()
                 self._dispatch_round()
                 self._reap_finished()
+                # Harvest round'u her HARVEST_CHECK_INTERVAL_SEC'de bir çağır
+                if time.time() - last_harvest_check >= HARVEST_CHECK_INTERVAL_SEC:
+                    self._harvest_round()
+                    last_harvest_check = time.time()
             except Exception as e:
                 launcher_log(f"dispatch error: {e!r}")
             self._stop_evt.wait(DISPATCH_INTERVAL_SEC)
@@ -580,6 +646,229 @@ class Worker:
                         break
                 if changed:
                     save_jobs(jobs)
+
+    # ----- HARVEST -----
+
+    def _harvest_round(self) -> None:
+        """Done job'lar için video harvest cycle. Worker thread'ten dakikada bir çağrılır."""
+        jobs = load_jobs()
+        now = time.time()
+        candidates = []
+        for j in jobs:
+            # Sadece notebook_url'i olan ve harvest'i bitmemiş done/submitted job'lar
+            if j.status not in ("done", "submitted"):
+                continue
+            if not j.notebook_url:
+                continue
+            if j.harvest_status in ("ready", "downloaded", "uploaded", "expired", "skip"):
+                continue
+            # İlk deneme için: finished_at + HARVEST_FIRST_DELAY_SEC bekleyelim
+            if j.harvest_attempts == 0:
+                if (j.finished_at or j.created_at) + HARVEST_FIRST_DELAY_SEC > now:
+                    continue
+            else:
+                if j.next_harvest_at > now:
+                    continue
+            candidates.append(j)
+
+        if not candidates:
+            return
+
+        # Aynı anda çok harvest açma — round başına 1 tane (yavaş ama güvenli)
+        target = candidates[0]
+        self._launch_harvest(target)
+
+    def _launch_harvest(self, job: Job) -> None:
+        """Harvest subprocess'ini ayağa kaldır, blocking değil."""
+        # Profile bul (auth.json kullanmak için)
+        profiles = load_profiles()
+        profile = next((p for p in profiles if p.id == job.profile_id), None)
+        if profile is None:
+            self._mark_harvest_expired(job.id, "profile not found")
+            return
+
+        # Status güncelle: checking, attempt+1
+        jobs = load_jobs()
+        for j in jobs:
+            if j.id == job.id:
+                j.harvest_status = "checking"
+                j.harvest_attempts += 1
+                break
+        save_jobs(jobs)
+
+        cmd = [
+            PYTHON_BIN,
+            str(APP_DIR / "notebooklm_automator.py"),
+            "--profile-dir", str(PROFILES_DIR / profile.id),
+            "--authuser", str(profile.authuser),
+            "--harvest", job.notebook_url,
+            "--job-id", job.id,
+            "--json-events",
+            "--headless",
+            "--download-dir", str(DOWNLOADS_DIR),
+            "--screenshots-dir", str(SCREENSHOTS_DIR),
+        ]
+        log_path = harvest_log_path(job.id)
+        log_path.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            log_fp = log_path.open("a", encoding="utf-8", buffering=1)
+            log_fp.write(f"\n# Harvest attempt #{job.harvest_attempts} at {datetime.now().isoformat(timespec='seconds')}\n")
+            log_fp.write(f"# Cmd: {' '.join(cmd)}\n")
+            log_fp.flush()
+            proc = subprocess.Popen(
+                cmd,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                cwd=str(APP_DIR),
+                text=True,
+                bufsize=1,
+            )
+            t = threading.Thread(
+                target=self._harvest_stdout_reader,
+                args=(job.id, proc, log_fp),
+                name=f"harvest-{job.id}",
+                daemon=True,
+            )
+            t.start()
+            launcher_log(f"Harvest #{job.harvest_attempts} launched for job {job.id} (pid={proc.pid})")
+        except Exception as e:
+            self._mark_harvest_expired(job.id, f"launch failed: {e!r}")
+
+    def _harvest_stdout_reader(self, job_id: str, proc: subprocess.Popen, log_fp) -> None:
+        video_url = ""
+        local_path = ""
+        not_ready = False
+        login_required = False
+        try:
+            assert proc.stdout is not None
+            for line in proc.stdout:
+                try:
+                    log_fp.write(line); log_fp.flush()
+                except Exception:
+                    pass
+                line = line.rstrip()
+                if line.startswith("##JSON## "):
+                    try:
+                        evt = json.loads(line[len("##JSON## "):])
+                    except json.JSONDecodeError:
+                        continue
+                    et = evt.get("type", "")
+                    if et == "harvest_video_url_found":
+                        video_url = evt.get("video_url", "")
+                    elif et == "harvest_downloaded":
+                        local_path = evt.get("path", "")
+                    elif et == "harvest_not_ready":
+                        not_ready = True
+                    elif et == "harvest_login_required":
+                        login_required = True
+        except Exception as e:
+            launcher_log(f"harvest stdout reader for {job_id} failed: {e!r}")
+        finally:
+            try:
+                log_fp.close()
+            except Exception:
+                pass
+
+        rc = proc.wait()
+        self._apply_harvest_result(job_id, rc, video_url, local_path, not_ready, login_required)
+
+    def _apply_harvest_result(
+        self,
+        job_id: str,
+        rc: int,
+        video_url: str,
+        local_path: str,
+        not_ready: bool,
+        login_required: bool,
+    ) -> None:
+        jobs = load_jobs()
+        target: Optional[Job] = next((j for j in jobs if j.id == job_id), None)
+        if target is None:
+            return
+
+        if login_required:
+            target.harvest_status = "expired"
+            target.harvest_error = "Hesap login süresi geçmiş — admin re-login yapsın"
+            save_jobs(jobs)
+            return
+
+        if video_url:
+            target.video_url = video_url
+            target.harvest_status = "ready"
+            if local_path:
+                # Relative path olarak sakla (data/downloads altında)
+                try:
+                    rel = Path(local_path).resolve().relative_to(APP_DIR)
+                    target.video_local_path = str(rel)
+                except (ValueError, OSError):
+                    target.video_local_path = local_path
+                target.harvest_status = "downloaded"
+            save_jobs(jobs)
+
+            # Phase 3: Azure upload (eğer enabled ise ve dosya varsa)
+            if AZURE_ENABLED and target.video_local_path:
+                full_path = APP_DIR / target.video_local_path
+                if full_path.exists():
+                    ok, remote_url, err = upload_to_azure(full_path, job_id)
+                    jobs2 = load_jobs()
+                    for j in jobs2:
+                        if j.id == job_id:
+                            if ok:
+                                j.video_remote_url = remote_url
+                                j.harvest_status = "uploaded"
+                            else:
+                                j.harvest_error = f"Azure upload failed: {err}"
+                            break
+                    save_jobs(jobs2)
+                    launcher_log(
+                        f"Azure upload for {job_id}: {'ok' if ok else 'failed'} {err}"
+                    )
+            return
+
+        # Video yok henüz — retry veya expire
+        if not_ready or rc == 2:
+            if target.harvest_attempts >= HARVEST_MAX_ATTEMPTS:
+                target.harvest_status = "expired"
+                target.harvest_error = (
+                    f"{HARVEST_MAX_ATTEMPTS} denemeden sonra video hazır değildi"
+                )
+            else:
+                target.harvest_status = "pending"
+                target.next_harvest_at = time.time() + HARVEST_RETRY_INTERVAL_SEC
+            save_jobs(jobs)
+            return
+
+        # Beklenmedik failure
+        if target.harvest_attempts >= HARVEST_MAX_ATTEMPTS:
+            target.harvest_status = "expired"
+            target.harvest_error = f"Harvest hatası (rc={rc})"
+        else:
+            target.harvest_status = "pending"
+            target.next_harvest_at = time.time() + HARVEST_RETRY_INTERVAL_SEC
+            target.harvest_error = f"rc={rc}, retry"
+        save_jobs(jobs)
+
+    def _mark_harvest_expired(self, job_id: str, reason: str) -> None:
+        jobs = load_jobs()
+        for j in jobs:
+            if j.id == job_id:
+                j.harvest_status = "expired"
+                j.harvest_error = reason
+                break
+        save_jobs(jobs)
+
+    def trigger_harvest_now(self, job_id: str) -> bool:
+        """Admin'in 'şimdi harvest et' butonu için. Job'u next_harvest_at=now yapar."""
+        jobs = load_jobs()
+        for j in jobs:
+            if j.id == job_id:
+                if j.harvest_status not in ("ready", "downloaded", "uploaded"):
+                    j.harvest_status = "pending"
+                    j.next_harvest_at = 0
+                    j.harvest_attempts = 0
+                    save_jobs(jobs)
+                    return True
+        return False
 
 
 def load_profiles_with_updates(updated: list[Profile]) -> list[Profile]:
@@ -1121,7 +1410,29 @@ def render_user_view() -> None:
                         elapsed = fmt_duration(j.started_at, 0)
                         sub = f"▶ NotebookLM tetikleniyor · {elapsed} sürdü"
                     elif j.status == "done":
-                        sub = "✓ Tetiklendi! Video 25-60 dk içinde NotebookLM'de hazır olur"
+                        # Harvest durumuna göre alt-başlık
+                        hs = j.harvest_status
+                        if hs == "uploaded":
+                            sub = "🎬 Video hazır + bulutta paylaşıma açık!"
+                        elif hs == "downloaded":
+                            sub = "🎬 Video hazır ve indirilmiş!"
+                        elif hs == "ready":
+                            sub = "🎬 Video hazır — oynatabilirsin"
+                        elif hs == "checking":
+                            sub = f"🔍 Video kontrol ediliyor... (deneme {j.harvest_attempts}/{HARVEST_MAX_ATTEMPTS})"
+                        elif hs == "expired":
+                            sub = "⌛ Video kontrolü zaman aşımı — Notebook'u açıp manuel bak"
+                        else:  # pending
+                            if j.harvest_attempts == 0:
+                                first_at = (j.finished_at or j.created_at) + HARVEST_FIRST_DELAY_SEC
+                                wait_min = max(0, int((first_at - time.time()) / 60))
+                                if wait_min > 0:
+                                    sub = f"✓ Tetiklendi · {wait_min} dk sonra video kontrol edilecek"
+                                else:
+                                    sub = "✓ Tetiklendi · video kontrolü çok yakında"
+                            else:
+                                next_min = max(0, int((j.next_harvest_at - time.time()) / 60))
+                                sub = f"🔍 Video henüz hazır değil · {next_min} dk sonra tekrar bakılacak (deneme {j.harvest_attempts}/{HARVEST_MAX_ATTEMPTS})"
                     elif j.status == "submitted":
                         sub = "📤 Tetiklendi (notebook URL'i yok). Admin loga baksın."
                     elif j.status == "failed":
@@ -1141,7 +1452,40 @@ def render_user_view() -> None:
                         unsafe_allow_html=True,
                     )
                 with cs[2]:
-                    if j.notebook_url and j.status in TERMINAL_STATUSES:
+                    # Öncelik: Azure remote URL > local download > video URL > notebook URL
+                    if j.video_remote_url:
+                        st.markdown(
+                            f'<a href="{j.video_remote_url}" target="_blank" '
+                            f'style="display:block; text-align:center; padding:6px 10px; '
+                            f'background:#10B981; color:white; border-radius:6px; '
+                            f'text-decoration:none; font-size:0.82rem; font-weight:600; '
+                            f'margin-bottom:4px;">☁️ Video aç</a>',
+                            unsafe_allow_html=True,
+                        )
+                    elif j.video_local_path and (APP_DIR / j.video_local_path).exists():
+                        full_path = APP_DIR / j.video_local_path
+                        try:
+                            with full_path.open("rb") as fh:
+                                st.download_button(
+                                    "⬇️ Videoyu indir",
+                                    data=fh.read(),
+                                    file_name=full_path.name,
+                                    mime="video/mp4",
+                                    key=f"u_dl_{j.id}",
+                                    use_container_width=True,
+                                )
+                        except OSError:
+                            pass
+                    elif j.video_url:
+                        st.markdown(
+                            f'<a href="{j.video_url}" target="_blank" '
+                            f'style="display:block; text-align:center; padding:6px 10px; '
+                            f'background:#6366F1; color:white; border-radius:6px; '
+                            f'text-decoration:none; font-size:0.82rem; font-weight:600; '
+                            f'margin-bottom:4px;">▶ Video oynat</a>',
+                            unsafe_allow_html=True,
+                        )
+                    elif j.notebook_url and j.status in TERMINAL_STATUSES:
                         if st.button("🌐 Notebook'u aç", key=f"u_open_{j.id}", use_container_width=True):
                             open_in_browser(j.notebook_url)
         st.markdown('</div>', unsafe_allow_html=True)
@@ -1525,12 +1869,22 @@ with tab_status:
             icon="🚫",
         )
 
-    cols = st.columns(5)
+    # Video harvest istatistikleri
+    n_video_ready = sum(1 for j in jobs if j.video_url and j.harvest_status in ("ready", "downloaded", "uploaded"))
+    n_video_uploaded = sum(1 for j in jobs if j.harvest_status == "uploaded")
+
+    cols = st.columns(6)
     cols[0].metric("⏳ Kuyrukta", counts.get("queued", 0))
     cols[1].metric("▶ Çalışan", counts.get("running", 0))
-    cols[2].metric("✓ Tamamlanan", counts.get("done", 0) + counts.get("submitted", 0))
-    cols[3].metric("⏱ Süresi geçti", counts.get("stopped", 0))
-    cols[4].metric("✗ Hatalı", counts.get("failed", 0))
+    cols[2].metric("✓ Tetiklendi", counts.get("done", 0) + counts.get("submitted", 0))
+    cols[3].metric("🎬 Video hazır", n_video_ready)
+    cols[4].metric("☁️ Azure'da", n_video_uploaded if AZURE_ENABLED else "-")
+    cols[5].metric("✗ Hatalı", counts.get("failed", 0))
+
+    if AZURE_ENABLED:
+        st.caption(f"☁️ Azure aktif · container: `{AZURE_CONTAINER}` · prefix: `{AZURE_BLOB_PREFIX}`")
+    else:
+        st.caption("ℹ️ Azure kapalı (`AZURE_STORAGE_CONNECTION_STRING` env var set edilmedi)")
 
     # CSV verisi (her zaman hazır)
     csv_buf = io.StringIO()
@@ -1636,9 +1990,36 @@ with tab_status:
                         )
 
             with cs[6]:
-                if j.notebook_url and j.status in TERMINAL_STATUSES:
-                    if st.button("🌐 Aç", key=f"open_{j.id}", help="Notebook'u tarayıcıda aç (manuel indirme için)", use_container_width=True):
+                # Video varsa video butonu öncelikli
+                if j.video_remote_url:
+                    st.markdown(
+                        f'<a href="{j.video_remote_url}" target="_blank" '
+                        f'style="display:block; text-align:center; padding:5px 8px; '
+                        f'background:#10B981; color:white; border-radius:6px; '
+                        f'text-decoration:none; font-size:0.78rem; font-weight:600;">'
+                        f'☁️ Cloud</a>',
+                        unsafe_allow_html=True,
+                    )
+                elif j.video_url:
+                    st.markdown(
+                        f'<a href="{j.video_url}" target="_blank" '
+                        f'style="display:block; text-align:center; padding:5px 8px; '
+                        f'background:#6366F1; color:white; border-radius:6px; '
+                        f'text-decoration:none; font-size:0.78rem; font-weight:600;">'
+                        f'▶ Video</a>',
+                        unsafe_allow_html=True,
+                    )
+                elif j.notebook_url and j.status in TERMINAL_STATUSES:
+                    if st.button("🌐 Aç", key=f"open_{j.id}", help="Notebook'u tarayıcıda aç", use_container_width=True):
                         open_in_browser(j.notebook_url)
+                # Harvest now (admin için, status done ama henüz video yoksa)
+                if (j.status == "done" and not j.video_url
+                    and j.harvest_status not in ("checking",)):
+                    if st.button("🔍 Şimdi tara", key=f"harvest_{j.id}",
+                                 help="Video harvest cycle'ını hemen tetikle", use_container_width=True):
+                        worker.trigger_harvest_now(j.id)
+                        st.toast("Harvest cycle tetiklendi.", icon="🔍")
+                        st.rerun()
                 if j.status == "running":
                     if st.button("🛑 Durdur", key=f"stop_{j.id}", help="Bu job'ı durdur", use_container_width=True):
                         worker.stop_job(j.id)

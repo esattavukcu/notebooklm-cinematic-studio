@@ -9,11 +9,13 @@ Birden fazla Google hesabı üzerinden NotebookLM'de **toplu Cinematic video ür
 - 🔁 **Round-robin profil dispatch** — N farklı Google hesabı paralel kullanılır
 - 📊 **Günlük limit takibi** — her hesap için ayrı (default: 3 video/gün)
 - 🧵 **Paralel slot** — aynı hesapla birden fazla browser instance (auth.json ile)
-- 📝 **Toplu metin kuyruğu** — checkbox ile seç, "kuyruğa ekle"
+- 📝 **Toplu metin kuyruğu** — kullanıcı senaryosunu yapıştırır, gönderir, biter
 - 🎬 **Cinematic varsayılan** — Video Overview kartı + Generate butonu
 - 🪟 **Headless** — varsayılan görünmez çalışır, focus çalmaz
 - 📜 **Job logu** — her job için ayrı .log dosyası, Streamlit'te görünür
-- 🌐 **Notebook URL'leri** kayıt altında — manuel indirme için tek tık
+- 🤖 **Auto-harvest** — video tetikleme bittikten 30 dk sonra otomatik notebook'a girer, video URL'ini bulur, lokale indirir, opsiyonel Azure'a yükler
+- 🚫 **Kota detection** — NotebookLM "daily limit reached" mesajını yakalar, etkilenen hesabı bugün için pas geçer
+- 🔓 **Auto-deinit** — Google session expire olunca profili otomatik kapatır, admin'e re-login işareti verir
 
 ## Kurulum (3 komut)
 
@@ -76,6 +78,40 @@ export ADMIN_PASSWORD="senin-secret-string"
 4. Aşağıdaki listede durumu izle:
    - ⏳ KUYRUKTA → ▶ ÇALIŞIYOR → ✓ TAMAMLANDI
 5. ✓ Tamamlandı olunca **🌐 Notebook'u aç** → NotebookLM'de Studio panelden 25-60 dk içinde video hazır olur.
+
+## 🤖 Harvest modülü (auto-collect video links)
+
+Job tetiklendikten sonra (`done` status), Worker arka planda otomatik olarak video harvest cycle'ı başlatır:
+
+| Aşama | Ne yapar | Job status |
+|---|---|---|
+| **Phase 1: Bul** | 30 dk sonra notebook'a girer, video player'ı bulur, `<video src>` URL'ini çıkarır | `pending` → `checking` → `ready` |
+| **Phase 2: İndir** | Video URL'ini cookie'lerle GET çekip `data/downloads/<job_id>.mp4` olarak kaydeder | `ready` → `downloaded` |
+| **Phase 3: Azure** | (Opsiyonel, env var gated) lokal dosyayı Azure Blob Storage'a yükler | `downloaded` → `uploaded` |
+
+**Retry mantığı**: Video hazır değilse 10 dk sonra tekrar dener, max 8 deneme (~110 dk). Sonunda `expired` olur.
+
+### Azure Blob upload'u aktive et (opsiyonel)
+
+```bash
+export AZURE_STORAGE_CONNECTION_STRING="DefaultEndpointsProtocol=https;AccountName=...;AccountKey=...;..."
+export AZURE_CONTAINER="cinematic-videos"   # default
+export AZURE_BLOB_PREFIX="videos/"          # default
+./app.sh
+```
+
+`AZURE_STORAGE_CONNECTION_STRING` set edilmediyse Phase 3 sessizce skip edilir, sadece Phase 1+2 çalışır (video URL + lokal dosya).
+
+**Container ACL**: Container public-read ise `blob.url` direkt çalışır. Private ise SAS token gerek (şu an direkt URL döndürüyoruz; gerekirse genişletilir).
+
+### Mustafa için fark
+
+Job listesi durumları:
+- ⏳ KUYRUKTA → ▶ ÇALIŞIYOR → ✓ Tetiklendi (X dk sonra video kontrol edilecek)
+- 🔍 Video kontrol ediliyor (deneme 2/8)
+- ✓ TAMAMLANDI · 🎬 **Video hazır + bulutta paylaşıma açık** → **☁️ Video aç** butonu
+
+Eskiden manuel notebook açıp Studio'dan indirmek gerekiyordu. Artık tek tıkla video açılır/indirilir.
 
 ## Mimari
 

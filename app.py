@@ -1925,18 +1925,39 @@ with tab_status:
     else:
         st.caption("ℹ️ Azure kapalı (`AZURE_STORAGE_CONNECTION_STRING` env var set edilmedi)")
 
+    # Tüm Azure URL'leri tek blokta — toplu paylaşım için
+    azure_jobs = [j for j in jobs if j.video_remote_url]
+    if azure_jobs:
+        with st.expander(f"📋 Tüm Azure URL'leri ({len(azure_jobs)})", expanded=False):
+            st.caption("Aşağıdaki bloku tek tıkla kopyalayabilirsin (köşedeki 📋 ikonu).")
+            lines = []
+            for j in sorted(azure_jobs, key=lambda x: x.created_at, reverse=True):
+                title_clean = j.title.replace("\n", " ")[:80]
+                submitter = f" [{j.submitted_by}]" if j.submitted_by else ""
+                lines.append(f"# {title_clean}{submitter}")
+                lines.append(j.video_remote_url)
+                lines.append("")
+            st.code("\n".join(lines), language=None)
+
     # CSV verisi (her zaman hazır)
     csv_buf = io.StringIO()
     csv_buf.write("﻿")  # BOM, Excel UTF-8 uyumu
     csv_w = csv.writer(csv_buf)
-    csv_w.writerow(["id", "title", "status", "profile", "started", "duration_sec", "notebook_url", "error"])
+    csv_w.writerow([
+        "id", "title", "status", "submitted_by", "profile", "started",
+        "duration_sec", "notebook_url",
+        "harvest_status", "video_url", "video_local_path", "azure_url",
+        "error",
+    ])
     for j in load_jobs():
         duration = (j.finished_at or time.time()) - j.started_at if j.started_at else 0
         csv_w.writerow([
-            j.id, j.title, j.status, j.profile_name,
+            j.id, j.title, j.status, j.submitted_by, j.profile_name,
             fmt_time(j.started_at),
             int(duration) if j.started_at else "",
-            j.notebook_url, j.error,
+            j.notebook_url,
+            j.harvest_status, j.video_url, j.video_local_path, j.video_remote_url,
+            j.error,
         ])
 
     st.markdown("&nbsp;", unsafe_allow_html=True)
@@ -2010,6 +2031,16 @@ with tab_status:
                         f'style="font-size:0.84rem; text-decoration:none;">🔗 Notebook aç</a>',
                         unsafe_allow_html=True,
                     )
+                # Azure URL — admin için copy butonlu görünüm.
+                # st.code() köşesinde built-in clipboard butonu var.
+                if j.video_remote_url:
+                    with st.expander("☁️ Azure URL", expanded=False):
+                        st.code(j.video_remote_url, language=None)
+                # Lokal NotebookLM video URL'i — short-lived ama referans için
+                elif j.video_url:
+                    with st.expander("▶ Video URL (NotebookLM CDN)", expanded=False):
+                        st.code(j.video_url, language=None)
+                        st.caption("Bu URL signed/short-lived olabilir — paylaşım için Azure URL daha güvenilir.")
                 if j.error:
                     err_lower = j.error.lower()
                     is_quota = "kota" in err_lower or "limit" in err_lower

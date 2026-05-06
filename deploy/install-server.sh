@@ -32,15 +32,12 @@ else
   SUDO="sudo"
 fi
 
-echo "==> [1/6] Sistem paketleri yükleniyor (apt update + Chromium deps)..."
+echo "==> [1/6] Sistem paketleri (universal — python, git, nginx, certbot)..."
 $SUDO apt-get update -qq
 $SUDO apt-get install -y -qq \
   python3 python3-pip python3-venv git curl rsync \
   nginx certbot python3-certbot-nginx \
-  libnss3 libatk-bridge2.0-0 libdrm2 libxkbcommon0 libxcomposite1 \
-  libxdamage1 libxfixes3 libxrandr2 libgbm1 libpango-1.0-0 libcairo2 \
-  libasound2t64 || \
-$SUDO apt-get install -y -qq libasound2  # Ubuntu 22.04 fallback
+  ca-certificates
 
 # Python 3.10+ kontrolü
 PY_VER=$(python3 -c 'import sys; print("%d.%d" % sys.version_info[:2])')
@@ -60,6 +57,15 @@ chmod +x setup.sh app.sh run.sh deploy/install-server.sh deploy/sync-profiles.sh
 
 echo "==> [4/6] Python venv + bağımlılıklar..."
 ./setup.sh
+
+echo "==> [4.5/6] Playwright Chromium OS dependencies (OS-aware install-deps)..."
+# Playwright'ın kendi paketleyicisi — Ubuntu/Debian sürümünden bağımsız doğru
+# libleri seçer (libasound2 vs libasound2t64, libatk-bridge2.0-0 vs ..t64).
+# Bu adım Ubuntu 22.04, 24.04, 26.04+ hepsinde çalışır.
+$SUDO ./.venv/bin/python -m playwright install-deps chromium || {
+  echo "    ⚠ playwright install-deps başarısız. Manuel kurulum gerekebilir:"
+  echo "      sudo apt install libnss3 libatk-bridge2.0-0* libasound2* libxkbcommon0"
+}
 
 echo "==> [5/6] systemd service kuruluyor..."
 SERVICE_FILE="/etc/systemd/system/notebooklm.service"

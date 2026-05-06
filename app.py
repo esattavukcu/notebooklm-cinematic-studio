@@ -322,6 +322,11 @@ def upload_to_azure(local_path: Path, job_id: str) -> tuple[bool, str, str]:
             )
 
         base_url = blob.url
+        # azure-storage-blob SAS-based credential ile init edildiğinde blob.url
+        # zaten SAS içerebilir. Duplicate eklemekten kaçın: ?sv= veya &sig=
+        # zaten varsa olduğu gibi döndür.
+        if "sig=" in base_url:
+            return True, base_url, ""
         sas = _extract_sas_from_conn(AZURE_CONN)
         if sas:
             # SAS-based connection: URL'e ekle → tarayıcıda direkt oynanabilir.

@@ -831,56 +831,145 @@ def run_harvest(
                 raise RuntimeError("login_required")
 
             # Studio panelin yüklenmesini bekle
-            time.sleep(3)
+            time.sleep(4)
 
-            # Video Overview kartını bul ve tıkla
-            voloc = _find_first_visible(page, VIDEO_OVERVIEW_SELECTORS, timeout_ms=15000)
-            if voloc is None:
-                emitter.emit("harvest_video_card_not_found")
-                _take_screenshot(page, screenshots_dir, f"{job_id}_harvest_no_card")
-                raise RuntimeError("video_card_not_found")
+            # Strateji: NotebookLM Studio panelinin alt kısmında "üretilmiş içerikler"
+            # listesi var. Video tamamlandıysa orada bir kart olarak gözüküyor —
+            # üzerinde ▶ play butonu, başlık, "20h" gibi yaş bilgisi.
+            # Video Overview kartına (üst tool kartı) tıklarsak customize dialog
+            # açılır (yeni video üretmek için), bu DOĞRU OLAN şey değil.
+            #
+            # Akış:
+            #   1) Sayfada veya Studio panelinde direkt video[src] var mı?
+            #   2) Yoksa: produced-video play butonunu bul, tıkla, modal/inline
+            #      player'da video[src] çıkar
+            #   3) İkisi de yoksa: Video Overview kartına tıkla → customize dialog
+            #      veya generating indicator → "not_ready"
 
-            _click_with_fallback(voloc, page)
-            time.sleep(2)
-
-            # Önce hâlâ üretiliyor mu kontrol et (still generating)
-            still_generating = False
-            for sel in not_ready_indicators:
+            # 1) Sayfada zaten <video> var mı?
+            for sel in ('video[src]', 'video source[src]'):
                 try:
-                    if page.locator(sel).first.is_visible(timeout=500):
-                        still_generating = True
-                        break
-                except Exception:
-                    continue
-
-            if still_generating:
-                emitter.emit("harvest_not_ready", reason="still_generating")
-                _take_screenshot(page, screenshots_dir, f"{job_id}_harvest_not_ready")
-                exit_code = 2  # caller bunu retry sinyali olarak kullanır
-                return exit_code
-
-            # Video player'i ara
-            for sel in video_player_selectors:
-                try:
-                    locator = page.locator(sel).first
-                    locator.wait_for(state="visible", timeout=4000)
-                    src = locator.get_attribute("src") or ""
-                    if not src:
-                        # source child elementinden dene
-                        try:
-                            src = page.locator(f"{sel} source").first.get_attribute("src") or ""
-                        except Exception:
-                            pass
-                    if src and src.startswith("http"):
+                    loc = page.locator(sel).first
+                    loc.wait_for(state="attached", timeout=1500)
+                    src = loc.get_attribute("src") or ""
+                    if src and (src.startswith("http") or src.startswith("blob:")):
                         video_url = src
+                        emitter.emit("harvest_video_inline", src=src[:120])
                         break
                 except Exception:
                     continue
+
+            # 2) Yoksa produced-video play butonunu ara ve tıkla
+            if not video_url:
+                produced_play_selectors = [
+                    # Studio panel üretilmiş öğe play butonları
+                    '[role="complementary"] [aria-label="Play"]',
+                    '[role="complementary"] [aria-label*="Play" i]',
+                    '[role="complementary"] button[aria-label*="play" i]',
+                    'aside [aria-label="Play"]',
+                    'aside button[aria-label*="play" i]',
+                    # Material icon play_arrow olan butonlar
+                    'button:has(mat-icon:has-text("play_arrow"))',
+                    '[role="button"]:has(mat-icon:has-text("play_arrow"))',
+                    # Generic
+                    'button[aria-label="Play"]',
+                    'button[aria-label*="Play video" i]',
+                    # SVG play icon
+                    'button:has(svg[d*="M8 5v14"])',  # play_arrow SVG path
+                ]
+                play_clicked = False
+                for sel in produced_play_selectors:
+                    try:
+                        play_loc = page.locator(sel).first
+                        play_loc.wait_for(state="visible", timeout=1500)
+                        if _click_with_fallback(play_loc, page):
+                            emitter.emit("harvest_play_clicked", selector=sel)
+                            play_clicked = True
+                            break
+                    except Exception:
+                        continue
+
+                if play_clicked:
+                    # Video player açılana kadar bekle, src çıkar
+                    time.sleep(2)
+                    for sel in ('video[src]', '[role="dialog"] video', 'mat-dialog-container video',
+                                '.cdk-overlay-pane video', 'video'):
+                        try:
+                            vloc = page.locator(sel).first
+                            vloc.wait_for(state="visible", timeout=4000)
+                            src = vloc.get_attribute("src") or ""
+                            if not src:
+                                try:
+                                    src = page.locator(f"{sel} source").first.get_attribute("src") or ""
+                                except Exception:
+                                    pass
+                            if src and (src.startswith("http") or src.startswith("blob:")):
+                                video_url = src
+                                emitter.emit("harvest_video_after_play", src=src[:120])
+                                break
+                        except Exception:
+                            continue
+
+            # 3) Hâlâ video yok — Video Overview kartına tıklayarak durumu anla
+            #    (still_generating mı, hiç üretilmemiş mi)
+            if not video_url:
+                voloc = _find_first_visible(page, VIDEO_OVERVIEW_SELECTORS, timeout_ms=8000)
+                if voloc is None:
+                    emitter.emit("harvest_video_card_not_found")
+                    _take_screenshot(page, screenshots_dir, f"{job_id}_harvest_no_card")
+                    raise RuntimeError("video_card_not_found")
+
+                _click_with_fallback(voloc, page)
+                time.sleep(2)
+
+                # Generating indicator?
+                still_generating = False
+                for sel in not_ready_indicators:
+                    try:
+                        if page.locator(sel).first.is_visible(timeout=500):
+                            still_generating = True
+                            break
+                    except Exception:
+                        continue
+
+                if still_generating:
+                    emitter.emit("harvest_not_ready", reason="still_generating")
+                    _take_screenshot(page, screenshots_dir, f"{job_id}_harvest_not_ready")
+                    exit_code = 2
+                    return exit_code
+
+                # Customize dialog açıldıysa = bu notebook'ta hiç video üretilmemiş
+                dialog_open = False
+                for sel in ('[role="dialog"]', 'mat-dialog-container', '.cdk-overlay-pane'):
+                    try:
+                        if page.locator(sel).first.is_visible(timeout=500):
+                            dialog_open = True
+                            break
+                    except Exception:
+                        continue
+
+                if dialog_open:
+                    emitter.emit("harvest_no_video_produced", reason="customize_dialog_opened")
+                    _take_screenshot(page, screenshots_dir, f"{job_id}_harvest_no_produced")
+                    exit_code = 2  # retry — belki ilerde üretilir
+                    return exit_code
+
+                # Bir kez daha video[src] dene (kartla tetiklenmiş olabilir)
+                for sel in video_player_selectors:
+                    try:
+                        locator = page.locator(sel).first
+                        locator.wait_for(state="visible", timeout=4000)
+                        src = locator.get_attribute("src") or ""
+                        if src and (src.startswith("http") or src.startswith("blob:")):
+                            video_url = src
+                            break
+                    except Exception:
+                        continue
 
             if not video_url:
                 emitter.emit("harvest_video_not_found")
                 _take_screenshot(page, screenshots_dir, f"{job_id}_harvest_no_video")
-                exit_code = 2  # belki birazdan hazır olur
+                exit_code = 2
                 return exit_code
 
             emitter.emit("harvest_video_url_found", video_url=video_url)

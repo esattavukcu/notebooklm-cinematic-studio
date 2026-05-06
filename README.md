@@ -157,10 +157,28 @@ Tam EC2 deployment rehberi (instance specs, security group, nginx + Let's Encryp
 | Dosya | Amaç |
 |---|---|
 | `deploy/install-server.sh` | apt deps + clone + venv + systemd service kurulumu |
+| `deploy/install-vnc.sh` | xvfb + x11vnc + noVNC kurulumu (server-side login için) |
 | `deploy/notebooklm.service` | systemd unit dosyası |
-| `deploy/nginx.conf.template` | reverse proxy + websocket + basic auth |
+| `deploy/nginx.conf.template` | reverse proxy + websocket + basic auth + /vnc/ |
 | `deploy/sync-profiles.sh` | Lokal `chrome_profiles/` + `.env` → sunucuya rsync |
 | `deploy/README.md` | Adım adım AWS EC2 rehberi |
+
+### Server-side login akışı (Mac'e gerek olmadan hesap ekleme)
+
+`deploy/install-vnc.sh` ile sunucuda `xvfb` + `x11vnc` + `noVNC` kurulu ise, admin "🔓 Hesabı aktive et" butonuna tıkladığında:
+
+1. Chromium sunucudaki virtual display'de açılır (görünmez)
+2. Admin UI'da **🖥️ VNC ekranını aç** linki çıkar
+3. Linke tıklayınca yeni tab'da Chromium browser-içinde görünür (noVNC web client)
+4. Google login yapılır, pencere kapanır
+5. `auth.json` sunucuda yazılır, profil otomatik aktif olur
+
+`.env`'de aktive et:
+```
+HEADLESS_INIT_DISPLAY=:99
+```
+
+Lokal'de boş bırak — Chromium native pencerede açılır.
 
 ## Mimari
 

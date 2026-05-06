@@ -86,6 +86,12 @@ AZURE_CONTAINER = os.environ.get("AZURE_CONTAINER", "cinematic-videos").strip()
 AZURE_BLOB_PREFIX = os.environ.get("AZURE_BLOB_PREFIX", "videos/").strip()
 AZURE_ENABLED = bool(AZURE_CONN)
 
+# Server-side login UI (xvfb + noVNC). Set ise Chromium init virtual display'de
+# açılır, admin /vnc/ üzerinden tarayıcıdan görüp login olur — Mac gerekmez.
+# Lokal deployment'ta boş bırak (Chromium native pencerede açılır).
+HEADLESS_INIT_DISPLAY = os.environ.get("HEADLESS_INIT_DISPLAY", "").strip()
+VNC_ENABLED = bool(HEADLESS_INIT_DISPLAY)
+
 PYTHON_BIN = sys.executable  # venv'in içindeki python
 
 # ---------------------------------------------------------------------------
@@ -980,13 +986,26 @@ def launch_profile_init(profile: Profile) -> int:
     log_fp.write(f"# Init for profile {profile.name} ({profile.id})\n")
     log_fp.write(f"# Cmd: {' '.join(cmd)}\n\n")
     log_fp.flush()
+
+    # Sunucuda xvfb + noVNC kuruluysa Chromium virtual display'de açılır.
+    # Lokal'de native pencerede açılır.
+    env = os.environ.copy()
+    if HEADLESS_INIT_DISPLAY:
+        env["DISPLAY"] = HEADLESS_INIT_DISPLAY
+        log_fp.write(f"# DISPLAY={HEADLESS_INIT_DISPLAY} (xvfb)\n\n")
+        log_fp.flush()
+
     proc = subprocess.Popen(
         cmd,
         stdout=log_fp,
         stderr=subprocess.STDOUT,
         cwd=str(APP_DIR),
+        env=env,
     )
-    launcher_log(f"Init launched for profile {profile.name} (pid={proc.pid})")
+    launcher_log(
+        f"Init launched for profile {profile.name} (pid={proc.pid}) "
+        f"display={HEADLESS_INIT_DISPLAY or 'native'}"
+    )
     return proc.pid
 
 
@@ -1631,10 +1650,23 @@ with st.sidebar:
                 if not p.initialized:
                     if st.button("🔓 Hesabı aktive et", key=f"login_{p.id}", use_container_width=True, type="primary"):
                         launch_profile_init(p)
-                        st.toast("Chromium açıldı. Google'a giriş yap, ardından pencereyi kapat — gerisi otomatik.", icon="🔓")
+                        st.session_state[f"init_started_{p.id}"] = time.time()
+                        if VNC_ENABLED:
+                            st.toast(
+                                "Chromium virtual display'de açıldı. Aşağıdaki VNC linkine "
+                                "tıkla, Google'a giriş yap, pencereyi kapat — gerisi otomatik.",
+                                icon="🖥️",
+                            )
+                        else:
+                            st.toast(
+                                "Chromium açıldı. Google'a giriş yap, ardından pencereyi "
+                                "kapat — gerisi otomatik.",
+                                icon="🔓",
+                            )
                 else:
                     if st.button("🔄 Yeniden giriş", key=f"relogin_{p.id}", use_container_width=True):
                         launch_profile_init(p)
+                        st.session_state[f"init_started_{p.id}"] = time.time()
                         st.toast("Chromium açıldı.", icon="🔓")
             with cols[1]:
                 if st.button("🗑", key=f"del_{p.id}", help="Profili sil", use_container_width=True):
@@ -1648,13 +1680,38 @@ with st.sidebar:
                             pass
                     st.rerun()
 
+            # VNC linki — init başlatılmışsa (sunucuda xvfb varsa)
+            init_started_at = st.session_state.get(f"init_started_{p.id}", 0)
+            if VNC_ENABLED and init_started_at and (time.time() - init_started_at) < 600:
+                # Init son 10 dk'da başlatıldı — VNC linki göster
+                st.markdown(
+                    '<a href="/vnc/" target="_blank" '
+                    'style="display:block; text-align:center; padding:8px 10px; '
+                    'background:#10B981; color:white; border-radius:6px; '
+                    'text-decoration:none; font-size:0.85rem; font-weight:600; margin-top:6px;">'
+                    '🖥️ VNC ekranını aç → Google login</a>'
+                    '<div style="font-size:0.72rem; opacity:0.7; margin-top:4px; text-align:center;">'
+                    'Login olduktan sonra Chromium penceresini kapat. Auto-init aktive eder.'
+                    '</div>',
+                    unsafe_allow_html=True,
+                )
+
             # Login pending olanlar için bilgilendirme
             if not p.initialized:
+                if VNC_ENABLED:
+                    msg = (
+                        '⏳ Login bekleniyor — VNC üzerinden Chromium\'da giriş '
+                        'yapınca <b>otomatik aktive olur</b>'
+                    )
+                else:
+                    msg = (
+                        '⏳ Login bekleniyor — Chromium\'da giriş yapınca '
+                        '<b>otomatik aktive olur</b>'
+                    )
                 st.markdown(
-                    '<div style="font-size:0.72rem; opacity:0.7; margin-top:6px; '
-                    'padding:6px 8px; background:rgba(99,102,241,0.08); border-radius:6px;">'
-                    '⏳ Login bekleniyor — Chromium\'da giriş yapınca <b>otomatik aktive olur</b>'
-                    '</div>',
+                    f'<div style="font-size:0.72rem; opacity:0.7; margin-top:6px; '
+                    f'padding:6px 8px; background:rgba(99,102,241,0.08); border-radius:6px;">'
+                    f'{msg}</div>',
                     unsafe_allow_html=True,
                 )
 

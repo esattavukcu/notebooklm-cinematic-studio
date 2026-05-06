@@ -57,23 +57,23 @@ if [ -n "$PROFILES" ]; then
       continue
     fi
     echo "==> Senkronlanıyor: $p"
-    rsync -avz --progress -e "ssh $SSH_OPTS" "$src" "$SERVER:$REMOTE_DIR/chrome_profiles/$p/"
+    rsync -avz --mkpath --progress -e "ssh $SSH_OPTS" "$src" "$SERVER:$REMOTE_DIR/chrome_profiles/$p/"
   done
 else
   echo "==> Tüm chrome_profiles/ rsync ediliyor..."
-  rsync -avz --progress -e "ssh $SSH_OPTS" chrome_profiles/ "$SERVER:$REMOTE_DIR/chrome_profiles/"
+  rsync -avz --mkpath --progress -e "ssh $SSH_OPTS" chrome_profiles/ "$SERVER:$REMOTE_DIR/chrome_profiles/"
 fi
 
 # .env de gönder (varsa)
 if [ -f ".env" ]; then
   echo "==> .env de senkronlanıyor (Azure conn, ADMIN_PASSWORD)..."
-  rsync -avz -e "ssh $SSH_OPTS" .env "$SERVER:$REMOTE_DIR/.env"
+  rsync -avz --mkpath -e "ssh $SSH_OPTS" .env "$SERVER:$REMOTE_DIR/.env"
 fi
 
 # data/profiles.json de gönder ki sunucu hangi profilin hangi isimle olduğunu bilsin
 if [ -f "data/profiles.json" ]; then
   echo "==> data/profiles.json senkronlanıyor..."
-  rsync -avz -e "ssh $SSH_OPTS" data/profiles.json "$SERVER:$REMOTE_DIR/data/profiles.json"
+  rsync -avz --mkpath -e "ssh $SSH_OPTS" data/profiles.json "$SERVER:$REMOTE_DIR/data/profiles.json"
 fi
 
 echo

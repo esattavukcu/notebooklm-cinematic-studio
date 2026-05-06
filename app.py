@@ -519,6 +519,28 @@ class Worker:
                 target.notebook_url = url
         elif etype == "quota_exceeded":
             target.error = "NotebookLM günlük Cinematic kotası dolmuş — yarın resetlenir veya başka hesap kullan."
+        elif etype in ("login_required_headless", "login_timeout"):
+            target.error = (
+                "Hesap login süresi geçmiş veya hiç yapılmamış. "
+                "Yöneticinin admin panelinden 'Yeniden giriş' yapması gerek."
+            )
+            # Profili initialized=False yap ki dispatch tekrar denemesin
+            try:
+                ps = load_profiles()
+                for p in ps:
+                    if p.id == target.profile_id:
+                        p.initialized = False
+                        # auth.json'u sil ki yenisi yazılana kadar geçerli sayılmasın
+                        auth = PROFILES_DIR / p.id / "auth.json"
+                        if auth.exists():
+                            try:
+                                auth.unlink()
+                            except OSError:
+                                pass
+                        break
+                save_profiles(ps)
+            except Exception:
+                pass
         elif etype == "automation_complete":
             url = evt.get("notebook_url", "") or target.notebook_url
             target.notebook_url = url
@@ -1089,6 +1111,8 @@ def render_user_view() -> None:
                         err = j.error.lower() if j.error else ""
                         if "kota" in err or "limit" in err:
                             sub = "🚫 Kota dolu — yarın otomatik denenir"
+                        elif "login" in err or "giriş" in err:
+                            sub = "🔓 Hesap login süresi geçmiş — yöneticiye haber ver"
                         else:
                             sub = f"⚠ Hata: {(j.error or 'bilinmiyor')[:120]}"
                     elif j.status == "stopped":

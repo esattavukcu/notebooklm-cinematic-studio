@@ -586,16 +586,37 @@ def run_automation(
             emitter.emit("navigating", url=url)
             page.goto(url, wait_until="domcontentloaded", timeout=60000)
 
-            # Login redirect kontrolü — accounts.google.com'a düştüyse 5 dk bekle
+            # Login redirect kontrolü — accounts.google.com'a düştüyse:
+            # - Headless modda: kullanıcı login yapamaz, hemen fail-fast.
+            # - Non-headless'ta: 5 dk pencerede manuel login bekle.
             try:
-                cur_url = page.url
-                if "accounts.google.com" in cur_url:
-                    emitter.emit("login_required_waiting")
+                # Sayfa redirect oturana kadar kısa bir bekleme
+                time.sleep(1.0)
+                cur_url = page.url or ""
+                if "accounts.google.com" in cur_url or "/signin" in cur_url:
+                    if headless:
+                        emitter.emit(
+                            "login_required_headless",
+                            url=cur_url,
+                            hint=("Hesabın Google login'i süresi geçmiş veya hiç yapılmamış. "
+                                  "Admin panelinden 'Yeniden giriş' yap."),
+                        )
+                        _take_screenshot(page, screenshots_dir, f"{job_id}_login_required")
+                        raise RuntimeError("login_required_headless")
+                    emitter.emit("login_required_waiting", hint="Pencerede manuel login bekleniyor (max 5 dk)")
                     deadline = time.time() + 300
                     while time.time() < deadline:
-                        if "notebooklm.google.com" in (page.url or ""):
+                        cur = page.url or ""
+                        if "notebooklm.google.com" in cur and "accounts.google.com" not in cur:
                             break
                         time.sleep(2)
+                    # 5 dk sonunda hâlâ accounts.google.com'daysa → fail
+                    cur = page.url or ""
+                    if "accounts.google.com" in cur or "/signin" in cur:
+                        emitter.emit("login_timeout", url=cur)
+                        raise RuntimeError("login_timeout")
+            except RuntimeError:
+                raise
             except Exception:
                 pass
 

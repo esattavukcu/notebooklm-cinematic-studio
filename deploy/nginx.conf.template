@@ -1,0 +1,62 @@
+# nginx reverse proxy + basic auth + websocket
+# /etc/nginx/sites-available/notebooklm olarak kopyalanır.
+#
+# Hazırlık:
+#   sudo apt install nginx certbot python3-certbot-nginx apache2-utils
+#   sudo htpasswd -c /etc/nginx/.htpasswd <kullanici>     # ilk kullanıcı
+#   sudo htpasswd /etc/nginx/.htpasswd <baska-kullanici>  # ekstra
+#
+# Kurulum:
+#   sudo cp deploy/nginx.conf.template /etc/nginx/sites-available/notebooklm
+#   sudo nano /etc/nginx/sites-available/notebooklm   # server_name'i değiştir!
+#   sudo ln -sf /etc/nginx/sites-available/notebooklm /etc/nginx/sites-enabled/
+#   sudo rm -f /etc/nginx/sites-enabled/default
+#   sudo nginx -t && sudo systemctl reload nginx
+#
+# HTTPS (Let's Encrypt — DNS A record domain'e işaret etmiş olmalı):
+#   sudo certbot --nginx -d studio.example.com
+# Bu komut bu config'i otomatik 443/SSL ile günceller.
+
+server {
+    listen 80;
+    listen [::]:80;
+    server_name studio.example.com;   # ⚠ KENDİ DOMAIN'İNE ÇEVİR
+
+    # Streamlit dosya yüklemesi için (CSV import vs)
+    client_max_body_size 100M;
+
+    # Basic auth — Streamlit'te kullanıcı kimliği yok, nginx burada koruyor
+    auth_basic "Cinematic Studio";
+    auth_basic_user_file /etc/nginx/.htpasswd;
+
+    location / {
+        proxy_pass http://127.0.0.1:8501;
+        proxy_http_version 1.1;
+
+        # Streamlit websocket — bu olmadan UI dondu kalır
+        proxy_set_header Upgrade $http_upgrade;
+        proxy_set_header Connection "upgrade";
+
+        proxy_set_header Host              $host;
+        proxy_set_header X-Real-IP         $remote_addr;
+        proxy_set_header X-Forwarded-For   $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+
+        # Long polling / websocket için yüksek timeout
+        proxy_read_timeout    86400;
+        proxy_send_timeout    86400;
+        proxy_buffering       off;
+
+        # Streamlit'in kendi static path'leri
+        proxy_redirect off;
+    }
+
+    # Streamlit static asset cache
+    location /_stcore/ {
+        proxy_pass http://127.0.0.1:8501;
+        proxy_http_version 1.1;
+        proxy_set_header Upgrade $http_upgrade;
+        proxy_set_header Connection "upgrade";
+        proxy_set_header Host $host;
+    }
+}

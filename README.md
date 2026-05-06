@@ -139,6 +139,29 @@ Job listesi durumları:
 
 Eskiden manuel notebook açıp Studio'dan indirmek gerekiyordu. Artık tek tıkla video açılır/indirilir.
 
+## ☁️ Sunucu deployment (AWS EC2 / herhangi Linux VM)
+
+Tek-tuş kurulum scripti `deploy/` altında:
+
+```bash
+# Sunucuda (Ubuntu 22.04+):
+curl -sSL https://raw.githubusercontent.com/esattavukcu/notebooklm-cinematic-studio/main/deploy/install-server.sh | bash
+
+# Lokalden chrome_profiles + .env senkronu:
+SERVER=ubuntu@studio.example.com KEY=~/.ssh/notebooklm.pem \
+  ./deploy/sync-profiles.sh
+```
+
+Tam EC2 deployment rehberi (instance specs, security group, nginx + Let's Encrypt, sorun giderme): **[deploy/README.md](deploy/README.md)**
+
+| Dosya | Amaç |
+|---|---|
+| `deploy/install-server.sh` | apt deps + clone + venv + systemd service kurulumu |
+| `deploy/notebooklm.service` | systemd unit dosyası |
+| `deploy/nginx.conf.template` | reverse proxy + websocket + basic auth |
+| `deploy/sync-profiles.sh` | Lokal `chrome_profiles/` + `.env` → sunucuya rsync |
+| `deploy/README.md` | Adım adım AWS EC2 rehberi |
+
 ## Mimari
 
 ```

@@ -1,0 +1,35 @@
+[Unit]
+Description=NotebookLM Cinematic Studio
+Documentation=https://github.com/esattavukcu/notebooklm-cinematic-studio
+After=network.target
+
+[Service]
+Type=simple
+# install-server.sh bunu kendi user'ı + APP_DIR'ı ile günceller.
+# Manuel kurulumda buradaki path'leri kendi sunucuna göre düzelt.
+User=ubuntu
+WorkingDirectory=/home/ubuntu/notebooklm-cinematic-studio
+ExecStart=/home/ubuntu/notebooklm-cinematic-studio/.venv/bin/streamlit run app.py \
+  --server.address=127.0.0.1 \
+  --server.port=8501 \
+  --browser.gatherUsageStats=false \
+  --server.headless=true \
+  --server.fileWatcherType=none
+Restart=always
+RestartSec=5
+# python-dotenv app.py içinden .env okuyor; ek env burada gerekli değil.
+# Yine de override etmek istersen:
+# Environment=AZURE_STORAGE_CONNECTION_STRING=...
+# Environment=ADMIN_PASSWORD=...
+
+# Loglama: stdout/stderr → journald
+StandardOutput=journal
+StandardError=journal
+
+# Güvenlik (opsiyonel sıkılaştırmalar)
+NoNewPrivileges=true
+PrivateTmp=true
+# ProtectSystem=full   # data/ ve chrome_profiles/ writable kalsın diye kapalı
+
+[Install]
+WantedBy=multi-user.target

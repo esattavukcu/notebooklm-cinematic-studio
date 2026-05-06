@@ -34,19 +34,48 @@ chmod +x setup.sh app.sh run.sh && ./setup.sh && ./app.sh
 
 > macOS Gatekeeper, AppTranslocation, vs. sorunu yok — bu pure Python + Streamlit, .app bundle değil.
 
-## İlk kullanım
+## İki mod: Kullanıcı vs Yönetim
 
-1. Tarayıcıda `http://localhost:8501` aç
-2. Sol panelde **Yeni profil ekle**:
-   - İsim: hesabını ayırt etmen için (örn. `baran-yga`)
-   - authuser: Chrome'da kaçıncı Google hesabıysa (0, 1, 2…) — tek hesap kullanıyorsan 0
-   - Günlük max video: 3 (NotebookLM ücretsiz limiti)
-3. **Login başlat** → açılan Chromium'da Google hesabınla login ol → pencereyi kapat
-4. **Login tamamlandı ✓** butonuna bas
-5. **📝 Hazırla** sekmesinde içerik ekle (uzun system prompt, senaryo, vs.)
-6. Checkbox'la seç → **Seçilenleri kuyruğa ekle**
-7. **📊 Durum** sekmesinde job'ları izle
-8. Job "done" olunca → **🌐** butonuyla notebook'u aç → Studio panelden video'yu manuel indir
+Araç iki ayrı arayüz sunar:
+
+### 👤 Kullanıcı görünümü (varsayılan, Mustafa-tier)
+- URL: `http://your-domain/` (parametresiz)
+- **Tek sayfa, tek textarea, tek button.** Senaryonu yapıştır → "Video üret" → bekle → notebook'u aç.
+- İlk girişte ismini ister (Mustafa, Ahmet, vb.), sonraki ziyaretlerde sadece kendi gönderilerini görür.
+- Hesap yönetimi, log, profil ayarları **görünmez**.
+
+### ⚙️ Yönetim (admin) görünümü
+- URL: `http://your-domain/?admin=<şifre>` (env var: `ADMIN_PASSWORD`)
+- Lokal kullanım için: `?admin=1` (env var boşsa)
+- Hesap (Google profil) ekleme, login başlatma, tüm job'lar, loglar, kuyruk yönetimi.
+
+### Admin şifresi tanımla (sunucu dağıtımı için)
+
+```bash
+export ADMIN_PASSWORD="senin-secret-string"
+./app.sh
+```
+
+`ADMIN_PASSWORD` set değilse `?admin=1` ile herkes admin olur (lokal geliştirme). Sunucuda mutlaka bir şifre belirle.
+
+## İlk kullanım (yöneticinin yapacakları)
+
+1. Tarayıcıda `http://localhost:8501/?admin=1` aç (veya sunucuda `?admin=<şifre>`)
+2. Sol panelde **+ Yeni hesap ekle**:
+   - Hesap adı: ayırt etmen için (örn. `baran-yga`, `editor-1`, vb.)
+   - Diğer ayarlar opsiyonel — varsayılanlar iyi (3 video/gün, 1 paralel slot)
+3. **🔓 Hesabı aktive et** → açılan Chromium'da Google'a giriş yap → pencereyi kapat
+4. ✨ **Otomatik aktive olur** — auth.json yazılır yazılmaz hesap "🟢 hazır" olur. Manuel buton yok.
+5. Kullanıcılara `http://your-domain/` URL'ini ver — onlar `?admin=` görmüyor, sadece submit ekranını.
+
+## Kullanıcı için kullanım (Mustafa)
+
+1. Yönetici verdiği URL'e git: `http://your-domain/`
+2. İlk girişte adını yaz → "Devam"
+3. Senaryonu (uzun metin) yapıştır → **🚀 Video üret**
+4. Aşağıdaki listede durumu izle:
+   - ⏳ KUYRUKTA → ▶ ÇALIŞIYOR → ✓ TAMAMLANDI
+5. ✓ Tamamlandı olunca **🌐 Notebook'u aç** → NotebookLM'de Studio panelden 25-60 dk içinde video hazır olur.
 
 ## Mimari
 

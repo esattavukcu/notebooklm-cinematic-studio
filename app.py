@@ -138,6 +138,7 @@ class Job:
     started_at: float = 0.0
     finished_at: float = 0.0
     created_at: float = field(default_factory=time.time)
+    submitted_by: str = ""           # Kullanıcının kendi adı (user view session_state'inden)
 
 
 # ---------------------------------------------------------------------------
@@ -294,11 +295,30 @@ class Worker:
     def _loop(self) -> None:
         while not self._stop_evt.is_set():
             try:
+                self._auto_init_check()
                 self._dispatch_round()
                 self._reap_finished()
             except Exception as e:
                 launcher_log(f"dispatch error: {e!r}")
             self._stop_evt.wait(DISPATCH_INTERVAL_SEC)
+
+    def _auto_init_check(self) -> None:
+        """auth.json yazılmış profilleri otomatik 'initialized=True' yap.
+        Kullanıcının elle 'Login tamamlandı' butonuna basmasına gerek kalmaz.
+        notebooklm_automator.py --init modunda framenavigated event'inde
+        auth.json kaydediyor — biz burada onu polling'e bağlıyoruz."""
+        profiles = load_profiles()
+        changed = False
+        for p in profiles:
+            if p.initialized:
+                continue
+            auth_path = PROFILES_DIR / p.id / "auth.json"
+            if auth_path.exists() and auth_path.stat().st_size > 100:
+                p.initialized = True
+                changed = True
+                launcher_log(f"Auto-init: profile {p.name} ({p.id}) marked initialized.")
+        if changed:
+            save_profiles(profiles)
 
     def _today_count_for(self, jobs: list[Job], profile_id: str) -> int:
         today = date.today()
@@ -858,6 +878,255 @@ def open_in_browser(url: str) -> None:
         st.toast(f"Tarayıcı açılamadı: {e}", icon="⚠️")
 
 
+# ---------------------------------------------------------------------------
+# Mode detection: admin (?admin=<pw>) vs user (default)
+# ---------------------------------------------------------------------------
+def _admin_password() -> str:
+    """ADMIN_PASSWORD env var. Boşsa: admin gizli URL devre dışı, herkes
+    user view görür. Set edilmişse: ?admin=<pw> ile admin paneli."""
+    return os.environ.get("ADMIN_PASSWORD", "").strip()
+
+
+def _is_admin() -> bool:
+    pw = _admin_password()
+    if not pw:
+        # Şifre set edilmediyse, ?admin=1 ile admin'e geç (lokal kullanım için).
+        return st.query_params.get("admin", "") != ""
+    return st.query_params.get("admin", "") == pw
+
+
+def _user_name() -> str:
+    """Kullanıcı kendi adını bir kez verir, session_state'te tutulur."""
+    return st.session_state.get("user_name", "").strip()
+
+
+# ---------------------------------------------------------------------------
+# USER VIEW — Mustafa-tier sadeliği. Tek sayfa, tek textarea, tek button.
+# ---------------------------------------------------------------------------
+def render_user_view() -> None:
+    profiles = load_profiles()
+    jobs = load_jobs()
+    today = date.today()
+
+    # Aktif hesap sayısı + bugün üretilen toplam
+    initialized_profiles = [p for p in profiles if p.initialized]
+    today_total = sum(
+        1 for j in jobs
+        if j.status in COUNTED_STATUSES and j.started_at
+        and datetime.fromtimestamp(j.started_at).date() == today
+    )
+
+    # Kullanılabilir hesap var mı? (Kota dolu olanlar hariç)
+    def _profile_blocked(pid: str) -> bool:
+        for j in jobs:
+            if j.profile_id != pid or not j.error:
+                continue
+            err = j.error.lower()
+            if "kota" not in err and "limit" not in err:
+                continue
+            ts = j.finished_at or j.started_at or j.created_at
+            try:
+                if datetime.fromtimestamp(ts).date() == today:
+                    return True
+            except (OSError, OverflowError, ValueError):
+                continue
+        return False
+
+    available_profiles = [p for p in initialized_profiles if not _profile_blocked(p.id)]
+    no_profile = len(initialized_profiles) == 0
+    all_blocked = len(initialized_profiles) > 0 and len(available_profiles) == 0
+
+    # Hero
+    if no_profile:
+        status_line = "Yönetici hesap eklemeli"
+    elif all_blocked:
+        status_line = "Tüm hesaplar bugün kotaya doldu — yarın resetlenir"
+    else:
+        status_line = f"{len(available_profiles)} hesap hazır · bugün {today_total} video tetiklendi"
+
+    hero("Senaryonu Gönder, Video Üretelim", status_line)
+
+    # Eğer hiç hesap yoksa erken çık
+    if no_profile:
+        st.warning(
+            "🛠 Henüz aktif Google hesabı yok. Yöneticiye haber ver — kurulum yapması gerek.",
+            icon="🛠️",
+        )
+        return
+
+    # İsim sorma (ilk girişte)
+    if not _user_name():
+        st.markdown("&nbsp;", unsafe_allow_html=True)
+        with st.container(border=True):
+            st.markdown(
+                '<div style="font-weight:600; font-size:1.05rem; margin-bottom:0.4rem;">'
+                '👋 Hoş geldin! Adın nedir?</div>'
+                '<div style="font-size:0.85rem; opacity:0.7; margin-bottom:0.6rem;">'
+                'Gönderdiğin videoların burada listelenmesi için.</div>',
+                unsafe_allow_html=True,
+            )
+            with st.form("user_name_form"):
+                cs = st.columns([4, 1])
+                with cs[0]:
+                    name = st.text_input(
+                        "Adın",
+                        placeholder="örn. Mustafa",
+                        label_visibility="collapsed",
+                    )
+                with cs[1]:
+                    submitted = st.form_submit_button("Devam ➜", type="primary", use_container_width=True)
+                if submitted:
+                    if name.strip():
+                        st.session_state["user_name"] = name.strip()
+                        st.rerun()
+                    else:
+                        st.error("İsim boş olamaz.")
+        return
+
+    # Tüm hesaplar bloke ise uyarı (ama yine de submit göster, kuyruğa atılabilir)
+    if all_blocked:
+        st.warning(
+            "🚫 Tüm hesapların bugünkü Cinematic kotası dolmuş. "
+            "Yine de gönder — kotalar resetlenince (yarın TR ~10:00) otomatik üretilir.",
+            icon="🚫",
+        )
+
+    # Submit form — büyük textarea + tek button
+    st.markdown("&nbsp;", unsafe_allow_html=True)
+    with st.form("user_submit", clear_on_submit=True):
+        st.markdown(
+            '<div style="font-size:0.95rem; font-weight:600; margin-bottom:0.3rem;">'
+            '📝 Video senaryonu yapıştır</div>'
+            '<div style="font-size:0.8rem; opacity:0.7; margin-bottom:0.5rem;">'
+            'Uzun yazabilirsin. NotebookLM senaryonu kaynak olarak alıp Cinematic '
+            'video üretecek.</div>',
+            unsafe_allow_html=True,
+        )
+        text = st.text_area(
+            "Senaryo",
+            height=360,
+            placeholder="Senaryon, system prompt'un veya uzun metin...",
+            label_visibility="collapsed",
+        )
+        st.markdown("&nbsp;", unsafe_allow_html=True)
+        cs = st.columns([3, 1])
+        with cs[0]:
+            st.markdown(
+                f'<div style="font-size:0.78rem; opacity:0.65;">'
+                f'Gönderen: <b>{_user_name()}</b> · '
+                f'<a href="?reset_name=1" style="opacity:0.7;">değiştir</a></div>',
+                unsafe_allow_html=True,
+            )
+        with cs[1]:
+            submitted = st.form_submit_button(
+                "🚀 Video üret",
+                type="primary",
+                use_container_width=True,
+                disabled=False,
+            )
+        if submitted:
+            if not text.strip():
+                st.error("Senaryo boş olamaz.")
+            else:
+                title = derive_title(text)
+                jobs_all = load_jobs()
+                jobs_all.append(Job(
+                    id=uuid.uuid4().hex[:12],
+                    title=title,
+                    text=text.strip(),
+                    submitted_by=_user_name(),
+                ))
+                save_jobs(jobs_all)
+                st.toast("Kuyruğa eklendi! Birkaç dakika içinde tetiklenecek.", icon="🚀")
+                time.sleep(0.5)
+                st.rerun()
+
+    # Reset name link
+    if st.query_params.get("reset_name", "") == "1":
+        st.session_state.pop("user_name", None)
+        st.query_params.clear()
+        st.rerun()
+
+    # Senin son istekleri
+    st.markdown("&nbsp;", unsafe_allow_html=True)
+    user = _user_name()
+    my_jobs = [j for j in jobs if j.submitted_by == user]
+    my_jobs_sorted = sorted(my_jobs, key=lambda j: j.created_at, reverse=True)[:30]
+
+    section_header(f"📋 Senin son isteklerin", f"{len(my_jobs)} kayıt")
+
+    if not my_jobs_sorted:
+        empty_state(
+            "📭",
+            "Henüz video isteğin yok",
+            "Yukarıya senaryonu yapıştır ve gönder.",
+        )
+    else:
+        st.markdown('<div class="job-row-wrap">', unsafe_allow_html=True)
+        for j in my_jobs_sorted:
+            with st.container(border=True):
+                cs = st.columns([1.3, 5, 1.5])
+                with cs[0]:
+                    st.markdown(status_pill(j.status), unsafe_allow_html=True)
+                with cs[1]:
+                    title_short = j.title if len(j.title) <= 80 else j.title[:79] + "…"
+                    st.markdown(
+                        f'<div style="font-size:0.95rem; font-weight:600; line-height:1.3;" '
+                        f'title="{j.title}">{title_short}</div>',
+                        unsafe_allow_html=True,
+                    )
+                    # Status'a göre alt-açıklama
+                    if j.status == "queued":
+                        sub = f"⏳ Kuyrukta · {fmt_time(j.created_at)}"
+                    elif j.status == "running":
+                        elapsed = fmt_duration(j.started_at, 0)
+                        sub = f"▶ NotebookLM tetikleniyor · {elapsed} sürdü"
+                    elif j.status == "done":
+                        sub = "✓ Tetiklendi! Video 25-60 dk içinde NotebookLM'de hazır olur"
+                    elif j.status == "submitted":
+                        sub = "📤 Tetiklendi (notebook URL'i yok). Admin loga baksın."
+                    elif j.status == "failed":
+                        err = j.error.lower() if j.error else ""
+                        if "kota" in err or "limit" in err:
+                            sub = "🚫 Kota dolu — yarın otomatik denenir"
+                        else:
+                            sub = f"⚠ Hata: {(j.error or 'bilinmiyor')[:120]}"
+                    elif j.status == "stopped":
+                        sub = "⏹ Durduruldu"
+                    else:
+                        sub = j.status
+                    st.markdown(
+                        f'<div style="font-size:0.78rem; opacity:0.7; margin-top:3px;">{sub}</div>',
+                        unsafe_allow_html=True,
+                    )
+                with cs[2]:
+                    if j.notebook_url and j.status in TERMINAL_STATUSES:
+                        if st.button("🌐 Notebook'u aç", key=f"u_open_{j.id}", use_container_width=True):
+                            open_in_browser(j.notebook_url)
+        st.markdown('</div>', unsafe_allow_html=True)
+
+    # Admin shortcut
+    st.markdown(
+        '<div style="margin-top:3rem; text-align:center; font-size:0.78rem; opacity:0.5;">'
+        f'Sorun var mı? Yöneticiye haber ver. '
+        f'<a href="?admin=1" style="opacity:0.7;">⚙️ Admin</a>'
+        f'</div>',
+        unsafe_allow_html=True,
+    )
+
+
+# ===== MODE DISPATCH =====
+# Admin değilse: user view render et, sonra çık. Admin UI hiç render edilmez.
+if not _is_admin():
+    render_user_view()
+    # Auto-refresh: running job varsa yenile
+    _jobs_now = load_jobs()
+    if any(j.status == "running" or j.status == "queued" for j in _jobs_now):
+        time.sleep(4)
+        st.rerun()
+    st.stop()
+
+
 # ===== SIDEBAR =====
 with st.sidebar:
     st.markdown(
@@ -904,27 +1173,17 @@ with st.sidebar:
                 f'</div>',
                 unsafe_allow_html=True,
             )
-            cols = st.columns([2, 2, 1])
+            cols = st.columns([3, 1])
             with cols[0]:
                 if not p.initialized:
-                    if st.button("🔓 Login", key=f"login_{p.id}", use_container_width=True):
+                    if st.button("🔓 Hesabı aktive et", key=f"login_{p.id}", use_container_width=True, type="primary"):
                         launch_profile_init(p)
-                        st.toast("Chromium açıldı. Login olduktan sonra pencereyi kapat.", icon="🔓")
+                        st.toast("Chromium açıldı. Google'a giriş yap, ardından pencereyi kapat — gerisi otomatik.", icon="🔓")
                 else:
-                    if st.button("🔄 Re-login", key=f"relogin_{p.id}", use_container_width=True):
+                    if st.button("🔄 Yeniden giriş", key=f"relogin_{p.id}", use_container_width=True):
                         launch_profile_init(p)
                         st.toast("Chromium açıldı.", icon="🔓")
             with cols[1]:
-                if not p.initialized:
-                    if st.button("✅ Bitti", key=f"done_{p.id}", use_container_width=True):
-                        ps = load_profiles()
-                        for x in ps:
-                            if x.id == p.id:
-                                x.initialized = True
-                                break
-                        save_profiles(ps)
-                        st.rerun()
-            with cols[2]:
                 if st.button("🗑", key=f"del_{p.id}", help="Profili sil", use_container_width=True):
                     ps = [x for x in load_profiles() if x.id != p.id]
                     save_profiles(ps)
@@ -936,7 +1195,17 @@ with st.sidebar:
                             pass
                     st.rerun()
 
-            with st.expander("Ayarlar"):
+            # Login pending olanlar için bilgilendirme
+            if not p.initialized:
+                st.markdown(
+                    '<div style="font-size:0.72rem; opacity:0.7; margin-top:6px; '
+                    'padding:6px 8px; background:rgba(99,102,241,0.08); border-radius:6px;">'
+                    '⏳ Login bekleniyor — Chromium\'da giriş yapınca <b>otomatik aktive olur</b>'
+                    '</div>',
+                    unsafe_allow_html=True,
+                )
+
+            with st.expander("⚙️ Gelişmiş ayarlar"):
                 new_name = st.text_input("İsim", value=p.name, key=f"nm_{p.id}")
                 new_authuser = st.number_input(
                     "authuser index",
@@ -948,7 +1217,7 @@ with st.sidebar:
                     "Günlük max video",
                     min_value=0, max_value=100, value=p.daily_limit, step=1,
                     key=f"lim_{p.id}",
-                    help="0 = sınırsız",
+                    help="0 = sınırsız. NotebookLM ücretsiz: 3/gün",
                 )
                 new_max_c = st.number_input(
                     "Paralel slot",
@@ -974,17 +1243,30 @@ with st.sidebar:
                     st.toast("Kaydedildi.", icon="✅")
                     st.rerun()
 
-    st.markdown('<div class="sidebar-section">Yeni profil ekle</div>', unsafe_allow_html=True)
+    st.markdown('<div class="sidebar-section">+ Yeni hesap ekle</div>', unsafe_allow_html=True)
     with st.form("new_profile", clear_on_submit=True):
-        np_name = st.text_input("İsim", placeholder="örn. baran@yga.org.tr")
-        cs = st.columns(2)
-        with cs[0]:
-            np_authuser = st.number_input("authuser", min_value=0, max_value=20, value=0, step=1, help="Chrome'da kaçıncı Google hesabı (0=ilk)")
-        with cs[1]:
-            np_limit = st.number_input("Günlük max", min_value=0, max_value=100, value=3, step=1, help="0 = sınırsız")
-        np_concurrent = st.number_input("Paralel slot", min_value=1, max_value=10, value=1, step=1)
-        np_headless = st.checkbox("Arka planda çalış (görünmez)", value=True)
-        if st.form_submit_button("➕ Profil oluştur", use_container_width=True, type="primary"):
+        np_name = st.text_input(
+            "Hesap adı",
+            placeholder="örn. baran@yga.org.tr",
+            help="Sadece ayırt etmek için — istediğin ismi ver",
+        )
+        with st.expander("Gelişmiş (opsiyonel)"):
+            np_authuser = st.number_input(
+                "authuser",
+                min_value=0, max_value=20, value=0, step=1,
+                help="Chrome'da kaçıncı Google hesabı (0=ilk). Tek hesap kullanıyorsan 0 bırak.",
+            )
+            np_limit = st.number_input(
+                "Günlük max video",
+                min_value=0, max_value=100, value=3, step=1,
+                help="NotebookLM ücretsiz limit: 3/gün. 0 = sınırsız (Pro hesap için)",
+            )
+            np_concurrent = st.number_input(
+                "Paralel slot",
+                min_value=1, max_value=10, value=1, step=1,
+                help="Aynı hesapla aynı anda kaç browser açılsın",
+            )
+        if st.form_submit_button("➕ Hesap oluştur", use_container_width=True, type="primary"):
             if not np_name.strip():
                 st.error("İsim boş olamaz.")
             else:
@@ -995,21 +1277,33 @@ with st.sidebar:
                     authuser=int(np_authuser),
                     daily_limit=int(np_limit),
                     max_concurrent=int(np_concurrent),
-                    headless=bool(np_headless),
+                    headless=True,
                     initialized=False,
                 )
                 ps.append(new_p)
                 save_profiles(ps)
-                st.toast("Profil oluşturuldu. Login başlat butonuna bas.", icon="✅")
+                st.toast("Hesap oluşturuldu. Şimdi 'Hesabı aktive et' butonuna bas.", icon="✅")
                 st.rerun()
 
 
-# ===== HERO HEADER =====
+# ===== HERO HEADER (admin) =====
 _init_count = sum(1 for p in load_profiles() if p.initialized)
 _total_count = len(load_profiles())
-hero(
-    "NotebookLM Cinematic Studio",
-    f"Toplu metin → paralel video üretimi · {_init_count}/{_total_count} hesap aktif",
+st.markdown(
+    f'<div class="app-hero" style="display:flex; align-items:center; gap:1rem;">'
+    f'<div style="flex:1;">'
+    f'<h1>🎬 Cinematic Studio  <span style="font-size:0.6em; padding:3px 10px; '
+    f'background:rgba(255,255,255,0.18); border-radius:999px; vertical-align:middle; '
+    f'font-weight:600; letter-spacing:0.05em;">YÖNETİM</span></h1>'
+    f'<p>Toplu metin → paralel video üretimi · {_init_count}/{_total_count} hesap aktif</p>'
+    f'</div>'
+    f'<div style="text-align:right;">'
+    f'<a href="?" style="color:rgba(255,255,255,0.85); text-decoration:none; '
+    f'font-size:0.82rem; padding:6px 12px; border:1px solid rgba(255,255,255,0.3); '
+    f'border-radius:6px;">← Kullanıcı görünümü</a>'
+    f'</div>'
+    f'</div>',
+    unsafe_allow_html=True,
 )
 
 

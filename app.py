@@ -918,8 +918,17 @@ def _is_admin() -> bool:
 
 
 def _user_name() -> str:
-    """Kullanıcı kendi adını bir kez verir, session_state'te tutulur."""
-    return st.session_state.get("user_name", "").strip()
+    """Kullanıcı kendi adını bir kez verir. session_state'te tutulur ama
+    sayfa yenilemesinde kaybolmaması için URL query param'dan da restore eder.
+    Bu sayede ?u=Mustafa URL'i bookmark'lanırsa otomatik tanır."""
+    name = st.session_state.get("user_name", "").strip()
+    if name:
+        return name
+    qp_name = st.query_params.get("u", "").strip()
+    if qp_name:
+        st.session_state["user_name"] = qp_name
+        return qp_name
+    return ""
 
 
 # ---------------------------------------------------------------------------
@@ -999,7 +1008,10 @@ def render_user_view() -> None:
                     submitted = st.form_submit_button("Devam ➜", type="primary", use_container_width=True)
                 if submitted:
                     if name.strip():
-                        st.session_state["user_name"] = name.strip()
+                        clean = name.strip()
+                        st.session_state["user_name"] = clean
+                        # Sayfa yenilemede kaybolmaması için URL'e de yaz
+                        st.query_params["u"] = clean
                         st.rerun()
                     else:
                         st.error("İsim boş olamaz.")
@@ -1063,10 +1075,15 @@ def render_user_view() -> None:
                 time.sleep(0.5)
                 st.rerun()
 
-    # Reset name link
+    # Reset name link — hem session_state'i hem URL'deki ?u=... param'ını temizle
     if st.query_params.get("reset_name", "") == "1":
         st.session_state.pop("user_name", None)
-        st.query_params.clear()
+        # query_params.clear() admin param'ı da temizler — sadece u/reset_name'i sil
+        for k in ("u", "reset_name"):
+            try:
+                del st.query_params[k]
+            except KeyError:
+                pass
         st.rerun()
 
     # Senin son istekleri

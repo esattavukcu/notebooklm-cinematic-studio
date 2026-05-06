@@ -69,10 +69,15 @@ TERMINAL_STATUSES = {"done", "failed", "submitted", "stopped"}
 DISPATCH_INTERVAL_SEC = 2.0
 JOB_LOG_TAIL_LINES = 400
 
-# Harvest module config
-HARVEST_FIRST_DELAY_SEC = 30 * 60       # done olduktan ne kadar sonra ilk denemeyi yap
-HARVEST_RETRY_INTERVAL_SEC = 10 * 60    # not_ready olursa kaç dk sonra tekrar dene
-HARVEST_MAX_ATTEMPTS = 8                # toplam ~30 + 8*10 = 110 dk içinde vazgeç
+# Harvest module config — env var ile override edilebilir.
+# NotebookLM video üretimi gerçekte 60-90 dk sürüyor (READMEdeki "25-60dk"
+# bilgi yanıltıcı). Default'ları gerçek deneyimle hizaladık:
+#   - İlk deneme: 60 dk (video minimum bu kadar sürer)
+#   - Retry: 10 dk arayla, max 8 deneme → toplam pencere 60 + 80 = 140 dk
+#   - Yani ~2.3 saatlik harvest penceresi
+HARVEST_FIRST_DELAY_SEC = int(os.environ.get("HARVEST_FIRST_DELAY_MIN", "60")) * 60
+HARVEST_RETRY_INTERVAL_SEC = int(os.environ.get("HARVEST_RETRY_INTERVAL_MIN", "10")) * 60
+HARVEST_MAX_ATTEMPTS = int(os.environ.get("HARVEST_MAX_ATTEMPTS", "8"))
 HARVEST_CHECK_INTERVAL_SEC = 60         # Worker kaç sn'de bir harvest round yapsın
 
 # Azure Blob upload config (env-var gated)

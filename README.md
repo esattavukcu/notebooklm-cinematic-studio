@@ -85,11 +85,18 @@ Job tetiklendikten sonra (`done` status), Worker arka planda otomatik olarak vid
 
 | Aşama | Ne yapar | Job status |
 |---|---|---|
-| **Phase 1: Bul** | 30 dk sonra notebook'a girer, video player'ı bulur, `<video src>` URL'ini çıkarır | `pending` → `checking` → `ready` |
+| **Phase 1: Bul** | 60 dk sonra notebook'a girer, video player'ı bulur, `<video src>` URL'ini çıkarır | `pending` → `checking` → `ready` |
 | **Phase 2: İndir** | Video URL'ini cookie'lerle GET çekip `data/downloads/<job_id>.mp4` olarak kaydeder | `ready` → `downloaded` |
 | **Phase 3: Azure** | (Opsiyonel, env var gated) lokal dosyayı Azure Blob Storage'a yükler | `downloaded` → `uploaded` |
 
-**Retry mantığı**: Video hazır değilse 10 dk sonra tekrar dener, max 8 deneme (~110 dk). Sonunda `expired` olur.
+**Retry mantığı**: Video hazır değilse 10 dk sonra tekrar dener, max 8 deneme. Toplam pencere: 60 + 8×10 = **140 dk (~2.3 saat)**. Sonunda `expired` olur.
+
+**Tuning** — gerçek deneyimde NotebookLM'de video üretimi 60-90 dk sürüyor. Daha hızlı/yavaş hesaplar için env var ile ayarlanır:
+```bash
+HARVEST_FIRST_DELAY_MIN=45       # ilk denemeyi daha erken yap
+HARVEST_RETRY_INTERVAL_MIN=15    # retry'ları seyrekleştir
+HARVEST_MAX_ATTEMPTS=10          # daha çok dene
+```
 
 ### Azure Blob upload'u aktive et (opsiyonel)
 

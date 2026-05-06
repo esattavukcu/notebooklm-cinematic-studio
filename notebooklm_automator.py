@@ -37,6 +37,15 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Optional
 
+# .env auto-load — direkt CLI çağrısında da PLAYWRIGHT_CHROMIUM_EXECUTABLE_PATH
+# vs. okunabilsin. app.py'den subprocess olarak çağrıldığında env zaten parent'tan
+# inherit edilir, ama standalone test için bu lazım.
+try:
+    from dotenv import load_dotenv
+    load_dotenv(dotenv_path=Path(__file__).parent / ".env", override=False)
+except ImportError:
+    pass
+
 # ---------------------------------------------------------------------------
 # TMPDIR fix — Finder'dan başlatılan macOS context'inde Playwright'ın mkdtemp
 # çağrısı /var/folders/... altında ENOENT veriyor. Stabil bir tmp altına yönlendir.

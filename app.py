@@ -582,9 +582,28 @@ st.set_page_config(page_title="NotebookLM Cinematic Studio", layout="wide")
 worker = get_worker()
 followup = get_followup_worker()
 
+VERSION = "0.5.1"
+
+# Git commit hash'i göster (varsa) — debug için
+def _git_short_hash() -> str:
+    try:
+        result = subprocess.run(
+            ["git", "rev-parse", "--short", "HEAD"],
+            capture_output=True, text=True, timeout=2, cwd=str(ROOT),
+        )
+        if result.returncode == 0:
+            return result.stdout.strip()
+    except Exception:
+        pass
+    return ""
+
+_git_hash = _git_short_hash()
+_version_str = f"v{VERSION}" + (f" · {_git_hash}" if _git_hash else "")
+
 st.title("NotebookLM Cinematic Studio")
 st.caption(
-    "Birden fazla Google profili üzerinden NotebookLM'de Cinematic videolar üretir."
+    f"Birden fazla Google profili üzerinden NotebookLM'de Cinematic videolar üretir. "
+    f"`{_version_str}` · {ROOT}"
 )
 
 # ---------------- Sidebar: Profile yönetimi ----------------
@@ -593,7 +612,7 @@ with st.sidebar:
     st.markdown("### 🚀 Hızlı erişim")
     if st.button(
         "🌐 NotebookLM'i normal Chrome'da aç",
-        use_container_width=True,
+        width="stretch",
         help="Mac'in default browser'ında NotebookLM açılır. Manuel video indirmek için en kolay yol — download ~/Downloads'a düşer."
     ):
         subprocess.Popen(["open", "https://notebooklm.google.com"])
@@ -911,7 +930,7 @@ with tab_compose:
                 with row[0]:
                     default_chk = select_all
                     chk = st.checkbox(
-                        "",
+                        f"Seç: {d.title}",
                         value=st.session_state.get(f"draft_chk_{d.id}", default_chk),
                         key=f"draft_chk_{d.id}",
                         label_visibility="collapsed",
@@ -1099,7 +1118,7 @@ with tab_status:
             )
         st.dataframe(
             rows,
-            use_container_width=True,
+            width="stretch",
             hide_index=True,
             column_config={
                 "Notebook": st.column_config.LinkColumn(

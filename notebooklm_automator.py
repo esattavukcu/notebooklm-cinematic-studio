@@ -449,10 +449,20 @@ def select_cinematic_video_overview(page: Page) -> None:
 
     if not panel_opened:
         log("⚠ Panel açıldığına dair gösterge bulunamadı. Tekrar tıklamayı deniyorum...")
-        # Bir kez daha ağır siklette tıkla — bazen ilk tıklama tooltip gösteriyor sadece
         page.wait_for_timeout(800)
         _force_click(page, matched_sel)
         page.wait_for_timeout(2000)
+
+    # Click sonrası screenshot — debug için
+    try:
+        screenshot_dir = Path(__file__).parent / "data" / "logs" / "screenshots"
+        screenshot_dir.mkdir(parents=True, exist_ok=True)
+        ts = time.strftime("%H%M%S")
+        shot = screenshot_dir / f"after_video_click_{ts}.png"
+        page.screenshot(path=str(shot), full_page=False)
+        log(f"Screenshot: {shot}")
+    except Exception as e:
+        log(f"Screenshot alınamadı: {e}")
 
     log("Panel kontrolü tamam, Cinematic seçimine geçiliyor...")
     page.wait_for_timeout(1500)

@@ -20,6 +20,7 @@ import io
 import json
 import os
 import platform
+import re
 import shutil
 import signal
 import subprocess
@@ -32,6 +33,16 @@ from dataclasses import asdict, dataclass, field
 from datetime import datetime, date, timezone
 from pathlib import Path
 from typing import Any, Optional
+
+# .env auto-load — secret'lar repo'ya gitmesin diye dosyadan okuyoruz.
+# python-dotenv requirements.txt'te var. Yüklenmemişse sessizce devam et.
+try:
+    from dotenv import load_dotenv
+    # APP_DIR henüz tanımlanmadığı için göreli path kullanıyoruz; load_dotenv()
+    # default olarak çalışma dizininden başlayıp parent'lara doğru .env arar.
+    load_dotenv(dotenv_path=Path(__file__).parent / ".env", override=False)
+except ImportError:
+    pass
 
 import streamlit as st
 
@@ -269,8 +280,17 @@ def harvest_log_path(job_id: str) -> Path:
 # Azure Blob upload (Phase 3) — env var ile gated, opsiyonel.
 # AZURE_STORAGE_CONNECTION_STRING ve AZURE_CONTAINER set edilmediyse skip.
 # ---------------------------------------------------------------------------
+def _extract_sas_from_conn(conn: str) -> str:
+    """SAS-based connection string'lerden SharedAccessSignature param'ını çıkarır.
+    Account-key'li connection string'de SAS olmaz, boş döner."""
+    m = re.search(r"SharedAccessSignature=([^;]+)", conn)
+    return m.group(1) if m else ""
+
+
 def upload_to_azure(local_path: Path, job_id: str) -> tuple[bool, str, str]:
-    """Returns (success, remote_url_or_empty, error_or_empty)."""
+    """Returns (success, remote_url_or_empty, error_or_empty).
+    SAS-based connection ise döndürdüğü URL'e SAS append'lenir →
+    private container'da bile direkt browser'da oynatılabilir."""
     if not AZURE_ENABLED:
         return False, "", "azure_disabled"
     try:
@@ -295,9 +315,18 @@ def upload_to_azure(local_path: Path, job_id: str) -> tuple[bool, str, str]:
                 overwrite=True,
                 content_settings=ContentSettings(content_type="video/mp4"),
             )
-        # Public URL — container public ise direkt çalışır.
-        # Private container kullanıyorsa SAS token gerekecek; şimdilik base URL döndürüyoruz.
-        return True, blob.url, ""
+
+        base_url = blob.url
+        sas = _extract_sas_from_conn(AZURE_CONN)
+        if sas:
+            # SAS-based connection: URL'e ekle → tarayıcıda direkt oynanabilir.
+            # Note: Bu URL'i alan kişi SAS'in tüm scope'u (rwdla) ile erişir,
+            # SAS expire'a kadar (2-yıl). Daha sıkı izolasyon için per-blob
+            # read-only SAS gerekir (bu account key gerektirir, biz SAS-only).
+            sep = "&" if "?" in base_url else "?"
+            return True, f"{base_url}{sep}{sas}", ""
+        # Account-key veya public container: base URL yeterli
+        return True, base_url, ""
     except Exception as e:
         return False, "", str(e)[:300]
 

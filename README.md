@@ -93,16 +93,35 @@ Job tetiklendikten sonra (`done` status), Worker arka planda otomatik olarak vid
 
 ### Azure Blob upload'u aktive et (opsiyonel)
 
+`.env.example` dosyasını `.env` olarak kopyala, kendi değerlerinle doldur. `.env` gitignored — secret'lar repo'ya gitmez. App başlarken otomatik okur (`python-dotenv` ile).
+
 ```bash
-export AZURE_STORAGE_CONNECTION_STRING="DefaultEndpointsProtocol=https;AccountName=...;AccountKey=...;..."
-export AZURE_CONTAINER="cinematic-videos"   # default
-export AZURE_BLOB_PREFIX="videos/"          # default
+cp .env.example .env
+# .env'i editle, AZURE_STORAGE_CONNECTION_STRING'i doldur
 ./app.sh
 ```
 
-`AZURE_STORAGE_CONNECTION_STRING` set edilmediyse Phase 3 sessizce skip edilir, sadece Phase 1+2 çalışır (video URL + lokal dosya).
+`.env` örneği:
+```
+ADMIN_PASSWORD=uzun-random-string
+AZURE_STORAGE_CONNECTION_STRING=BlobEndpoint=https://...;SharedAccessSignature=sv=...
+AZURE_CONTAINER=cinematic-videos
+AZURE_BLOB_PREFIX=videos/
+```
 
-**Container ACL**: Container public-read ise `blob.url` direkt çalışır. Private ise SAS token gerek (şu an direkt URL döndürüyoruz; gerekirse genişletilir).
+**SAS vs Account Key**: İki tür connection string desteklenir:
+- **Account key** (`AccountKey=...`) — full admin yetki, expire olmaz
+- **SAS-based** (`SharedAccessSignature=sv=...`) — time-limited, scope'lu, daha güvenli
+
+SAS-based ise upload sonrası dönen URL'e SAS otomatik append edilir → private container'da bile direkt browser'da oynatılabilir.
+
+**`AZURE_STORAGE_CONNECTION_STRING` set edilmediyse** Phase 3 sessizce skip edilir, sadece Phase 1+2 çalışır (video URL + lokal dosya).
+
+**Sunucuda deploy**: `.env` dosyasını sunucuya `rsync` ile gönder (SSH üzerinden — log'lara yazmaz):
+```bash
+rsync -avz .env user@server:/home/user/notebooklm-cinematic-studio/.env
+ssh user@server 'sudo systemctl restart notebooklm'
+```
 
 ### Mustafa için fark
 

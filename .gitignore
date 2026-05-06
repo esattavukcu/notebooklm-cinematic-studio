@@ -1,0 +1,16 @@
+.venv/
+venv/
+__pycache__/
+*.pyc
+*.pyo
+.DS_Store
+.env
+data/
+chrome_profiles/
+launcher.log
+*.log
+.idea/
+.vscode/
+.pytest_cache/
+build/
+dist/

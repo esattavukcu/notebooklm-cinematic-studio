@@ -1385,23 +1385,27 @@ def open_in_browser(url: str) -> None:
 # ---------------------------------------------------------------------------
 import secrets  # noqa: E402
 
-# Module-level session token store. Servis restart'ta sıfırlanır (kullanıcılar
-# tekrar login olur). Process içinde paylaşımlı — Worker thread ile aynı.
-_AUTH_TOKENS: dict[str, dict] = {}
+
+# Streamlit her sayfa render'ında app.py'yi yeniden exec ediyor → module-level
+# dict her seferinde sıfırlanıyor. @st.cache_resource ile bağlayıp Streamlit'in
+# process'i boyunca tek bir paylaşımlı dict tut.
+@st.cache_resource
+def _token_store() -> dict[str, dict]:
+    return {}
 
 
 def _issue_session_token(auth: dict) -> str:
     token = secrets.token_urlsafe(24)
-    _AUTH_TOKENS[token] = auth
+    _token_store()[token] = auth
     return token
 
 
 def _lookup_session_token(token: str) -> Optional[dict]:
-    return _AUTH_TOKENS.get(token) if token else None
+    return _token_store().get(token) if token else None
 
 
 def _revoke_session_token(token: str) -> None:
-    _AUTH_TOKENS.pop(token, None)
+    _token_store().pop(token, None)
 
 
 def _restore_session_from_url() -> None:

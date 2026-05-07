@@ -107,6 +107,13 @@ LLM_ENABLED = bool(OPENROUTER_API_KEY)
 # Liste eskirse https://openrouter.ai/models?max_price=0 üzerinden güncelle.
 # NOT: Free tier endpoint'leri sık sık unavailable olabiliyor (404, rate limit).
 # Bir model çalışmazsa diğerine geç.
+# --- Image search: opsiyonel free-tier API keyleri ---
+# Wikimedia + Openverse key gerektirmez. Pixabay + Pexels free tier ama
+# kayıt + key alımı gerekir. Set edilmezse o kaynak skip edilir.
+PIXABAY_API_KEY = os.environ.get("PIXABAY_API_KEY", "").strip()
+PEXELS_API_KEY = os.environ.get("PEXELS_API_KEY", "").strip()
+
+
 OPENROUTER_FREE_MODELS: list[tuple[str, str]] = [
     # (id, label) — sıra: probe ile doğrulanmış çalışanlar önce
     ("openai/gpt-oss-120b:free",
@@ -805,13 +812,17 @@ def _search_wikimedia(query: str, limit: int = 4) -> list[dict]:
 
 
 def _search_openverse(query: str, limit: int = 4) -> list[dict]:
-    """Openverse aggregator (Flickr/CC kaynakları). API key gerekmez."""
+    """Openverse aggregator (Flickr/CC kaynakları). API key gerekmez.
+
+    Not: license_type filtresi koymuyoruz — Openverse zaten sadece CC içerik
+    indeksliyor, ama strict "commercial" filtresi sonuçları çok daraltıyor.
+    BY-NC, BY-ND da kabul (kullanım amacımıza uygun, atıf veriyoruz).
+    """
     if not query.strip():
         return []
     params = {
         "q": query,
         "page_size": str(limit),
-        "license_type": "commercial",  # CC0/CC-BY/CC-BY-SA — kullanılabilir
     }
     # Yeni domain api.openverse.org — eski .engineering hala çalışıyor ama yeni daha stabil
     url = "https://api.openverse.org/v1/images/?" + urllib.parse.urlencode(params)
@@ -834,24 +845,102 @@ def _search_openverse(query: str, limit: int = 4) -> list[dict]:
     return results
 
 
-def search_images(query: str, limit: int = 8) -> list[dict]:
-    """Aynı query'yi Wikimedia + Openverse'te paralel ara, sonuçları interleave et.
+def _search_pixabay(query: str, limit: int = 4) -> list[dict]:
+    """Pixabay — free tier (key gerek). https://pixabay.com/api/docs/
 
-    Interleave: kaynak çeşitliliği için bir Wikimedia, bir Openverse...
+    Lisans: Pixabay License (commercial-friendly, atıf opsiyonel).
+    """
+    if not PIXABAY_API_KEY or not query.strip():
+        return []
+    params = {
+        "key": PIXABAY_API_KEY,
+        "q": query,
+        "per_page": str(max(3, limit)),  # min 3
+        "image_type": "photo",
+        "safesearch": "true",
+    }
+    url = "https://pixabay.com/api/?" + urllib.parse.urlencode(params)
+    data = _http_get_json(url)
+    if not data:
+        return []
+    results = []
+    for item in (data.get("hits") or [])[:limit]:
+        results.append({
+            "source": "pixabay",
+            "thumb_url": item.get("previewURL") or item.get("webformatURL"),
+            "full_url": item.get("largeImageURL") or item.get("webformatURL"),
+            "title": (item.get("tags") or "")[:120],
+            "license": "Pixabay",
+            "attribution": (item.get("user") or "")[:80] or "Pixabay",
+            "page_url": item.get("pageURL"),
+            "width": item.get("imageWidth", 0),
+            "height": item.get("imageHeight", 0),
+        })
+    return results
+
+
+def _search_pexels(query: str, limit: int = 4) -> list[dict]:
+    """Pexels — free tier (key gerek). https://www.pexels.com/api/documentation/
+
+    Lisans: Pexels License (commercial-friendly, atıf opsiyonel).
+    """
+    if not PEXELS_API_KEY or not query.strip():
+        return []
+    params = {"query": query, "per_page": str(limit)}
+    url = "https://api.pexels.com/v1/search?" + urllib.parse.urlencode(params)
+    data = _http_get_json(url, headers={"Authorization": PEXELS_API_KEY})
+    if not data:
+        return []
+    results = []
+    for item in (data.get("photos") or [])[:limit]:
+        src = item.get("src") or {}
+        results.append({
+            "source": "pexels",
+            "thumb_url": src.get("medium") or src.get("small"),
+            "full_url": src.get("large2x") or src.get("large") or src.get("original"),
+            "title": (item.get("alt") or "")[:120],
+            "license": "Pexels",
+            "attribution": (item.get("photographer") or "")[:80] or "Pexels",
+            "page_url": item.get("url"),
+            "width": item.get("width", 0),
+            "height": item.get("height", 0),
+        })
+    return results
+
+
+def search_images(query: str, limit: int = 12) -> list[dict]:
+    """Aynı query'yi tüm aktif kaynaklarda ara, sonuçları interleave et.
+
+    Aktif kaynaklar:
+    - Wikimedia (her zaman, key gerekmez)
+    - Openverse (her zaman, key gerekmez)
+    - Pixabay (PIXABAY_API_KEY env set ise)
+    - Pexels (PEXELS_API_KEY env set ise)
+
+    Interleave: kaynak çeşitliliği için round-robin.
     """
     if not query.strip():
         return []
-    half = max(2, limit // 2)
-    wm = _search_wikimedia(query, limit=half + 2)
-    ov = _search_openverse(query, limit=half + 2)
-    # Interleave
+    per_source = max(2, limit // 4)
+    sources: list[list[dict]] = []
+    sources.append(_search_wikimedia(query, limit=per_source + 2))
+    sources.append(_search_openverse(query, limit=per_source + 2))
+    if PIXABAY_API_KEY:
+        sources.append(_search_pixabay(query, limit=per_source + 2))
+    if PEXELS_API_KEY:
+        sources.append(_search_pexels(query, limit=per_source + 2))
+
+    # Round-robin interleave
     out = []
     i = 0
-    while (i < len(wm) or i < len(ov)) and len(out) < limit:
-        if i < len(wm):
-            out.append(wm[i])
-        if i < len(ov) and len(out) < limit:
-            out.append(ov[i])
+    while len(out) < limit:
+        added_this_round = False
+        for src_list in sources:
+            if i < len(src_list) and len(out) < limit:
+                out.append(src_list[i])
+                added_this_round = True
+        if not added_this_round:
+            break
         i += 1
     return out[:limit]
 
@@ -2171,6 +2260,34 @@ def render_user_view() -> None:
                 _persist_draft()
                 break
 
+    def _cb_use_manual_url(asset_id: str, widget_key: str) -> None:
+        """Kullanıcının yapıştırdığı URL'i selected_image olarak set et."""
+        url = (st.session_state.get(widget_key) or "").strip()
+        if not url or not (url.startswith("http://") or url.startswith("https://")):
+            st.session_state["_script_msg"] = (
+                "err", "Geçerli bir https:// URL'si yapıştır."
+            )
+            return
+        for a in st.session_state.get("script_assets", []):
+            if a.get("id") != asset_id:
+                continue
+            a["selected_image"] = {
+                "source": "manual",
+                "thumb_url": url,
+                "full_url": url,
+                "title": "(manuel URL)",
+                "license": "kullanıcı belirtmedi",
+                "attribution": "manuel",
+                "page_url": url,
+                "width": 0,
+                "height": 0,
+            }
+            # Widget'ı temizle (bir sonraki run'da)
+            st.session_state[widget_key] = ""
+            st.session_state["_script_msg"] = ("ok", "URL seçildi.")
+            _persist_draft()
+            break
+
     # Önceki run'da bir mesaj set edildiyse göster (callback render'dan önce çalışır)
     _msg = st.session_state.pop("_script_msg", None)
 
@@ -2438,11 +2555,45 @@ def render_user_view() -> None:
                                     on_click=_cb_search_images,
                                     args=(aid,),
                                     use_container_width=True,
-                                    help="Wikimedia + Openverse'te bu query ile ara",
+                                    help="Aktif kaynaklarda bu query ile ara",
                                 )
                             with search_cs[1]:
+                                # Aktif kaynak listesi
+                                _active = ["Wikimedia", "Openverse"]
+                                if PIXABAY_API_KEY:
+                                    _active.append("Pixabay")
+                                if PEXELS_API_KEY:
+                                    _active.append("Pexels")
                                 st.caption(
-                                    "Wikimedia Commons + Openverse'te (CC lisanslı) ara"
+                                    f"Aktif kaynaklar: **{' · '.join(_active)}**"
+                                )
+
+                            # Manuel URL paste — kullanıcı kendisi URL bulup yapıştırabilir
+                            with st.expander("✏ Manuel URL yapıştır", expanded=False):
+                                _q_for_external = (asset.get("query") or "").strip()
+                                if _q_for_external:
+                                    _g_url = "https://www.google.com/search?tbm=isch&q=" + urllib.parse.quote(_q_for_external)
+                                    _ddg_url = "https://duckduckgo.com/?iax=images&ia=images&q=" + urllib.parse.quote(_q_for_external)
+                                    st.markdown(
+                                        f'<div style="font-size:0.78rem; opacity:0.8; margin-bottom:6px;">'
+                                        f'Bulamadıysan dış arama: '
+                                        f'<a href="{_g_url}" target="_blank">🔗 Google Images</a> · '
+                                        f'<a href="{_ddg_url}" target="_blank">🔗 DuckDuckGo</a> '
+                                        f'→ uygun görseli bul → <b>resme sağ tıkla → "Resim adresini kopyala"</b>'
+                                        f'</div>',
+                                        unsafe_allow_html=True,
+                                    )
+                                _manual_key = f"asset_manual_url_{aid}"
+                                st.text_input(
+                                    "Görsel URL'i (https://... ile başlamalı)",
+                                    key=_manual_key,
+                                    placeholder="https://example.com/image.jpg",
+                                )
+                                st.button(
+                                    "Bu URL'i kullan",
+                                    key=f"asset_manual_use_{aid}",
+                                    on_click=_cb_use_manual_url,
+                                    args=(aid, _manual_key),
                                 )
                         else:
                             # Aday görseller var, henüz seçim yok
@@ -2499,6 +2650,29 @@ def render_user_view() -> None:
                                             args=(aid, cand_idx),
                                             use_container_width=True,
                                         )
+
+                            # Manuel URL paste — adaylar varken de erişilebilir
+                            with st.expander("✏ Beğenmediysen: manuel URL yapıştır", expanded=False):
+                                _q_for_external2 = (asset.get("query") or "").strip()
+                                if _q_for_external2:
+                                    _g_url2 = "https://www.google.com/search?tbm=isch&q=" + urllib.parse.quote(_q_for_external2)
+                                    st.markdown(
+                                        f'<a href="{_g_url2}" target="_blank" '
+                                        f'style="font-size:0.78rem;">🔗 Google Images\'te aç</a>',
+                                        unsafe_allow_html=True,
+                                    )
+                                _manual_key2 = f"asset_manual_url2_{aid}"
+                                st.text_input(
+                                    "Görsel URL'i",
+                                    key=_manual_key2,
+                                    placeholder="https://example.com/image.jpg",
+                                )
+                                st.button(
+                                    "Bu URL'i kullan",
+                                    key=f"asset_manual_use2_{aid}",
+                                    on_click=_cb_use_manual_url,
+                                    args=(aid, _manual_key2),
+                                )
 
     # ===== Submit button =====
     st.markdown("&nbsp;", unsafe_allow_html=True)

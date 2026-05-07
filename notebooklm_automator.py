@@ -372,16 +372,19 @@ def run_init(profile_dir: Path, authuser: int, emitter: EventEmitter) -> int:
 
     emitter.emit("init_starting", profile_dir=str(profile_dir), port=port)
 
-    # Chrome'u manuel başlat. stdout/stderr'i log dosyasına yönlendir
-    # (DEVNULL bazı Chrome assertion'larını tetikliyor olabilir).
+    # Chrome'u shell wrapper ile başlat — direkt subprocess.Popen Xvfb'de
+    # Chrome'u SIGTRAP'leyen bir şey yapıyor (process group/session/TTY ile
+    # ilgili). Bash subshell üzerinden başlatınca Chrome düzgün ayağa kalkıyor.
     chrome_log_path = profile_dir / "chrome_init.log"
+    import shlex
+    chrome_cmd = " ".join(shlex.quote(a) for a in chrome_args)
     try:
         chrome_log = chrome_log_path.open("wb")
         chrome_proc = subprocess.Popen(
-            chrome_args,
+            chrome_cmd,
+            shell=True,
             stdout=chrome_log,
             stderr=subprocess.STDOUT,
-            start_new_session=True,  # systemd'nin TERM signal'lerinden bağımsız
         )
     except Exception as e:
         emitter.emit("init_error", error=f"Chrome spawn fail: {e}")

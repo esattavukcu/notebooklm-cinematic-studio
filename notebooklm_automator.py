@@ -29,9 +29,12 @@ import random
 import re
 import shutil
 import signal
+import subprocess
 import sys
 import time
 import traceback
+import urllib.error
+import urllib.request
 from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path

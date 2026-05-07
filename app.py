@@ -60,6 +60,7 @@ JOBS_FILE = DATA_DIR / "jobs.json"
 PROFILES_FILE = DATA_DIR / "profiles.json"
 DRAFTS_FILE = DATA_DIR / "drafts.json"
 USERS_FILE = DATA_DIR / "users.json"
+SCRIPT_DRAFTS_FILE = DATA_DIR / "script_drafts.json"  # Phase A in-progress drafts
 LAUNCHER_LOG = LOGS_DIR / "launcher.log"
 
 # Bugünkü kullanım sayımına dahil olan job durumları. Failed da sayılır —
@@ -202,7 +203,7 @@ class Draft:
 class Job:
     id: str
     title: str
-    text: str
+    text: str                         # Final script — NotebookLM'e gönderilen
     profile_id: str = ""
     profile_name: str = ""
     status: str = "queued"           # queued | running | done | failed | submitted | stopped
@@ -213,6 +214,9 @@ class Job:
     finished_at: float = 0.0
     created_at: float = field(default_factory=time.time)
     submitted_by: str = ""           # Kullanıcının kendi adı (user view session_state'inden)
+    # Audit trail — script iteration geçmişi (Phase A)
+    original_script: str = ""        # Kullanıcının ilk yapıştırdığı versiyon (AI iterasyonundan önce)
+    iterations: list = field(default_factory=list)  # [{script, feedback, model, ts}, ...]
     # Harvest (video collection) fields
     video_url: str = ""              # NotebookLM tarafındaki direkt <video src> URL
     video_local_path: str = ""       # data/downloads/<job_id>.mp4 (relative)
@@ -370,6 +374,50 @@ def load_jobs() -> list[Job]:
 
 def save_jobs(jobs: list[Job]) -> None:
     _atomic_write_json(JOBS_FILE, [asdict(j) for j in jobs])
+
+
+# ---------------------------------------------------------------------------
+# Script drafts (Phase A) — kullanıcının yazmakta olduğu senaryo + iterasyonlar
+# Dosya formatı: {username: {script: str, iterations: list, updated_at: float}}
+# Refresh kaybetmesin diye disk'e persist edilir, submit'te temizlenir.
+# ---------------------------------------------------------------------------
+def _load_all_script_drafts() -> dict:
+    raw = _read_json(SCRIPT_DRAFTS_FILE, {})
+    return raw if isinstance(raw, dict) else {}
+
+
+def load_script_draft(username: str) -> Optional[dict]:
+    """Bu kullanıcının kayıtlı draft'ını döndür (None = yok)."""
+    if not username:
+        return None
+    all_drafts = _load_all_script_drafts()
+    d = all_drafts.get(username)
+    if not isinstance(d, dict):
+        return None
+    return d
+
+
+def save_script_draft(username: str, script: str, iterations: list) -> None:
+    """Kullanıcının draft'ını disk'e yaz."""
+    if not username:
+        return
+    all_drafts = _load_all_script_drafts()
+    all_drafts[username] = {
+        "script": script or "",
+        "iterations": iterations or [],
+        "updated_at": time.time(),
+    }
+    _atomic_write_json(SCRIPT_DRAFTS_FILE, all_drafts)
+
+
+def clear_script_draft(username: str) -> None:
+    """Kullanıcının draft'ını sil (submit veya manuel sıfırla sonrası)."""
+    if not username:
+        return
+    all_drafts = _load_all_script_drafts()
+    if username in all_drafts:
+        del all_drafts[username]
+        _atomic_write_json(SCRIPT_DRAFTS_FILE, all_drafts)
 
 
 # ---------------------------------------------------------------------------
@@ -1700,6 +1748,25 @@ def render_user_view() -> None:
         st.session_state["script_feedback"] = ""
         st.session_state["script_iterations"] = []
 
+    # İlk yüklemede disk'ten restore (refresh / yeni sekme / başka cihazdan
+    # gelirken yarım kalan draft'ı geri getir). Sadece ilk run'da çalışır.
+    if "_script_draft_initialized" not in st.session_state:
+        _user = _user_name()
+        _saved = load_script_draft(_user) if _user else None
+        if _saved:
+            st.session_state["script_draft"] = _saved.get("script", "")
+            st.session_state["script_iterations"] = _saved.get("iterations", []) or []
+            if _saved.get("script"):
+                # Kullanıcıya bildir — bilinmeyen yerden draft gelmesin
+                st.session_state["_script_msg"] = (
+                    "ok", "Yarım kalan draft'ın geri yüklendi."
+                )
+        else:
+            st.session_state["script_draft"] = ""
+            st.session_state["script_iterations"] = []
+        st.session_state["script_feedback"] = ""
+        st.session_state["_script_draft_initialized"] = True
+
     if "script_draft" not in st.session_state:
         st.session_state["script_draft"] = ""
     if "script_iterations" not in st.session_state:
@@ -1712,6 +1779,16 @@ def render_user_view() -> None:
     # Submit niyeti — submit callback'i set eder, ana akış kuyruğa ekler.
     if "_pending_submit" not in st.session_state:
         st.session_state["_pending_submit"] = False
+
+    # --- Persistence helper (disk autosave) ---
+    def _persist_draft() -> None:
+        u = _user_name()
+        if u:
+            save_script_draft(
+                u,
+                st.session_state.get("script_draft", ""),
+                st.session_state.get("script_iterations", []),
+            )
 
     # --- Callbacks ---
     def _cb_regenerate() -> None:
@@ -1735,11 +1812,13 @@ def render_user_view() -> None:
             st.session_state["script_draft"] = result.strip()
             st.session_state["script_feedback"] = ""
             st.session_state["_script_msg"] = ("ok", "Yeni versiyon hazır.")
+            _persist_draft()
         else:
             st.session_state["_script_msg"] = ("err", result)
 
     def _cb_reset_history() -> None:
         st.session_state["script_iterations"] = []
+        _persist_draft()
 
     def _cb_revert(actual_i: int) -> None:
         iters = st.session_state["script_iterations"]
@@ -1748,6 +1827,11 @@ def render_user_view() -> None:
             # Bu noktadan sonraki versiyonları sil
             st.session_state["script_iterations"] = iters[:actual_i]
             st.session_state["_script_msg"] = ("ok", f"v{actual_i + 1} geri yüklendi.")
+            _persist_draft()
+
+    def _cb_text_changed() -> None:
+        """text_area on_change: kullanıcı yazıp blur ettiğinde disk'e kaydet."""
+        _persist_draft()
 
     def _cb_submit() -> None:
         text = st.session_state.get("script_draft", "").strip()
@@ -1777,6 +1861,7 @@ def render_user_view() -> None:
         placeholder="Senaryon, system prompt'un veya uzun metin...",
         label_visibility="collapsed",
         key="script_draft",
+        on_change=_cb_text_changed,  # blur'da disk'e autosave
     )
 
     # ===== AI Editor (LLM aktifse) =====
@@ -1891,6 +1976,13 @@ def render_user_view() -> None:
     if st.session_state.get("_pending_submit"):
         st.session_state["_pending_submit"] = False
         text_submit = st.session_state.get("script_draft", "").strip()
+        iterations_at_submit = list(st.session_state.get("script_iterations", []))
+        # Audit: original_script = ilk iterasyondaki "script" (ilk yapıştırılan
+        # versiyon). Hiç iterasyon yoksa = final script.
+        if iterations_at_submit:
+            original_at_submit = iterations_at_submit[0].get("script", text_submit)
+        else:
+            original_at_submit = text_submit
         if text_submit:
             title = derive_title(text_submit)
             jobs_all = load_jobs()
@@ -1899,8 +1991,12 @@ def render_user_view() -> None:
                 title=title,
                 text=text_submit,
                 submitted_by=_user_name(),
+                original_script=original_at_submit,
+                iterations=iterations_at_submit,
             ))
             save_jobs(jobs_all)
+            # Disk'teki yarım draft'ı temizle (artık jobs.json'da audit'le birlikte var)
+            clear_script_draft(_user_name())
             # Submit sonrası alanları temizle — widget değerleri callback dışında
             # ama yeni run başlamadan önce session_state'i temizleyemeyiz çünkü
             # widget'lar zaten render edildi. Bu yüzden bayrak kullan: bir
@@ -2598,6 +2694,49 @@ with tab_status:
                         f'style="font-size:0.84rem; text-decoration:none;">🔗 Notebook aç</a>',
                         unsafe_allow_html=True,
                     )
+                # Script audit trail — kullanıcının iterasyon geçmişi
+                # (Phase A: original_script + iterations[])
+                if j.iterations or j.original_script:
+                    n_iter = len(j.iterations or [])
+                    label = (f"📜 Senaryo geçmişi · {n_iter} AI iterasyonu"
+                             if n_iter else "📜 Senaryo (hiç iterasyon yok)")
+                    with st.expander(label, expanded=False):
+                        # Original (yapıştırılan)
+                        if j.original_script and j.original_script != j.text:
+                            st.markdown(
+                                "<small style='opacity:0.7; font-weight:600;'>"
+                                "ORİJİNAL (kullanıcının yapıştırdığı)</small>",
+                                unsafe_allow_html=True,
+                            )
+                            st.text(j.original_script[:5000])
+                            st.markdown("---")
+                        # Iterations
+                        for k, it in enumerate(j.iterations or []):
+                            mdl = (it.get("model") or "?").split("/")[-1].replace(":free", "")
+                            st.markdown(
+                                f"<small style='opacity:0.7; font-weight:600;'>"
+                                f"v{k+1} · <code>{mdl}</code></small>",
+                                unsafe_allow_html=True,
+                            )
+                            fb = it.get("feedback", "").strip()
+                            if fb:
+                                st.markdown(
+                                    f"<div style='font-size:0.8rem; opacity:0.85; "
+                                    f"padding:6px 10px; background:rgba(99,102,241,0.08); "
+                                    f"border-left:2px solid #6366F1; border-radius:4px; "
+                                    f"margin-bottom:4px;'>💬 {fb}</div>",
+                                    unsafe_allow_html=True,
+                                )
+                            with st.expander(f"v{k+1} senaryosu", expanded=False):
+                                st.text(it.get("script", "")[:5000])
+                            st.markdown("&nbsp;", unsafe_allow_html=True)
+                        # Final (NotebookLM'e giden)
+                        st.markdown(
+                            "<small style='opacity:0.7; font-weight:600;'>"
+                            "FİNAL (NotebookLM'e gönderilen)</small>",
+                            unsafe_allow_html=True,
+                        )
+                        st.text(j.text[:5000])
                 # Azure URL — admin için copy butonlu görünüm.
                 # st.code() köşesinde built-in clipboard butonu var.
                 if j.video_remote_url:

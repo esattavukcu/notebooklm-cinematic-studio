@@ -67,8 +67,11 @@ LAUNCHER_LOG = LOGS_DIR / "launcher.log"
 
 # Bugünkü kullanım sayımına dahil olan job durumları. Failed da sayılır —
 # yoksa kullanıcı sürekli aynı profili spam'leyip limit aşabilir.
-COUNTED_STATUSES = {"running", "done", "submitted", "failed"}
+COUNTED_STATUSES = {"running", "generating", "done", "submitted", "failed"}
 TERMINAL_STATUSES = {"done", "failed", "submitted", "stopped"}
+# generating = automator bitti, NotebookLM Cinematic video üretiyor; harvest bekliyoruz.
+# done       = video harvest edildi (+ Azure'a yüklendi); gerçekten tamamlandı.
+HARVEST_PICKUP_STATUSES = {"generating", "done"}  # geriye dönük uyum için "done" da
 
 DISPATCH_INTERVAL_SEC = 2.0
 JOB_LOG_TAIL_LINES = 400
@@ -1674,7 +1677,14 @@ class Worker:
                 url = evt.get("notebook_url", "") or target.notebook_url
                 target.notebook_url = url
                 if int(evt.get("exit_code", 1)) == 0:
-                    target.status = "done" if url else "submitted"
+                    # Automator işini bitirdi (Generate tıklandı), ama NotebookLM
+                    # Cinematic videoyu 30-60dk'da üretiyor. status="generating"
+                    # olarak işaretle — harvest cycle bunu pick'leyip video URL'i
+                    # geldiğinde "done"a çevirecek.
+                    if url:
+                        target.status = "generating"
+                    else:
+                        target.status = "submitted"
                 else:
                     target.status = "failed"
                     if not target.error:
@@ -1718,8 +1728,9 @@ class Worker:
         now = time.time()
         candidates = []
         for j in jobs:
-            # Sadece notebook_url'i olan ve harvest'i bitmemiş done/submitted job'lar
-            if j.status not in ("done", "submitted"):
+            # Harvest pickup: 'generating' (yeni — automator success) veya
+            # 'done'/'submitted' (geriye dönük uyum).
+            if j.status not in ("generating", "done", "submitted"):
                 continue
             if not j.notebook_url:
                 continue
@@ -1867,6 +1878,10 @@ class Worker:
                 except (ValueError, OSError):
                     target.video_local_path = local_path
                 target.harvest_status = "downloaded"
+                # Phase E.4: video harvest edildi → job status'u 'generating'den
+                # 'done'a yükselt (gerçekten tamamlandı).
+                if target.status in ("generating", "submitted"):
+                    target.status = "done"
             save_jobs(jobs)
 
             # Phase 3: Azure upload (eğer enabled ise ve dosya varsa)
@@ -1880,6 +1895,10 @@ class Worker:
                             if ok:
                                 j.video_remote_url = remote_url
                                 j.harvest_status = "uploaded"
+                                # Eğer hâlâ generating ise (downloaded path'inde
+                                # set edilmemişse), şimdi done yap.
+                                if j.status in ("generating", "submitted"):
+                                    j.status = "done"
                             else:
                                 j.harvest_error = f"Azure upload failed: {err}"
                             break
@@ -2104,20 +2123,22 @@ _CUSTOM_CSS = """
   white-space: nowrap;
   vertical-align: middle;
 }
-.pill-queued    { background: #FEF3C7; color: #92400E; border-color: #FBBF24; }
-.pill-running   { background: #DBEAFE; color: #1E3A8A; border-color: #60A5FA; }
-.pill-done      { background: #D1FAE5; color: #065F46; border-color: #34D399; }
-.pill-submitted { background: #E0E7FF; color: #3730A3; border-color: #818CF8; }
-.pill-failed    { background: #FEE2E2; color: #991B1B; border-color: #F87171; }
-.pill-stopped   { background: #E5E7EB; color: #374151; border-color: #9CA3AF; }
+.pill-queued     { background: #FEF3C7; color: #92400E; border-color: #FBBF24; }
+.pill-running    { background: #DBEAFE; color: #1E3A8A; border-color: #60A5FA; }
+.pill-generating { background: #EDE9FE; color: #5B21B6; border-color: #A78BFA; }
+.pill-done       { background: #D1FAE5; color: #065F46; border-color: #34D399; }
+.pill-submitted  { background: #E0E7FF; color: #3730A3; border-color: #818CF8; }
+.pill-failed     { background: #FEE2E2; color: #991B1B; border-color: #F87171; }
+.pill-stopped    { background: #E5E7EB; color: #374151; border-color: #9CA3AF; }
 
 @media (prefers-color-scheme: dark) {
-  .pill-queued    { background: rgba(251,191,36,0.18); color: #FCD34D; }
-  .pill-running   { background: rgba(96,165,250,0.18); color: #93C5FD; }
-  .pill-done      { background: rgba(52,211,153,0.18); color: #6EE7B7; }
-  .pill-submitted { background: rgba(129,140,248,0.18); color: #A5B4FC; }
-  .pill-failed    { background: rgba(248,113,113,0.18); color: #FCA5A5; }
-  .pill-stopped   { background: rgba(156,163,175,0.20); color: #D1D5DB; }
+  .pill-queued     { background: rgba(251,191,36,0.18); color: #FCD34D; }
+  .pill-running    { background: rgba(96,165,250,0.18); color: #93C5FD; }
+  .pill-generating { background: rgba(167,139,250,0.20); color: #C4B5FD; }
+  .pill-done       { background: rgba(52,211,153,0.18); color: #6EE7B7; }
+  .pill-submitted  { background: rgba(129,140,248,0.18); color: #A5B4FC; }
+  .pill-failed     { background: rgba(248,113,113,0.18); color: #FCA5A5; }
+  .pill-stopped    { background: rgba(156,163,175,0.20); color: #D1D5DB; }
 }
 
 /* Job satırı */
@@ -2222,6 +2243,7 @@ worker = get_worker()
 _STATUS_LABELS = {
     "queued": "KUYRUKTA",
     "running": "ÇALIŞIYOR",
+    "generating": "VİDEO ÜRETİLİYOR",  # NotebookLM Cinematic'te 30-60dk
     "done": "TAMAMLANDI",
     "submitted": "GÖNDERİLDİ",
     "failed": "HATA",
@@ -3463,8 +3485,26 @@ def render_user_view() -> None:
                     elif j.status == "running":
                         elapsed = fmt_duration(j.started_at, 0)
                         sub = f"▶ NotebookLM tetikleniyor · {elapsed} sürdü"
+                    elif j.status == "generating":
+                        # Automator bitti, NotebookLM Cinematic videoyu üretiyor.
+                        # Harvest cycle'ında ne aşamada olduğumuza göre alt-başlık.
+                        hs = j.harvest_status
+                        elapsed_min = max(0, int((time.time() - (j.finished_at or time.time())) / 60))
+                        if hs == "checking":
+                            sub = f"🔍 Video kontrol ediliyor... (deneme {j.harvest_attempts}/{HARVEST_MAX_ATTEMPTS})"
+                        elif hs == "expired":
+                            sub = "⌛ Video kontrolü zaman aşımı — Notebook'u açıp manuel bak"
+                        elif j.harvest_attempts == 0:
+                            first_at = (j.finished_at or j.created_at) + HARVEST_FIRST_DELAY_SEC
+                            wait_min = max(0, int((first_at - time.time()) / 60))
+                            if wait_min > 0:
+                                sub = f"🎬 Video üretiliyor · {elapsed_min} dk geçti · ilk kontrol {wait_min} dk sonra"
+                            else:
+                                sub = f"🎬 Video üretiliyor · {elapsed_min} dk · kontrol çok yakında"
+                        else:
+                            next_min = max(0, int((j.next_harvest_at - time.time()) / 60))
+                            sub = f"🎬 Video üretiliyor · {elapsed_min} dk · sonraki kontrol {next_min} dk (deneme {j.harvest_attempts}/{HARVEST_MAX_ATTEMPTS})"
                     elif j.status == "done":
-                        # Harvest durumuna göre alt-başlık
                         hs = j.harvest_status
                         if hs == "uploaded":
                             sub = "🎬 Video hazır + bulutta paylaşıma açık!"
@@ -3472,21 +3512,8 @@ def render_user_view() -> None:
                             sub = "🎬 Video hazır ve indirilmiş!"
                         elif hs == "ready":
                             sub = "🎬 Video hazır — oynatabilirsin"
-                        elif hs == "checking":
-                            sub = f"🔍 Video kontrol ediliyor... (deneme {j.harvest_attempts}/{HARVEST_MAX_ATTEMPTS})"
-                        elif hs == "expired":
-                            sub = "⌛ Video kontrolü zaman aşımı — Notebook'u açıp manuel bak"
-                        else:  # pending
-                            if j.harvest_attempts == 0:
-                                first_at = (j.finished_at or j.created_at) + HARVEST_FIRST_DELAY_SEC
-                                wait_min = max(0, int((first_at - time.time()) / 60))
-                                if wait_min > 0:
-                                    sub = f"✓ Tetiklendi · {wait_min} dk sonra video kontrol edilecek"
-                                else:
-                                    sub = "✓ Tetiklendi · video kontrolü çok yakında"
-                            else:
-                                next_min = max(0, int((j.next_harvest_at - time.time()) / 60))
-                                sub = f"🔍 Video henüz hazır değil · {next_min} dk sonra tekrar bakılacak (deneme {j.harvest_attempts}/{HARVEST_MAX_ATTEMPTS})"
+                        else:
+                            sub = "✓ Tamamlandı"
                     elif j.status == "submitted":
                         sub = "📤 Tetiklendi (notebook URL'i yok). Admin loga baksın."
                     elif j.status == "failed":
@@ -3572,7 +3599,7 @@ if not is_logged_in():
 if not _is_admin():
     render_user_view()
     _jobs_now = load_jobs()
-    if any(j.status == "running" or j.status == "queued" for j in _jobs_now):
+    if any(j.status in ("running", "queued", "generating") for j in _jobs_now):
         time.sleep(4)
         st.rerun()
     st.stop()
@@ -3984,7 +4011,7 @@ with tab_status:
     cols = st.columns(6)
     cols[0].metric("⏳ Kuyrukta", counts.get("queued", 0))
     cols[1].metric("▶ Çalışan", counts.get("running", 0))
-    cols[2].metric("✓ Tetiklendi", counts.get("done", 0) + counts.get("submitted", 0))
+    cols[2].metric("🎬 Üretiliyor", counts.get("generating", 0) + counts.get("submitted", 0))
     cols[3].metric("🎬 Video hazır", n_video_ready)
     cols[4].metric("☁️ Azure'da", n_video_uploaded if AZURE_ENABLED else "-")
     cols[5].metric("✗ Hatalı", counts.get("failed", 0))
@@ -4256,8 +4283,9 @@ with tab_status:
                 elif j.notebook_url and j.status in TERMINAL_STATUSES:
                     if st.button("🌐 Aç", key=f"open_{j.id}", help="Notebook'u tarayıcıda aç", use_container_width=True):
                         open_in_browser(j.notebook_url)
-                # Harvest now (admin için, status done ama henüz video yoksa)
-                if (j.status == "done" and not j.video_url
+                # Harvest now (admin için, automator bitti ama henüz video yoksa)
+                if (j.status in ("generating", "done", "submitted")
+                    and not j.video_url
                     and j.harvest_status not in ("checking",)):
                     if st.button("🔍 Şimdi tara", key=f"harvest_{j.id}",
                                  help="Video harvest cycle'ını hemen tetikle", use_container_width=True):
@@ -4270,7 +4298,7 @@ with tab_status:
                         st.toast("Durdurma sinyali gönderildi.", icon="🛑")
         st.markdown('</div>', unsafe_allow_html=True)
 
-    if counts.get("running", 0) > 0:
+    if counts.get("running", 0) > 0 or counts.get("generating", 0) > 0:
         st.markdown(
             '<div style="margin-top:1rem; padding:8px 14px; border-radius:8px; '
             'background:rgba(99,102,241,0.08); border-left:3px solid #6366F1; font-size:0.85rem;">'

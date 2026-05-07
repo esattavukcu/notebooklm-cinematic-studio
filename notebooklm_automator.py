@@ -178,6 +178,21 @@ ADD_SOURCES_SELECTORS = [
 
 # Cinematic Customize dialog'unda "Custom prompt" button/toggle.
 # NotebookLM bunu bazen ikon, bazen text olarak gösterir. Multi-variant.
+# İlk modal'da (Create new sonrası) ya da "+ Add sources" modal'ında
+# "Upload files" butonu — tıklanınca native file picker açıyor (hidden
+# input lazy-attached oluyor, doğrudan input[type=file] aramak fail ediyor).
+# Bu yüzden expect_file_chooser ile butona basıp picker'ı yakalıyoruz.
+UPLOAD_FILES_BUTTON_SELECTORS = [
+    'button:has-text("Upload files")',
+    'button:has-text("Upload Files")',
+    'button:has-text("Dosya yükle")',
+    'button:has-text("Dosyaları yükle")',
+    '[role="button"]:has-text("Upload files")',
+    'mat-card:has-text("Upload files")',
+    '[aria-label*="upload" i][aria-label*="file" i]',
+]
+
+
 CUSTOM_PROMPT_BUTTON_SELECTORS = [
     'button:has-text("Custom prompt")',
     'button:has-text("Custom Prompt")',
@@ -791,7 +806,15 @@ def upload_files_to_notebook(
     # 2) Modal açılsın diye küçük bekleme
     time.sleep(1.5)
 
-    # 3) Dialog içindeki file input'u bul (hidden olabilir)
+    # 3) Dosyaları yükle — iki stratejiyle (NotebookLM lazy-attach yapıyor)
+    paths_str = [str(p.resolve()) for p in file_paths if p.exists()]
+    if not paths_str:
+        emitter.emit("no_valid_file_paths", label=label)
+        return False
+
+    upload_done = False
+
+    # Strateji 1: direkt input[type=file] aramak (bazen DOM'da hidden var)
     file_input_selectors = [
         '[role="dialog"] input[type="file"]',
         'mat-dialog-container input[type="file"]',
@@ -802,29 +825,47 @@ def upload_files_to_notebook(
     for sel in file_input_selectors:
         try:
             cand = page.locator(sel).first
-            cand.wait_for(state="attached", timeout=5000)
+            cand.wait_for(state="attached", timeout=2500)
             file_input = cand
-            emitter.emit("file_input_found", selector=sel, label=label)
+            emitter.emit("file_input_found", selector=sel, label=label,
+                         strategy="direct")
             break
         except Exception:
             continue
-    if file_input is None:
-        emitter.emit("file_input_not_found", label=label)
-        _take_screenshot(page, screenshots_dir, f"{job_id}_no_file_input_{label}")
-        return False
+    if file_input is not None:
+        try:
+            file_input.set_input_files(paths_str)
+            emitter.emit("files_set", count=len(paths_str), label=label,
+                         strategy="direct")
+            upload_done = True
+        except Exception as e:
+            emitter.emit("direct_set_input_files_failed", error=str(e), label=label)
 
-    # 4) Toplu upload
-    paths_str = [str(p.resolve()) for p in file_paths if p.exists()]
-    if not paths_str:
-        emitter.emit("no_valid_file_paths", label=label)
-        return False
-    try:
-        file_input.set_input_files(paths_str)
-        emitter.emit("files_set", count=len(paths_str), label=label)
-    except Exception as e:
-        emitter.emit("set_input_files_failed", error=str(e), label=label)
-        _take_screenshot(page, screenshots_dir, f"{job_id}_upload_fail_{label}")
-        return False
+    # Strateji 2: "Upload files" butonu + expect_file_chooser
+    if not upload_done:
+        upload_btn = _find_first_visible(
+            page, UPLOAD_FILES_BUTTON_SELECTORS, timeout_ms=8000
+        )
+        if upload_btn is None:
+            emitter.emit("upload_files_button_not_found", label=label)
+            _take_screenshot(page, screenshots_dir,
+                             f"{job_id}_no_upload_btn_{label}")
+            return False
+        try:
+            with page.expect_file_chooser(timeout=15000) as fc_info:
+                try:
+                    upload_btn.click(timeout=5000)
+                except Exception:
+                    upload_btn.evaluate("el => el.click()")
+            file_chooser = fc_info.value
+            file_chooser.set_files(paths_str)
+            emitter.emit("files_set", count=len(paths_str), label=label,
+                         strategy="file_chooser")
+        except Exception as e:
+            emitter.emit("file_chooser_failed", error=str(e), label=label)
+            _take_screenshot(page, screenshots_dir,
+                             f"{job_id}_filechooser_fail_{label}")
+            return False
 
     # 5) Upload tamamlanmasını bekle (modal kapanması signal)
     time.sleep(5)
@@ -1096,7 +1137,19 @@ def run_automation(
                 if image_paths:
                     first_files.extend([p for p in image_paths if p.exists()])
 
-                # File input'u bul (modal henüz açık olmalı)
+                # NotebookLM modal'ında file input lazy-attached — direkt
+                # aramak fail ediyor. İki strateji:
+                # 1) Doğrudan input[type=file] var mı? (bazen DOM'da hidden duruyor)
+                # 2) Yoksa "Upload files" butonuna bas + expect_file_chooser
+                #    ile native picker'ı yakala.
+                paths_str = [str(p.resolve()) for p in first_files if p.exists()]
+                emitter.emit("first_modal_uploading",
+                             count=len(paths_str),
+                             files=[Path(p).name for p in paths_str])
+
+                upload_done = False
+
+                # Strateji 1: direkt input[type=file] — kısa timeout, varsa kullan
                 file_input = None
                 for sel in (
                     '[role="dialog"] input[type="file"]',
@@ -1106,28 +1159,53 @@ def run_automation(
                 ):
                     try:
                         cand = page.locator(sel).first
-                        cand.wait_for(state="attached", timeout=8000)
+                        cand.wait_for(state="attached", timeout=2500)
                         file_input = cand
-                        emitter.emit("first_modal_file_input_found", selector=sel)
+                        emitter.emit("first_modal_file_input_found",
+                                     selector=sel, strategy="direct")
                         break
                     except Exception:
                         continue
-                if file_input is None:
-                    emitter.emit("first_modal_file_input_not_found")
-                    _take_screenshot(page, screenshots_dir, f"{job_id}_no_first_modal_input")
-                    raise RuntimeError("İlk modal'da file input bulunamadı")
+                if file_input is not None:
+                    try:
+                        file_input.set_input_files(paths_str)
+                        emitter.emit("first_modal_files_set",
+                                     count=len(paths_str), strategy="direct")
+                        upload_done = True
+                    except Exception as e:
+                        emitter.emit("direct_set_input_files_failed", error=str(e))
 
-                paths_str = [str(p.resolve()) for p in first_files if p.exists()]
-                emitter.emit("first_modal_uploading",
-                             count=len(paths_str),
-                             files=[Path(p).name for p in paths_str])
-                try:
-                    file_input.set_input_files(paths_str)
-                except Exception as e:
-                    emitter.emit("first_modal_upload_failed", error=str(e))
-                    _take_screenshot(page, screenshots_dir, f"{job_id}_first_upload_fail")
-                    raise RuntimeError(f"Toplu upload başarısız: {e}")
-                emitter.emit("first_modal_files_set", count=len(paths_str))
+                # Strateji 2: "Upload files" butonu + expect_file_chooser
+                if not upload_done:
+                    upload_btn = _find_first_visible(
+                        page, UPLOAD_FILES_BUTTON_SELECTORS, timeout_ms=10000
+                    )
+                    if upload_btn is None:
+                        emitter.emit("upload_files_button_not_found")
+                        _take_screenshot(page, screenshots_dir,
+                                         f"{job_id}_no_upload_btn")
+                        raise RuntimeError(
+                            "İlk modal'da Upload files butonu bulunamadı"
+                        )
+                    emitter.emit("upload_files_button_found")
+                    try:
+                        with page.expect_file_chooser(timeout=15000) as fc_info:
+                            try:
+                                upload_btn.click(timeout=5000)
+                            except Exception:
+                                # JS click fallback
+                                upload_btn.evaluate("el => el.click()")
+                        file_chooser = fc_info.value
+                        file_chooser.set_files(paths_str)
+                        emitter.emit("first_modal_files_set",
+                                     count=len(paths_str),
+                                     strategy="file_chooser")
+                        upload_done = True
+                    except Exception as e:
+                        emitter.emit("file_chooser_failed", error=str(e))
+                        _take_screenshot(page, screenshots_dir,
+                                         f"{job_id}_filechooser_fail")
+                        raise RuntimeError(f"File chooser ile upload başarısız: {e}")
 
                 # Notebook URL'i yakala (upload tamamlanınca redirect olur)
                 try:

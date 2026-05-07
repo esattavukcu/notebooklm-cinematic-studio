@@ -372,19 +372,23 @@ def run_init(profile_dir: Path, authuser: int, emitter: EventEmitter) -> int:
 
     emitter.emit("init_starting", profile_dir=str(profile_dir), port=port)
 
-    # Chrome'u shell wrapper + & (background/disown) ile başlat. Direkt
-    # subprocess.Popen Xvfb'de Chrome'u SIGTRAP ile düşürüyor; bash subshell'in
-    # arka plan job'ı için yaptığı session/PG/TTY setup'ı Chrome'u memnun ediyor.
+    # Chrome'u shell wrapper + & ile başlat. Önemli detaylar:
+    # - shell=True olmadan Chrome SIGTRAP atıyor (PG/TTY setup farkı)
+    # - & olmadan shell foreground'da chrome'u bekleyince yine SIGTRAP
+    # - stdout=file redirect olunca Chrome startup'ta takılıyor (TTY check?)
+    # Bu yüzden chrome'un stdout'unu shell üzerinden bir log dosyasına
+    # > ile yönlendiriyoruz — bu Popen'dan farklı, Chrome bash redirect'i
+    # bir TTY-benzeri olarak tolere ediyor.
     chrome_log_path = profile_dir / "chrome_init.log"
     import shlex
-    chrome_cmd = " ".join(shlex.quote(a) for a in chrome_args) + " &"
+    chrome_cmd = (
+        " ".join(shlex.quote(a) for a in chrome_args)
+        + f" > {shlex.quote(str(chrome_log_path))} 2>&1 &"
+    )
     try:
-        chrome_log = chrome_log_path.open("wb")
         chrome_proc = subprocess.Popen(
             chrome_cmd,
             shell=True,
-            stdout=chrome_log,
-            stderr=subprocess.STDOUT,
         )
     except Exception as e:
         emitter.emit("init_error", error=f"Chrome spawn fail: {e}")

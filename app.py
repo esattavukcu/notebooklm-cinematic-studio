@@ -217,6 +217,8 @@ class Job:
     # Audit trail — script iteration geçmişi (Phase A)
     original_script: str = ""        # Kullanıcının ilk yapıştırdığı versiyon (AI iterasyonundan önce)
     iterations: list = field(default_factory=list)  # [{script, feedback, model, ts}, ...]
+    # Phase B: extracted assets — her görsel için {id, position, description, query, style}
+    assets: list = field(default_factory=list)
     # Harvest (video collection) fields
     video_url: str = ""              # NotebookLM tarafındaki direkt <video src> URL
     video_local_path: str = ""       # data/downloads/<job_id>.mp4 (relative)
@@ -397,7 +399,8 @@ def load_script_draft(username: str) -> Optional[dict]:
     return d
 
 
-def save_script_draft(username: str, script: str, iterations: list) -> None:
+def save_script_draft(username: str, script: str, iterations: list,
+                      assets: Optional[list] = None) -> None:
     """Kullanıcının draft'ını disk'e yaz."""
     if not username:
         return
@@ -405,6 +408,7 @@ def save_script_draft(username: str, script: str, iterations: list) -> None:
     all_drafts[username] = {
         "script": script or "",
         "iterations": iterations or [],
+        "assets": assets or [],
         "updated_at": time.time(),
     }
     _atomic_write_json(SCRIPT_DRAFTS_FILE, all_drafts)
@@ -618,6 +622,104 @@ Generate the revised script."""
         temperature=0.8,
         max_tokens=3000,
     )
+
+
+# ---------------------------------------------------------------------------
+# Phase B: Asset extraction — script'ten görsel listesi çıkar
+# ---------------------------------------------------------------------------
+ASSET_EXTRACTOR_SYSTEM = """You are a visual director for short-form factual videos (Weird Facts / explainer style).
+
+Given a video narration script, extract a list of visual assets (images, illustrations, footage frames) that should appear during narration. Each asset must:
+- Match a specific narration moment (a phrase or sentence)
+- Have a CONCRETE, searchable subject — no abstract concepts, metaphors, or feelings
+- Be the kind of thing findable on stock-image sites (Wikimedia Commons, Openverse, Flickr CC) OR generatable by an AI image model
+
+Output ONLY a JSON array. No preamble, no markdown fences, no explanation. Strictly this schema:
+
+[
+  {
+    "position": "<3-7 word excerpt of the narration line this image accompanies, in the script's original language>",
+    "description": "<one-sentence Turkish description of what the image should show, for the user to review>",
+    "query": "<3-6 English keywords for stock image search — concrete nouns, no articles>",
+    "style": "photo" | "illustration" | "diagram" | "archive"
+  },
+  ...
+]
+
+Rules:
+- Aim for one key visual per main idea. Don't pad — quality over quantity.
+- Adjust count to script length: ~5 for short scripts (under 200 words), ~10-15 for longer.
+- "query" MUST be English even if the script is Turkish.
+- "description" MUST be Turkish if the script is Turkish, else English.
+- "style" guidance: "photo" for real-world subjects, "illustration" for stylized concepts, "diagram" for charts/processes, "archive" for historical/old footage.
+
+Return ONLY the JSON array. Anything else breaks the parser."""
+
+
+def extract_assets(script: str, model: Optional[str] = None) -> tuple[bool, list, str]:
+    """Script'ten asset listesi çıkar. (success, assets_list, error_msg) döner.
+
+    assets_list elemanları: {position, description, query, style}.
+    Hata durumunda assets_list = [].
+    """
+    if not script.strip():
+        return False, [], "Senaryo boş olamaz."
+
+    ok, raw = _openrouter_chat(
+        [
+            {"role": "system", "content": ASSET_EXTRACTOR_SYSTEM},
+            {"role": "user", "content": f"SCRIPT:\n{script.strip()}\n\nExtract assets as JSON array."},
+        ],
+        model=model,
+        temperature=0.4,  # daha deterministik — JSON parse hatası az olsun
+        max_tokens=4000,
+    )
+    if not ok:
+        return False, [], raw  # raw = error mesajı
+
+    # JSON parse — model bazen markdown fence (```json ... ```) ekliyor, temizle
+    cleaned = raw.strip()
+    if cleaned.startswith("```"):
+        # ```json\n...\n``` veya ```\n...\n``` formatını sıyır
+        lines = cleaned.split("\n")
+        if len(lines) >= 3:
+            cleaned = "\n".join(lines[1:-1]) if lines[-1].strip().startswith("```") else "\n".join(lines[1:])
+        cleaned = cleaned.replace("```json", "").replace("```", "").strip()
+    # Bazen başında "Here is the JSON:" gibi yazılar — ilk [ karakterinden başlat
+    if "[" in cleaned:
+        cleaned = cleaned[cleaned.index("["):]
+        # Son ] karakterinde kes
+        if "]" in cleaned:
+            cleaned = cleaned[: cleaned.rindex("]") + 1]
+
+    try:
+        assets = json.loads(cleaned)
+    except json.JSONDecodeError as e:
+        return False, [], (
+            f"Model JSON yerine başka bir şey döndürdü ({e.msg}). "
+            f"Başka model dene. İlk 200 karakter: {raw[:200]!r}"
+        )
+
+    if not isinstance(assets, list):
+        return False, [], "Model array değil, başka bir şey döndürdü."
+
+    # Validate + normalize
+    valid = []
+    for i, item in enumerate(assets):
+        if not isinstance(item, dict):
+            continue
+        valid.append({
+            "id": uuid.uuid4().hex[:8],  # stable id for editing/regenerate
+            "position": str(item.get("position", ""))[:200],
+            "description": str(item.get("description", ""))[:500],
+            "query": str(item.get("query", ""))[:200],
+            "style": str(item.get("style", "photo")).lower() or "photo",
+        })
+
+    if not valid:
+        return False, [], "Model boş veya geçersiz liste döndürdü."
+
+    return True, valid, ""
 
 
 # ---------------------------------------------------------------------------
@@ -1747,6 +1849,7 @@ def render_user_view() -> None:
         st.session_state["script_draft"] = ""
         st.session_state["script_feedback"] = ""
         st.session_state["script_iterations"] = []
+        st.session_state["script_assets"] = []
 
     # İlk yüklemede disk'ten restore (refresh / yeni sekme / başka cihazdan
     # gelirken yarım kalan draft'ı geri getir). Sadece ilk run'da çalışır.
@@ -1756,6 +1859,7 @@ def render_user_view() -> None:
         if _saved:
             st.session_state["script_draft"] = _saved.get("script", "")
             st.session_state["script_iterations"] = _saved.get("iterations", []) or []
+            st.session_state["script_assets"] = _saved.get("assets", []) or []
             if _saved.get("script"):
                 # Kullanıcıya bildir — bilinmeyen yerden draft gelmesin
                 st.session_state["_script_msg"] = (
@@ -1764,6 +1868,7 @@ def render_user_view() -> None:
         else:
             st.session_state["script_draft"] = ""
             st.session_state["script_iterations"] = []
+            st.session_state["script_assets"] = []
         st.session_state["script_feedback"] = ""
         st.session_state["_script_draft_initialized"] = True
 
@@ -1773,6 +1878,8 @@ def render_user_view() -> None:
         st.session_state["script_iterations"] = []
     if "script_feedback" not in st.session_state:
         st.session_state["script_feedback"] = ""
+    if "script_assets" not in st.session_state:
+        st.session_state["script_assets"] = []
     # Callback'ler arası mesaj geçişi (toast/error). Render'da tüketilir.
     if "_script_msg" not in st.session_state:
         st.session_state["_script_msg"] = None  # ("ok"|"err", text)
@@ -1788,6 +1895,7 @@ def render_user_view() -> None:
                 u,
                 st.session_state.get("script_draft", ""),
                 st.session_state.get("script_iterations", []),
+                st.session_state.get("script_assets", []),
             )
 
     # --- Callbacks ---
@@ -1839,6 +1947,53 @@ def render_user_view() -> None:
             st.session_state["_script_msg"] = ("err", "Senaryo boş olamaz.")
             return
         st.session_state["_pending_submit"] = True
+
+    # --- Phase B (asset extraction) callbacks ---
+    def _cb_extract_assets() -> None:
+        script = st.session_state.get("script_draft", "").strip()
+        model = st.session_state.get("script_model") or OPENROUTER_MODEL
+        if not script:
+            st.session_state["_script_msg"] = ("err", "Önce senaryo yapıştır.")
+            return
+        ok, assets, err = extract_assets(script, model=model)
+        if ok:
+            st.session_state["script_assets"] = assets
+            st.session_state["_script_msg"] = (
+                "ok", f"{len(assets)} görsel önerildi. Listeyi düzenleyebilirsin."
+            )
+            _persist_draft()
+        else:
+            st.session_state["_script_msg"] = ("err", err)
+
+    def _cb_clear_assets() -> None:
+        st.session_state["script_assets"] = []
+        _persist_draft()
+
+    def _cb_delete_asset(asset_id: str) -> None:
+        st.session_state["script_assets"] = [
+            a for a in st.session_state.get("script_assets", [])
+            if a.get("id") != asset_id
+        ]
+        _persist_draft()
+
+    def _cb_add_asset() -> None:
+        st.session_state["script_assets"].append({
+            "id": uuid.uuid4().hex[:8],
+            "position": "",
+            "description": "",
+            "query": "",
+            "style": "photo",
+        })
+        _persist_draft()
+
+    def _cb_asset_edit(asset_id: str, field_name: str, widget_key: str) -> None:
+        """Inline edit: text_input/selectbox değiştiğinde asset dict'i güncelle."""
+        new_val = st.session_state.get(widget_key, "")
+        for a in st.session_state.get("script_assets", []):
+            if a.get("id") == asset_id:
+                a[field_name] = new_val
+                break
+        _persist_draft()
 
     # Önceki run'da bir mesaj set edildiyse göster (callback render'dan önce çalışır)
     _msg = st.session_state.pop("_script_msg", None)
@@ -1946,6 +2101,114 @@ def render_user_view() -> None:
                                 args=(actual_i,),
                             )
 
+    # ===== Phase B: Asset extraction (görsel listesi) =====
+    if LLM_ENABLED:
+        assets = st.session_state.get("script_assets", []) or []
+        n_assets = len(assets)
+        b_label = "🖼 Görseller (Phase B)"
+        if n_assets:
+            b_label += f" — {n_assets} öneri"
+        with st.expander(b_label, expanded=bool(n_assets)):
+            st.caption(
+                "Senaryon hazır olunca aşağıdaki butona bas — LLM, video için "
+                "lazım olan görsellerin listesini çıkarır. Her birini "
+                "düzenleyebilir, silebilir, manuel ekleyebilirsin. Bu liste "
+                "Phase C'de image search'e girecek."
+            )
+            cs_b = st.columns([2, 1, 1])
+            with cs_b[0]:
+                if n_assets:
+                    extract_label = "🔄 Yeniden çıkar (listeyi sıfırlar)"
+                else:
+                    extract_label = "🖼 Görselleri çıkar"
+                st.button(
+                    extract_label,
+                    type="primary",
+                    use_container_width=True,
+                    on_click=_cb_extract_assets,
+                    key="btn_extract_assets",
+                    help="Aktif senaryoyu LLM'e gönderir, görsel listesi çıkarır."
+                )
+            with cs_b[1]:
+                if n_assets:
+                    st.button(
+                        "➕ Manuel ekle",
+                        use_container_width=True,
+                        on_click=_cb_add_asset,
+                        key="btn_add_asset",
+                    )
+            with cs_b[2]:
+                if n_assets:
+                    st.button(
+                        "🗑 Tümünü sil",
+                        use_container_width=True,
+                        on_click=_cb_clear_assets,
+                        key="btn_clear_assets",
+                    )
+
+            if n_assets:
+                st.markdown("&nbsp;", unsafe_allow_html=True)
+                STYLE_OPTS = ["photo", "illustration", "diagram", "archive"]
+                STYLE_ICON = {
+                    "photo": "📷", "illustration": "🎨",
+                    "diagram": "📊", "archive": "🗄"
+                }
+                for idx, asset in enumerate(assets):
+                    aid = asset.get("id") or uuid.uuid4().hex[:8]
+                    asset["id"] = aid  # ensure id always present
+                    style_now = asset.get("style", "photo")
+                    if style_now not in STYLE_OPTS:
+                        style_now = "photo"
+                    icon = STYLE_ICON.get(style_now, "📷")
+
+                    with st.container(border=True):
+                        head = st.columns([5, 1.2, 0.6])
+                        with head[0]:
+                            pos = asset.get("position", "")
+                            st.markdown(
+                                f'<div style="font-size:0.85rem; font-weight:600; '
+                                f'margin-bottom:2px;">'
+                                f'{icon} <span style="opacity:0.55;">#{idx+1}</span> · '
+                                f'<span style="opacity:0.7; font-weight:500; '
+                                f'font-style:italic;">{pos[:90] if pos else "(konum belirtilmedi)"}</span>'
+                                f'</div>',
+                                unsafe_allow_html=True,
+                            )
+                        with head[1]:
+                            st.selectbox(
+                                "Stil",
+                                options=STYLE_OPTS,
+                                index=STYLE_OPTS.index(style_now),
+                                label_visibility="collapsed",
+                                key=f"asset_style_{aid}",
+                                on_change=_cb_asset_edit,
+                                args=(aid, "style", f"asset_style_{aid}"),
+                            )
+                        with head[2]:
+                            st.button(
+                                "🗑",
+                                key=f"asset_del_{aid}",
+                                use_container_width=True,
+                                on_click=_cb_delete_asset,
+                                args=(aid,),
+                                help="Bu öneriyi sil",
+                            )
+                        st.text_input(
+                            "Açıklama (TR)",
+                            value=asset.get("description", ""),
+                            key=f"asset_desc_{aid}",
+                            on_change=_cb_asset_edit,
+                            args=(aid, "description", f"asset_desc_{aid}"),
+                        )
+                        st.text_input(
+                            "Search query (EN, image API'leri için)",
+                            value=asset.get("query", ""),
+                            key=f"asset_query_{aid}",
+                            on_change=_cb_asset_edit,
+                            args=(aid, "query", f"asset_query_{aid}"),
+                            help="3-6 İngilizce keyword. Phase C'de Wikimedia/Openverse search'e gönderilecek.",
+                        )
+
     # ===== Submit button =====
     st.markdown("&nbsp;", unsafe_allow_html=True)
     cs = st.columns([3, 1])
@@ -1977,6 +2240,7 @@ def render_user_view() -> None:
         st.session_state["_pending_submit"] = False
         text_submit = st.session_state.get("script_draft", "").strip()
         iterations_at_submit = list(st.session_state.get("script_iterations", []))
+        assets_at_submit = list(st.session_state.get("script_assets", []))
         # Audit: original_script = ilk iterasyondaki "script" (ilk yapıştırılan
         # versiyon). Hiç iterasyon yoksa = final script.
         if iterations_at_submit:
@@ -1993,6 +2257,7 @@ def render_user_view() -> None:
                 submitted_by=_user_name(),
                 original_script=original_at_submit,
                 iterations=iterations_at_submit,
+                assets=assets_at_submit,
             ))
             save_jobs(jobs_all)
             # Disk'teki yarım draft'ı temizle (artık jobs.json'da audit'le birlikte var)
@@ -2694,6 +2959,32 @@ with tab_status:
                         f'style="font-size:0.84rem; text-decoration:none;">🔗 Notebook aç</a>',
                         unsafe_allow_html=True,
                     )
+                # Phase B: Asset listesi (kullanıcının çıkardığı görsel önerileri)
+                if j.assets:
+                    with st.expander(f"🖼 Görseller · {len(j.assets)} öneri", expanded=False):
+                        for k, a in enumerate(j.assets):
+                            style = a.get("style", "photo")
+                            icon = {
+                                "photo": "📷", "illustration": "🎨",
+                                "diagram": "📊", "archive": "🗄"
+                            }.get(style, "📷")
+                            pos = a.get("position", "")[:80]
+                            desc = a.get("description", "")
+                            query = a.get("query", "")
+                            st.markdown(
+                                f'<div style="margin-bottom:8px; padding:8px 10px; '
+                                f'background:rgba(99,102,241,0.05); border-radius:6px;">'
+                                f'<div style="font-size:0.78rem; opacity:0.65; '
+                                f'margin-bottom:2px;">{icon} #{k+1} · '
+                                f'<i>{pos}</i></div>'
+                                f'<div style="font-size:0.85rem;">{desc}</div>'
+                                f'<div style="font-size:0.75rem; opacity:0.7; '
+                                f'margin-top:4px; font-family:monospace;">'
+                                f'🔍 <code>{query}</code></div>'
+                                f'</div>',
+                                unsafe_allow_html=True,
+                            )
+
                 # Script audit trail — kullanıcının iterasyon geçmişi
                 # (Phase A: original_script + iterations[])
                 if j.iterations or j.original_script:

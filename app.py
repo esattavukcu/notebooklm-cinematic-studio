@@ -835,7 +835,8 @@ class Worker:
                 continue
             if not j.notebook_url:
                 continue
-            if j.harvest_status in ("ready", "downloaded", "uploaded", "expired", "skip"):
+            # "checking" da skip — şu an harvest çalışıyor, paralel tetikleme.
+            if j.harvest_status in ("ready", "downloaded", "uploaded", "expired", "skip", "checking"):
                 continue
             # İlk deneme için: finished_at + HARVEST_FIRST_DELAY_SEC bekleyelim
             if j.harvest_attempts == 0:

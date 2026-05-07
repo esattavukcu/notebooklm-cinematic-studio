@@ -97,25 +97,29 @@ VNC_ENABLED = bool(HEADLESS_INIT_DISPLAY)
 # extraction) UI'da gizlenir.
 OPENROUTER_API_KEY = os.environ.get("OPENROUTER_API_KEY", "").strip()
 OPENROUTER_MODEL = os.environ.get(
-    "OPENROUTER_MODEL", "qwen/qwen3-next-80b-a3b-instruct:free"
+    "OPENROUTER_MODEL", "openai/gpt-oss-120b:free"
 ).strip()
 LLM_ENABLED = bool(OPENROUTER_API_KEY)
 
 # Kullanıcının UI'dan seçebileceği top free modeller (Mayıs 2026 itibarıyla
 # OpenRouter ücretsiz katmanından el ile seçildi). Hepsi instruct + multilingual.
 # Liste eskirse https://openrouter.ai/models?max_price=0 üzerinden güncelle.
+# NOT: Free tier endpoint'leri sık sık unavailable olabiliyor (404, rate limit).
+# Bir model çalışmazsa diğerine geç.
 OPENROUTER_FREE_MODELS: list[tuple[str, str]] = [
-    # (id, label)
-    ("qwen/qwen3-next-80b-a3b-instruct:free",
-     "Qwen3 Next 80B — multilingual, dengeli (varsayılan)"),
-    ("google/gemma-4-31b-it:free",
-     "Gemma 4 31B — Google, hızlı"),
+    # (id, label) — sıra: önce kanıtlanmış çalışanlar
     ("openai/gpt-oss-120b:free",
-     "GPT-OSS 120B — OpenAI açık-ağırlık, kaliteli"),
+     "GPT-OSS 120B — OpenAI açık-ağırlık (varsayılan, kaliteli)"),
+    ("openai/gpt-oss-20b:free",
+     "GPT-OSS 20B — OpenAI, daha hızlı"),
     ("z-ai/glm-4.5-air:free",
      "GLM 4.5 Air — yaratıcı yazım iyi"),
     ("nvidia/nemotron-3-super-120b-a12b:free",
      "Nemotron 3 Super 120B — NVIDIA, derin akıl yürütme"),
+    ("qwen/qwen3-next-80b-a3b-instruct:free",
+     "Qwen3 Next 80B — multilingual (bugün unavailable)"),
+    ("google/gemma-4-31b-it:free",
+     "Gemma 4 31B — Google (bugün unavailable)"),
 ]
 
 PYTHON_BIN = sys.executable  # venv'in içindeki python

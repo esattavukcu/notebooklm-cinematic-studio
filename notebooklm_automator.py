@@ -372,12 +372,16 @@ def run_init(profile_dir: Path, authuser: int, emitter: EventEmitter) -> int:
 
     emitter.emit("init_starting", profile_dir=str(profile_dir), port=port)
 
-    # Chrome'u manuel başlat
+    # Chrome'u manuel başlat. stdout/stderr'i log dosyasına yönlendir
+    # (DEVNULL bazı Chrome assertion'larını tetikliyor olabilir).
+    chrome_log_path = profile_dir / "chrome_init.log"
     try:
+        chrome_log = chrome_log_path.open("wb")
         chrome_proc = subprocess.Popen(
             chrome_args,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
+            stdout=chrome_log,
+            stderr=subprocess.STDOUT,
+            start_new_session=True,  # systemd'nin TERM signal'lerinden bağımsız
         )
     except Exception as e:
         emitter.emit("init_error", error=f"Chrome spawn fail: {e}")
@@ -392,7 +396,17 @@ def run_init(profile_dir: Path, authuser: int, emitter: EventEmitter) -> int:
     chrome_ready = False
     for _ in range(30):
         if chrome_proc.poll() is not None:
-            emitter.emit("init_error", error=f"Chrome erken çıktı (rc={chrome_proc.returncode})")
+            # Chrome'un kendi log'unu da emit et — neden çıktığını görelim
+            tail = ""
+            try:
+                tail = chrome_log_path.read_text(errors="replace")[-1500:]
+            except Exception:
+                pass
+            emitter.emit(
+                "init_error",
+                error=f"Chrome erken çıktı (rc={chrome_proc.returncode})",
+                chrome_log=tail,
+            )
             return 1
         try:
             urllib.request.urlopen(cdp_url, timeout=1)

@@ -303,10 +303,36 @@ def _take_screenshot(page, screenshots_dir: Path, tag: str) -> Optional[Path]:
 
 # ---------------------------------------------------------------------------
 # INIT mode: kullanıcının elle login olmasını bekle, state'i kaydet.
+#
+# Strateji: Playwright'ın launch_persistent_context'i Xvfb context'inde
+# Chromium'u SIGTRAP ile kıran flag'ler ekliyor. Workaround:
+#   1) Chrome'u manuel `subprocess.Popen` ile başlat (manuel test çalışıyor)
+#   2) Chrome --remote-debugging-port=9222 ile listenleyince Playwright'ı
+#      connect_over_cdp ile bağla
+#   3) Frame navigation'ı izle, NotebookLM'e ulaşınca storage_state kaydet
+#   4) Chrome kapanınca finalize et
 # ---------------------------------------------------------------------------
-def run_init(profile_dir: Path, authuser: int, emitter: EventEmitter) -> int:
-    from playwright.sync_api import sync_playwright
+def _find_chrome_binary() -> Optional[str]:
+    """Önce env var'dan, sonra Playwright bundled, sonra system Chrome."""
+    env = os.environ.get("PLAYWRIGHT_CHROMIUM_EXECUTABLE_PATH", "").strip()
+    if env and Path(env).exists():
+        return env
+    # Playwright bundled chromium
+    cache = Path.home() / ".cache" / "ms-playwright"
+    for d in sorted(cache.glob("chromium-*"), reverse=True):
+        candidate = d / "chrome-linux64" / "chrome"
+        if candidate.exists():
+            return str(candidate)
+    # System Google Chrome
+    for p in ("/usr/bin/google-chrome-stable", "/usr/bin/google-chrome", "/usr/bin/chromium"):
+        if Path(p).exists():
+            return p
+    return None
 
+
+def run_init(profile_dir: Path, authuser: int, emitter: EventEmitter) -> int:
+    """Manuel Chrome subprocess + Playwright CDP connect.
+    launch_persistent_context Xvfb'de SIGTRAP veriyor — bypass."""
     profile_dir.mkdir(parents=True, exist_ok=True)
     cleanup_profile_locks(profile_dir)
     _ensure_stable_tmpdir(profile_dir)
@@ -314,66 +340,138 @@ def run_init(profile_dir: Path, authuser: int, emitter: EventEmitter) -> int:
     auth_json = profile_dir / "auth.json"
     saved_once = {"value": False}
 
-    with sync_playwright() as pw:
-        emitter.emit("init_starting", profile_dir=str(profile_dir))
-        context = pw.chromium.launch_persistent_context(
-            user_data_dir=str(profile_dir),
-            headless=False,
-            args=[
-                "--disable-blink-features=AutomationControlled",
-                "--disable-features=DownloadBubble,DownloadBubbleV2",
-                *_xvfb_args(),
-            ],
-            accept_downloads=True,
-            **_launch_kwargs_extra(),
+    chrome_bin = _find_chrome_binary()
+    if not chrome_bin:
+        emitter.emit("init_error", error="Chrome binary bulunamadı")
+        return 1
+
+    # Random TCP port — birden fazla init paralel çalışırsa çakışmasın
+    import random
+    port = random.randint(9300, 9899)
+
+    chrome_args = [
+        chrome_bin,
+        "--no-sandbox",
+        "--disable-dev-shm-usage",
+        "--no-first-run",
+        "--no-default-browser-check",
+        "--disable-blink-features=AutomationControlled",
+        f"--user-data-dir={profile_dir}",
+        f"--remote-debugging-port={port}",
+        f"{DEFAULT_HOMEPAGE}?authuser={authuser}",
+    ]
+    if os.environ.get("DISPLAY", "").startswith(":"):
+        # Xvfb context için ek arg'lar
+        chrome_args.insert(1, "--ozone-platform=x11")
+        chrome_args.insert(2, "--disable-gpu")
+
+    emitter.emit("init_starting", profile_dir=str(profile_dir), port=port)
+
+    # Chrome'u manuel başlat
+    try:
+        chrome_proc = subprocess.Popen(
+            chrome_args,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
         )
-        # Yeni veya mevcut sayfa
-        page = context.pages[0] if context.pages else context.new_page()
+    except Exception as e:
+        emitter.emit("init_error", error=f"Chrome spawn fail: {e}")
+        return 1
 
-        def _save_storage_state() -> None:
+    emitter.emit("init_chrome_pid", pid=chrome_proc.pid)
+
+    # Chrome'un port'ta listenlemesini bekle (max 30 sn)
+    import urllib.request
+    import urllib.error
+    cdp_url = f"http://127.0.0.1:{port}/json/version"
+    chrome_ready = False
+    for _ in range(30):
+        if chrome_proc.poll() is not None:
+            emitter.emit("init_error", error=f"Chrome erken çıktı (rc={chrome_proc.returncode})")
+            return 1
+        try:
+            urllib.request.urlopen(cdp_url, timeout=1)
+            chrome_ready = True
+            break
+        except (urllib.error.URLError, OSError):
+            time.sleep(1)
+
+    if not chrome_ready:
+        emitter.emit("init_error", error="Chrome 30 sn içinde port'ta listenleyemedi")
+        try:
+            chrome_proc.terminate()
+        except Exception:
+            pass
+        return 1
+
+    emitter.emit("init_chrome_ready", port=port)
+
+    # Playwright'ı CDP ile bağla
+    from playwright.sync_api import sync_playwright
+
+    try:
+        with sync_playwright() as pw:
+            browser = pw.chromium.connect_over_cdp(f"http://127.0.0.1:{port}", timeout=15000)
+            contexts = browser.contexts
+            if not contexts:
+                emitter.emit("init_error", error="Chrome context'i bulunamadı")
+                chrome_proc.terminate()
+                return 1
+            context = contexts[0]
+            page = context.pages[0] if context.pages else context.new_page()
+
+            def _save_storage_state() -> None:
+                try:
+                    state = context.storage_state()
+                    tmp = auth_json.with_suffix(".json.tmp")
+                    tmp.write_text(json.dumps(state), encoding="utf-8")
+                    tmp.replace(auth_json)
+                    emitter.emit("auth_saved", path=str(auth_json))
+                    saved_once["value"] = True
+                except Exception as e:
+                    emitter.emit("auth_save_error", error=str(e))
+
+            def _on_framenav(frame) -> None:
+                if saved_once["value"]:
+                    return
+                url = frame.url or ""
+                if "notebooklm.google.com" in url:
+                    _save_storage_state()
+
             try:
-                state = context.storage_state()
-                tmp = auth_json.with_suffix(".json.tmp")
-                tmp.write_text(json.dumps(state), encoding="utf-8")
-                tmp.replace(auth_json)
-                emitter.emit("auth_saved", path=str(auth_json))
-                saved_once["value"] = True
-            except Exception as e:
-                emitter.emit("auth_save_error", error=str(e))
+                page.on("framenavigated", _on_framenav)
+            except Exception:
+                pass
 
-        def _on_framenav(frame) -> None:
-            if saved_once["value"]:
-                return
-            url = frame.url or ""
-            # NotebookLM'e ulaştığında bir kez kaydet. Daha sonraki polling'ler
-            # Chromium'u öne getirebilir → focus stealing; kaçın.
-            if "notebooklm.google.com" in url:
+            emitter.emit(
+                "init_waiting_for_close",
+                hint="Tarayıcıda Google ile giriş yap, ardından pencereyi kapat.",
+            )
+
+            # Chrome process'in kapanmasını bekle
+            chrome_proc.wait()
+
+            # Final save denemesi
+            try:
                 _save_storage_state()
+            except Exception:
+                pass
 
-        page.on("framenavigated", _on_framenav)
-
-        url = f"{DEFAULT_HOMEPAGE}?authuser={authuser}"
+            try:
+                browser.close()
+            except Exception:
+                pass
+    except Exception as e:
+        emitter.emit("init_cdp_error", error=str(e))
         try:
-            page.goto(url, wait_until="domcontentloaded", timeout=45000)
-        except Exception as e:
-            emitter.emit("nav_error", error=str(e))
-
-        emitter.emit("init_waiting_for_close", hint="Tarayıcıda Google ile giriş yap, ardından pencereyi kapat.")
-        try:
-            page.wait_for_event("close", timeout=0)  # 0 = sonsuz
+            chrome_proc.terminate()
+            chrome_proc.wait(timeout=5)
         except Exception:
-            pass
-
-        # Pencere kapanmadan önce son bir state save denemesi
-        try:
-            _save_storage_state()
-        except Exception:
-            pass
-
-        try:
-            context.close()
-        except Exception:
-            pass
+            try:
+                chrome_proc.kill()
+            except Exception:
+                pass
+        return 1
 
     emitter.emit("init_complete", auth_saved=auth_json.exists())
     return 0

@@ -372,12 +372,12 @@ def run_init(profile_dir: Path, authuser: int, emitter: EventEmitter) -> int:
 
     emitter.emit("init_starting", profile_dir=str(profile_dir), port=port)
 
-    # Chrome'u shell wrapper ile başlat — direkt subprocess.Popen Xvfb'de
-    # Chrome'u SIGTRAP'leyen bir şey yapıyor (process group/session/TTY ile
-    # ilgili). Bash subshell üzerinden başlatınca Chrome düzgün ayağa kalkıyor.
+    # Chrome'u shell wrapper + & (background/disown) ile başlat. Direkt
+    # subprocess.Popen Xvfb'de Chrome'u SIGTRAP ile düşürüyor; bash subshell'in
+    # arka plan job'ı için yaptığı session/PG/TTY setup'ı Chrome'u memnun ediyor.
     chrome_log_path = profile_dir / "chrome_init.log"
     import shlex
-    chrome_cmd = " ".join(shlex.quote(a) for a in chrome_args)
+    chrome_cmd = " ".join(shlex.quote(a) for a in chrome_args) + " &"
     try:
         chrome_log = chrome_log_path.open("wb")
         chrome_proc = subprocess.Popen(
@@ -390,6 +390,7 @@ def run_init(profile_dir: Path, authuser: int, emitter: EventEmitter) -> int:
         emitter.emit("init_error", error=f"Chrome spawn fail: {e}")
         return 1
 
+    # & ile shell hemen çıkar; chrome arkada koşar. shell pid'i chrome'un değil.
     emitter.emit("init_chrome_pid", pid=chrome_proc.pid)
 
     # Chrome'un port'ta listenlemesini bekle (max 30 sn)
@@ -397,20 +398,9 @@ def run_init(profile_dir: Path, authuser: int, emitter: EventEmitter) -> int:
     import urllib.error
     cdp_url = f"http://127.0.0.1:{port}/json/version"
     chrome_ready = False
+    # Chrome `&` ile arka plana atıldı — Popen'ın gördüğü shell zaten çıktı.
+    # Yaşam takibini sadece /json/version polling ile yapıyoruz.
     for _ in range(30):
-        if chrome_proc.poll() is not None:
-            # Chrome'un kendi log'unu da emit et — neden çıktığını görelim
-            tail = ""
-            try:
-                tail = chrome_log_path.read_text(errors="replace")[-1500:]
-            except Exception:
-                pass
-            emitter.emit(
-                "init_error",
-                error=f"Chrome erken çıktı (rc={chrome_proc.returncode})",
-                chrome_log=tail,
-            )
-            return 1
         try:
             urllib.request.urlopen(cdp_url, timeout=1)
             chrome_ready = True
@@ -419,11 +409,12 @@ def run_init(profile_dir: Path, authuser: int, emitter: EventEmitter) -> int:
             time.sleep(1)
 
     if not chrome_ready:
-        emitter.emit("init_error", error="Chrome 30 sn içinde port'ta listenleyemedi")
+        tail = ""
         try:
-            chrome_proc.terminate()
+            tail = chrome_log_path.read_text(errors="replace")[-1500:]
         except Exception:
             pass
+        emitter.emit("init_error", error="Chrome 30 sn içinde port'ta listenleyemedi", chrome_log=tail)
         return 1
 
     emitter.emit("init_chrome_ready", port=port)
@@ -480,8 +471,15 @@ def run_init(profile_dir: Path, authuser: int, emitter: EventEmitter) -> int:
                 hint="Tarayıcıda Google ile giriş yap, ardından pencereyi kapat.",
             )
 
-            # Chrome process'in kapanmasını bekle
-            chrome_proc.wait()
+            # Chrome'un ölümünü port-polling ile izle (& nedeniyle shell pid
+            # chrome'un değil; chrome devTools port'unda dinlerken hayatta sayılır)
+            while True:
+                try:
+                    urllib.request.urlopen(cdp_url, timeout=2)
+                    time.sleep(2)
+                except (urllib.error.URLError, OSError):
+                    # Port cevap vermiyor → chrome öldü
+                    break
 
             # Final save denemesi
             try:

@@ -510,18 +510,35 @@ def delete_style_guide(filename: str) -> bool:
 # alanına yapışan metin. {{...}} placeholder'ları submit anında doldurulur.
 # ---------------------------------------------------------------------------
 DEFAULT_CUSTOM_PROMPT_TEMPLATE = """Role: You are a specialized Educational Video Producer.
-Task: Generate a cinematic video overview based on the provided Script and Learning Objectives.
+
+Task: Generate a cinematic video overview using the provided sources:
+- Source 1 is the SCRIPT — use its content as VERBATIM narration.
+- Sources 2+ are REFERENCE IMAGES — match each one to its corresponding narration moment as listed below.
 
 Core Constraints (STRICT ADHERENCE REQUIRED):
-1. Verbatim Narration: Use the provided script exactly. No improvisation, intros, or outros.
-2. Zero-Text Visuals: Absolutely no text, labels, or logos in the frame. Use visual metaphors or color-coding only.
-3. Historical & Identity Fidelity: Use the Historical Accuracy & Identity Protocol to ensure correct ethnicity, age, and real-world image integration.
-4. Visual Harmony & Safety: Apply the Student Safety Guide—high-key lighting, soft geometry, and lifted shadows. Avoid "AI slop" or fractal-like textures.
-5. Compositional Logic: Follow the Spatial Simplicity Rule. Isolate one central subject per scene with significant white space to maintain clarity.
-6. Style Ratio: The 80/20 photorealistic Model—Ensure no hybrid clutter; do not mix photos and illustrations in a single frame.
+1. Verbatim Narration: Use the script (Source 1) exactly. No improvisation, intros, or outros.
+2. Image-Narration Sync: For each reference image (Source 2+), display it in the video at the narration moment specified next to its name. Do not use an image at a moment it isn't mapped to.
+3. Zero-Text Visuals: Absolutely no text, labels, watermarks, or logos in the frame. Use visual metaphors or color-coding only.
+4. Visual Harmony: High-key lighting, soft geometry, lifted shadows. Avoid "AI slop" or fractal-like textures.
+5. Spatial Simplicity: One central subject per scene with significant white space.
+6. Style Coherence: ~80% photorealistic, ~20% illustration. Do not mix photo and illustration within a single frame.
 
-Required Sources for this Task:
+Provided Sources (with narration mapping):
 {{SOURCES_LIST}}"""
+
+
+def _format_source_image_line(idx: int, asset: dict, base_name: str) -> str:
+    """Bir image source için tek satır listing inşa et: filename + description + position."""
+    desc = (asset.get("description") or "").strip()
+    pos = (asset.get("position") or "").strip()
+    line = f"Source {idx}: {base_name}"
+    if desc and pos:
+        line += f" — visual: {desc}; show when narration says: \"{pos}\""
+    elif desc:
+        line += f" — visual: {desc}"
+    elif pos:
+        line += f" — show when narration says: \"{pos}\""
+    return line
 
 
 def _safe_filename_from_query(query: str, fallback: str = "image") -> str:
@@ -536,41 +553,40 @@ def _safe_filename_from_query(query: str, fallback: str = "image") -> str:
     return (cleaned[:48] or fallback)
 
 
-def build_source_listing(script_title: str, style_guides: list[dict],
-                          assets: list) -> tuple[str, list[str]]:
+def build_source_listing(script_title: str, assets: list) -> tuple[str, list[str]]:
     """Custom prompt'ta listelenecek source isimleri + numaralandırma.
+
+    Image'lar için description (TR) + position (script anı) eklenir → NotebookLM
+    her görseli script'in hangi anında göstereceğini bilir.
 
     Returns (formatted_listing_text, ordered_source_names).
     """
-    items: list[tuple[str, str]] = []  # (source_name_for_prompt, kind)
-    # 1) Script — NotebookLM'de filename "<title>_Script.txt" olarak yüklenecek
+    lines: list[str] = []
+    names: list[str] = []
+
+    # Source 1: Script
     script_name = f"{script_title}_Script" if script_title else "Script"
-    items.append((script_name, "text"))
-    # 2) Style guides (admin lib) — filename'leri kullan (uzantı atılır)
-    for g in style_guides:
-        base = Path(g["name"]).stem
-        items.append((base, "guide"))
-    # 3) Selected images (Phase B/C/D) — query'den isimlendirilmiş
+    lines.append(f"Source 1: {script_name} — verbatim narration content")
+    names.append(script_name)
+
+    # Source 2+: Selected images with description + position mapping
     for i, a in enumerate(assets):
         sel = a.get("selected_image") or {}
         if not sel.get("full_url") and not sel.get("thumb_url"):
             continue
         base = _safe_filename_from_query(a.get("query", ""), fallback=f"image_{i+1}")
-        items.append((f"{base}_{i+1:02d}", "image"))
+        full_name = f"{base}_{i+1:02d}"
+        idx = len(names) + 1  # Source numarası (script + önceki image'lar sonrası)
+        lines.append(_format_source_image_line(idx, a, full_name))
+        names.append(full_name)
 
-    # Format: "Source 1: ..., Source 2: ..."
-    lines = []
-    names = []
-    for idx, (n, _kind) in enumerate(items, start=1):
-        lines.append(f"Source {idx}: {n}")
-        names.append(n)
     return ("\n".join(lines), names)
 
 
 def render_custom_prompt(template: str, script_title: str,
-                          style_guides: list[dict], assets: list) -> str:
+                          assets: list) -> str:
     """Template'teki {{SOURCES_LIST}} placeholder'ını doldur."""
-    listing, _ = build_source_listing(script_title, style_guides, assets)
+    listing, _ = build_source_listing(script_title, assets)
     return template.replace("{{SOURCES_LIST}}", listing)
 
 
@@ -1471,18 +1487,7 @@ class Worker:
             except Exception as e:
                 launcher_log(f"Job {job.id}: image download hata, devam: {e}")
 
-        # 3) Style guides — admin'in upload ettiği reusable kaynaklar.
-        # Job'un style_guides_used snapshot'ından oku ki ileride admin değişiklik
-        # yapsa da bu job'ın kullandığı set sabit kalsın.
-        guide_paths: list[Path] = []
-        for gname in (job.style_guides_used or []):
-            gp = STYLE_GUIDES_DIR / Path(gname).name
-            if gp.exists() and gp.is_file():
-                guide_paths.append(gp)
-            else:
-                launcher_log(f"Job {job.id}: style guide bulunamadı: {gname}")
-
-        # 4) Custom prompt'u disk'e yaz (CLI escape sorunu yaşamamak için)
+        # 3) Custom prompt'u disk'e yaz (CLI escape sorunu yaşamamak için)
         prompt_path: Optional[Path] = None
         if (job.custom_prompt or "").strip():
             prompt_path = job_pack_dir / "_custom_prompt.txt"
@@ -1512,9 +1517,6 @@ class Worker:
 
         if script_path is not None:
             cmd += ["--script-file", str(script_path)]
-        if guide_paths:
-            cmd.append("--style-guides")
-            cmd.extend(str(p) for p in guide_paths)
         if image_paths:
             cmd.append("--images")
             cmd.extend(str(p) for p in image_paths)
@@ -1522,8 +1524,8 @@ class Worker:
             cmd += ["--custom-prompt-file", str(prompt_path)]
 
         launcher_log(
-            f"Job {job.id} packet: 1 script + {len(guide_paths)} guides + "
-            f"{len(image_paths)} images + custom_prompt={'yes' if prompt_path else 'no'}"
+            f"Job {job.id} packet: 1 script + {len(image_paths)} images + "
+            f"custom_prompt={'yes' if prompt_path else 'no'}"
         )
 
         log_path = job_log_path(job.id)
@@ -2801,12 +2803,13 @@ def render_user_view() -> None:
 
     # --- Phase E (custom prompt) callbacks ---
     def _cb_autofill_prompt() -> None:
-        """Mevcut script title + style guides + selected assets'ten template doldur."""
+        """Mevcut script title + selected assets'ten template doldur (image-script mapping)."""
         title = derive_title(st.session_state.get("script_draft", "")) or "Untitled"
-        guides = list_style_guides()
-        assets = st.session_state.get("script_assets", []) or []
+        assets_full = st.session_state.get("script_assets", []) or []
+        # Sadece selected_image olan asset'leri prompt'a koy
+        sel_assets = [a for a in assets_full if a.get("selected_image")]
         rendered = render_custom_prompt(
-            DEFAULT_CUSTOM_PROMPT_TEMPLATE, title, guides, assets
+            DEFAULT_CUSTOM_PROMPT_TEMPLATE, title, sel_assets
         )
         st.session_state["script_custom_prompt"] = rendered
         st.session_state["script_custom_prompt_user_edited"] = False
@@ -3276,30 +3279,15 @@ def render_user_view() -> None:
                                     args=(aid, _manual_key2),
                                 )
 
-    # ===== Style Guides kütüphanesi (paylaşılan) =====
-    # Mustafa, Serdar dahil herkes yükleyip silebilir. Her job'da otomatik attach.
-    _existing_guides = list_style_guides()
-    _sg_label = "📚 Style Guides kütüphanesi"
-    if _existing_guides:
-        _sg_label += f" — {len(_existing_guides)} dosya"
-    else:
-        _sg_label += " — boş"
-    with st.expander(_sg_label, expanded=False):
-        st.caption(
-            "Bu klasör ekibinizin paylaştığı kaynak kütüphanesi. Yüklediğin "
-            "her dosya, herkesin video job'larına otomatik kaynak olarak eklenir."
-        )
-        render_style_guides_ui(key_prefix="user_sg", heading=False)
-
     # ===== Phase E: Custom Prompt + paket önizleme =====
     # NotebookLM Cinematic'in "Customize Video Overview → Custom prompt"
-    # alanına yapışacak metin. Source listesi otomatik enumere edilir
-    # (script + admin'in style_guide'ları + selected_image olan asset'ler).
-    _guides_now = list_style_guides()
+    # alanına yapışacak metin. Source listesi her seçili görselin description+
+    # position bilgisiyle birlikte enumere edilir → NotebookLM hangi görseli
+    # script'in hangi anında göstereceğini bilir.
     _assets_now = st.session_state.get("script_assets", []) or []
     _selected_assets = [a for a in _assets_now if a.get("selected_image")]
     _title_now = derive_title(st.session_state.get("script_draft", "")) or "Untitled"
-    _src_listing, _src_names = build_source_listing(_title_now, _guides_now, _selected_assets)
+    _src_listing, _src_names = build_source_listing(_title_now, _selected_assets)
     _total_sources = len(_src_names)
 
     # Eğer custom prompt boşsa ve script var ve "user edited" değilse, otomatik doldur
@@ -3309,30 +3297,33 @@ def render_user_view() -> None:
         and not st.session_state.get("script_custom_prompt_user_edited", False)
     ):
         st.session_state["script_custom_prompt"] = render_custom_prompt(
-            DEFAULT_CUSTOM_PROMPT_TEMPLATE, _title_now, _guides_now, _selected_assets
+            DEFAULT_CUSTOM_PROMPT_TEMPLATE, _title_now, _selected_assets
         )
 
-    cp_label = f"📋 Custom Prompt + Paket önizleme · {_total_sources} source"
+    n_images = max(0, _total_sources - 1)
+    cp_label = (
+        f"📋 Custom Prompt + Paket · 1 script + {n_images} görsel"
+        if _total_sources > 0 else "📋 Custom Prompt"
+    )
     with st.expander(cp_label, expanded=False):
         st.caption(
             "Bu metin NotebookLM'de Cinematic Customize → Custom prompt alanına "
-            "otomatik yapıştırılır. Source listesi script + style guide'lar + "
-            "seçili görsellerden hesaplanır."
+            "yapıştırılır. Görsellerin script'in hangi anında gösterileceğini "
+            "buradaki 'Source N: ... show when narration says: \"...\"' "
+            "satırlarından NotebookLM çıkarır."
         )
 
         # Paket önizleme — neler upload edilecek
         st.markdown(
             f'<div style="font-size:0.85rem; padding:8px 12px; '
             f'background:rgba(99,102,241,0.06); border-radius:6px; margin-bottom:8px;">'
-            f'<b>📦 Bu submit\'te NotebookLM\'e yüklenecekler ({_total_sources} source):</b><br>'
+            f'<b>📦 NotebookLM\'e gidecek source\'lar ({_total_sources}):</b><br>'
             f'<span style="font-size:0.78rem;">'
             + "<br>".join(f"• <code>{n}</code>" for n in _src_names) +
             f'</span>'
             f'</div>',
             unsafe_allow_html=True,
         )
-        if not _guides_now:
-            st.caption("⚠ Henüz style guide yüklenmemiş — admin Style Guides tab'ından eklesin.")
 
         cs_p = st.columns([1.2, 4])
         with cs_p[0]:
@@ -3395,8 +3386,6 @@ def render_user_view() -> None:
         custom_prompt_submit = (
             st.session_state.get("script_custom_prompt", "") or ""
         ).strip()
-        # Style guide snapshot — submit anında attach edilenleri kayıt et
-        guides_at_submit = [g["name"] for g in list_style_guides()]
         # Audit: original_script = ilk iterasyondaki "script" (ilk yapıştırılan
         # versiyon). Hiç iterasyon yoksa = final script.
         if iterations_at_submit:
@@ -3415,7 +3404,7 @@ def render_user_view() -> None:
                 iterations=iterations_at_submit,
                 assets=assets_at_submit,
                 custom_prompt=custom_prompt_submit,
-                style_guides_used=guides_at_submit,
+                # style_guides_used kaldırıldı (Phase E.3 — yanlış yorumdu)
             ))
             save_jobs(jobs_all)
             # Disk'teki yarım draft'ı temizle (artık jobs.json'da audit'le birlikte var)
@@ -3812,9 +3801,8 @@ st.markdown(
 
 
 # ===== ANA PANEL — TAB'LAR =====
-tab_prep, tab_status, tab_videos, tab_guides, tab_log, tab_users = st.tabs(
-    ["📝  Hazırla", "📊  Durum", "🎬  Videolar", "📚  Style Guides",
-     "📜  Log", "👥  Kullanıcılar"]
+tab_prep, tab_status, tab_videos, tab_log, tab_users = st.tabs(
+    ["📝  Hazırla", "📊  Durum", "🎬  Videolar", "📜  Log", "👥  Kullanıcılar"]
 )
 
 
@@ -4118,35 +4106,10 @@ with tab_status:
                         f'style="font-size:0.84rem; text-decoration:none;">🔗 Notebook aç</a>',
                         unsafe_allow_html=True,
                     )
-                # Phase E: Custom Prompt + style guides snapshot
-                if j.custom_prompt or j.style_guides_used:
-                    n_guides = len(j.style_guides_used or [])
-                    cp_label = "📋 Paket detayı"
-                    if j.custom_prompt:
-                        cp_label += " · Custom Prompt"
-                    if n_guides:
-                        cp_label += f" · {n_guides} guide"
-                    with st.expander(cp_label, expanded=False):
-                        if j.style_guides_used:
-                            st.markdown(
-                                "<small style='opacity:0.7; font-weight:600;'>"
-                                "STYLE GUIDES (snapshot — submit anında)</small>",
-                                unsafe_allow_html=True,
-                            )
-                            st.markdown(
-                                "<div style='font-size:0.78rem;'>"
-                                + "<br>".join(f"• <code>{g}</code>" for g in j.style_guides_used)
-                                + "</div>",
-                                unsafe_allow_html=True,
-                            )
-                            st.markdown("---")
-                        if j.custom_prompt:
-                            st.markdown(
-                                "<small style='opacity:0.7; font-weight:600;'>"
-                                "CUSTOM PROMPT (NotebookLM Cinematic'e gönderilen)</small>",
-                                unsafe_allow_html=True,
-                            )
-                            st.text(j.custom_prompt[:8000])
+                # Phase E: Custom Prompt (NotebookLM Cinematic'e gönderilen)
+                if j.custom_prompt:
+                    with st.expander("📋 Custom Prompt (Cinematic'e gönderilen)", expanded=False):
+                        st.text(j.custom_prompt[:8000])
 
                 # Phase B/C: Asset listesi + seçili görseller
                 if j.assets:
@@ -4380,12 +4343,7 @@ with tab_videos:
                         st.caption("okuma hatası")
 
 
-# -------------------- TAB 4: STYLE GUIDES --------------------
-with tab_guides:
-    render_style_guides_ui(key_prefix="admin_sg")
-
-
-# -------------------- TAB 5: LOG --------------------
+# -------------------- TAB 4: LOG --------------------
 with tab_log:
     section_header("📜 Loglar", "subprocess çıktıları + launcher")
 

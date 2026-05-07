@@ -723,6 +723,140 @@ def extract_assets(script: str, model: Optional[str] = None) -> tuple[bool, list
 
 
 # ---------------------------------------------------------------------------
+# Phase C: Image search — Wikimedia Commons + Openverse (free, no API key)
+# ---------------------------------------------------------------------------
+import urllib.parse  # noqa: E402
+import urllib.request  # noqa: E402
+
+_HTTP_TIMEOUT = 12  # seconds — image search'te beklemek istemiyoruz
+
+
+def _http_get_json(url: str, headers: Optional[dict] = None) -> Optional[dict]:
+    """Tek seferlik GET → JSON, hata varsa None."""
+    try:
+        req = urllib.request.Request(
+            url,
+            headers={
+                "User-Agent": "NotebookLM-Cinematic-Studio/1.0 (https://llm.yga.tr)",
+                **(headers or {}),
+            },
+        )
+        with urllib.request.urlopen(req, timeout=_HTTP_TIMEOUT) as r:
+            data = r.read()
+            return json.loads(data) if data else None
+    except Exception:
+        return None
+
+
+def _search_wikimedia(query: str, limit: int = 4) -> list[dict]:
+    """Wikimedia Commons'ta görsel ara. CC-BY-SA / public domain genelde."""
+    if not query.strip():
+        return []
+    # generator=search → search results
+    # prop=imageinfo + iiurlwidth=400 → 400px thumbnail URL döner
+    # iiprop: url (full), size, extmetadata (license info için)
+    params = {
+        "action": "query",
+        "format": "json",
+        "generator": "search",
+        "gsrsearch": query,
+        "gsrnamespace": "6",  # File: namespace only
+        "gsrlimit": str(limit),
+        "prop": "imageinfo",
+        "iiprop": "url|size|mime|extmetadata",
+        "iiurlwidth": "400",
+    }
+    url = "https://commons.wikimedia.org/w/api.php?" + urllib.parse.urlencode(params)
+    data = _http_get_json(url)
+    if not data:
+        return []
+    pages = (data.get("query") or {}).get("pages") or {}
+    results = []
+    for _pid, page in pages.items():
+        info_list = page.get("imageinfo") or []
+        if not info_list:
+            continue
+        info = info_list[0]
+        # Sadece görüntü mime'ları (svg, png, jpg, gif, webp). Video/PDF skip.
+        mime = (info.get("mime") or "").lower()
+        if not mime.startswith("image/"):
+            continue
+        # extmetadata'dan lisans + attribution
+        meta = info.get("extmetadata") or {}
+        license_short = (meta.get("LicenseShortName") or {}).get("value", "")
+        artist = (meta.get("Artist") or {}).get("value", "") or ""
+        # Artist HTML olabilir, basit strip
+        if "<" in artist:
+            import re as _re
+            artist = _re.sub(r"<[^>]+>", "", artist).strip()
+        title = page.get("title", "").replace("File:", "")
+        results.append({
+            "source": "wikimedia",
+            "thumb_url": info.get("thumburl") or info.get("url"),
+            "full_url": info.get("url"),
+            "title": title[:120],
+            "license": license_short[:40] or "—",
+            "attribution": artist[:120] or "Wikimedia Commons",
+            "page_url": f"https://commons.wikimedia.org/wiki/{urllib.parse.quote(page.get('title',''))}",
+            "width": info.get("width", 0),
+            "height": info.get("height", 0),
+        })
+    return results
+
+
+def _search_openverse(query: str, limit: int = 4) -> list[dict]:
+    """Openverse aggregator (Flickr/CC kaynakları). API key gerekmez."""
+    if not query.strip():
+        return []
+    params = {
+        "q": query,
+        "page_size": str(limit),
+        "license_type": "commercial",  # CC0/CC-BY/CC-BY-SA — kullanılabilir
+    }
+    # Yeni domain api.openverse.org — eski .engineering hala çalışıyor ama yeni daha stabil
+    url = "https://api.openverse.org/v1/images/?" + urllib.parse.urlencode(params)
+    data = _http_get_json(url)
+    if not data:
+        return []
+    results = []
+    for item in (data.get("results") or [])[:limit]:
+        results.append({
+            "source": "openverse",
+            "thumb_url": item.get("thumbnail") or item.get("url"),
+            "full_url": item.get("url"),
+            "title": (item.get("title") or "")[:120],
+            "license": (item.get("license") or "").upper()[:40] or "—",
+            "attribution": (item.get("creator") or "")[:120] or item.get("source", ""),
+            "page_url": item.get("foreign_landing_url") or item.get("url"),
+            "width": item.get("width", 0),
+            "height": item.get("height", 0),
+        })
+    return results
+
+
+def search_images(query: str, limit: int = 8) -> list[dict]:
+    """Aynı query'yi Wikimedia + Openverse'te paralel ara, sonuçları interleave et.
+
+    Interleave: kaynak çeşitliliği için bir Wikimedia, bir Openverse...
+    """
+    if not query.strip():
+        return []
+    half = max(2, limit // 2)
+    wm = _search_wikimedia(query, limit=half + 2)
+    ov = _search_openverse(query, limit=half + 2)
+    # Interleave
+    out = []
+    i = 0
+    while (i < len(wm) or i < len(ov)) and len(out) < limit:
+        if i < len(wm):
+            out.append(wm[i])
+        if i < len(ov) and len(out) < limit:
+            out.append(ov[i])
+        i += 1
+    return out[:limit]
+
+
+# ---------------------------------------------------------------------------
 # Worker — background dispatcher thread
 # ---------------------------------------------------------------------------
 class Worker:
@@ -1995,6 +2129,48 @@ def render_user_view() -> None:
                 break
         _persist_draft()
 
+    # --- Phase C (image search) callbacks ---
+    def _cb_search_images(asset_id: str) -> None:
+        for a in st.session_state.get("script_assets", []):
+            if a.get("id") != asset_id:
+                continue
+            q = (a.get("query") or "").strip()
+            if not q:
+                st.session_state["_script_msg"] = (
+                    "err", "Search query boş — önce query alanını doldur."
+                )
+                return
+            results = search_images(q, limit=8)
+            a["candidates"] = results
+            a["search_done_at"] = time.time()
+            if not results:
+                st.session_state["_script_msg"] = (
+                    "err", f"'{q}' için görsel bulunamadı. Query'yi değiştir veya Phase D (üret) sırasında kullanılacak."
+                )
+            else:
+                st.session_state["_script_msg"] = (
+                    "ok", f"{len(results)} aday görsel geldi. Birini seç."
+                )
+            _persist_draft()
+            break
+
+    def _cb_select_image(asset_id: str, cand_index: int) -> None:
+        for a in st.session_state.get("script_assets", []):
+            if a.get("id") != asset_id:
+                continue
+            cands = a.get("candidates") or []
+            if 0 <= cand_index < len(cands):
+                a["selected_image"] = cands[cand_index]
+                _persist_draft()
+            break
+
+    def _cb_clear_selection(asset_id: str) -> None:
+        for a in st.session_state.get("script_assets", []):
+            if a.get("id") == asset_id:
+                a.pop("selected_image", None)
+                _persist_draft()
+                break
+
     # Önceki run'da bir mesaj set edildiyse göster (callback render'dan önce çalışır)
     _msg = st.session_state.pop("_script_msg", None)
 
@@ -2208,6 +2384,121 @@ def render_user_view() -> None:
                             args=(aid, "query", f"asset_query_{aid}"),
                             help="3-6 İngilizce keyword. Phase C'de Wikimedia/Openverse search'e gönderilecek.",
                         )
+
+                        # ===== Phase C: Image search per asset =====
+                        selected = asset.get("selected_image")
+                        candidates = asset.get("candidates") or []
+
+                        if selected:
+                            # Seçili görsel — sade görünüm + değiştirme imkanı
+                            st.markdown("---")
+                            sc = st.columns([1, 2.5, 1])
+                            with sc[0]:
+                                try:
+                                    st.image(selected.get("thumb_url"),
+                                             use_container_width=True)
+                                except Exception:
+                                    st.caption("(thumbnail yüklenemedi)")
+                            with sc[1]:
+                                src_emoji = {"wikimedia": "🌐", "openverse": "🎨"}.get(
+                                    selected.get("source", ""), "🖼"
+                                )
+                                st.markdown(
+                                    f'<div style="font-size:0.85rem;">'
+                                    f'<b>✅ Seçili</b> · {src_emoji} {selected.get("source","?")}<br>'
+                                    f'<span style="opacity:0.7; font-size:0.78rem;">'
+                                    f'📜 Lisans: <b>{selected.get("license","?")}</b><br>'
+                                    f'👤 {selected.get("attribution","")[:60]}</span>'
+                                    f'</div>',
+                                    unsafe_allow_html=True,
+                                )
+                                if selected.get("page_url"):
+                                    st.markdown(
+                                        f'<a href="{selected["page_url"]}" target="_blank" '
+                                        f'style="font-size:0.75rem; opacity:0.7;">↗ kaynak sayfa</a>',
+                                        unsafe_allow_html=True,
+                                    )
+                            with sc[2]:
+                                st.button(
+                                    "✕ Kaldır",
+                                    key=f"asset_unsel_{aid}",
+                                    use_container_width=True,
+                                    on_click=_cb_clear_selection,
+                                    args=(aid,),
+                                    help="Seçimi kaldır, başka görsel seç",
+                                )
+                        elif not candidates:
+                            # Henüz arama yapılmamış — buton göster
+                            st.markdown("&nbsp;", unsafe_allow_html=True)
+                            search_cs = st.columns([2, 3])
+                            with search_cs[0]:
+                                st.button(
+                                    "🔍 Görsel ara",
+                                    key=f"asset_search_{aid}",
+                                    on_click=_cb_search_images,
+                                    args=(aid,),
+                                    use_container_width=True,
+                                    help="Wikimedia + Openverse'te bu query ile ara",
+                                )
+                            with search_cs[1]:
+                                st.caption(
+                                    "Wikimedia Commons + Openverse'te (CC lisanslı) ara"
+                                )
+                        else:
+                            # Aday görseller var, henüz seçim yok
+                            st.markdown("---")
+                            n_cands = len(candidates)
+                            head_cs = st.columns([3, 2])
+                            with head_cs[0]:
+                                st.markdown(
+                                    f'<small><b>{n_cands} aday görsel</b> · '
+                                    f'birini seç ↓</small>',
+                                    unsafe_allow_html=True,
+                                )
+                            with head_cs[1]:
+                                st.button(
+                                    "🔄 Yenile",
+                                    key=f"asset_research_{aid}",
+                                    on_click=_cb_search_images,
+                                    args=(aid,),
+                                    use_container_width=True,
+                                    help="Aramayı yenile (query değiştiyse)",
+                                )
+
+                            # Thumbnail grid — 4 sütun
+                            cands_to_show = candidates[:8]
+                            n_cols = 4
+                            for row_start in range(0, len(cands_to_show), n_cols):
+                                row = cands_to_show[row_start:row_start + n_cols]
+                                grid_cs = st.columns(n_cols)
+                                for j, cand in enumerate(row):
+                                    cand_idx = row_start + j
+                                    with grid_cs[j]:
+                                        try:
+                                            st.image(
+                                                cand.get("thumb_url"),
+                                                use_container_width=True,
+                                            )
+                                        except Exception:
+                                            st.caption("⚠ yüklenemedi")
+                                        src_short = {
+                                            "wikimedia": "🌐 wm",
+                                            "openverse": "🎨 ov",
+                                        }.get(cand.get("source", ""), "?")
+                                        license_short = (cand.get("license") or "")[:14]
+                                        st.markdown(
+                                            f'<div style="font-size:0.7rem; opacity:0.7; '
+                                            f'text-align:center; line-height:1.2; margin-top:-4px;">'
+                                            f'{src_short} · {license_short}</div>',
+                                            unsafe_allow_html=True,
+                                        )
+                                        st.button(
+                                            "Seç",
+                                            key=f"asset_pick_{aid}_{cand_idx}",
+                                            on_click=_cb_select_image,
+                                            args=(aid, cand_idx),
+                                            use_container_width=True,
+                                        )
 
     # ===== Submit button =====
     st.markdown("&nbsp;", unsafe_allow_html=True)
@@ -2959,9 +3250,13 @@ with tab_status:
                         f'style="font-size:0.84rem; text-decoration:none;">🔗 Notebook aç</a>',
                         unsafe_allow_html=True,
                     )
-                # Phase B: Asset listesi (kullanıcının çıkardığı görsel önerileri)
+                # Phase B/C: Asset listesi + seçili görseller
                 if j.assets:
-                    with st.expander(f"🖼 Görseller · {len(j.assets)} öneri", expanded=False):
+                    n_selected = sum(1 for a in j.assets if a.get("selected_image"))
+                    label = f"🖼 Görseller · {len(j.assets)} öneri"
+                    if n_selected:
+                        label += f" · ✅ {n_selected} seçili"
+                    with st.expander(label, expanded=False):
                         for k, a in enumerate(j.assets):
                             style = a.get("style", "photo")
                             icon = {
@@ -2971,6 +3266,26 @@ with tab_status:
                             pos = a.get("position", "")[:80]
                             desc = a.get("description", "")
                             query = a.get("query", "")
+                            sel = a.get("selected_image")
+                            sel_html = ""
+                            if sel:
+                                src_emoji = {"wikimedia": "🌐", "openverse": "🎨"}.get(
+                                    sel.get("source", ""), "🖼"
+                                )
+                                thumb = sel.get("thumb_url", "")
+                                lic = sel.get("license", "?")
+                                sel_html = (
+                                    f'<div style="display:flex; gap:8px; align-items:center; '
+                                    f'margin-top:6px; padding:6px; background:rgba(16,185,129,0.08); '
+                                    f'border-left:3px solid #10B981; border-radius:4px;">'
+                                    f'<img src="{thumb}" style="width:64px; height:48px; '
+                                    f'object-fit:cover; border-radius:4px;" '
+                                    f'onerror="this.style.display=\'none\'"/>'
+                                    f'<div style="font-size:0.75rem;">'
+                                    f'<b>✅ Seçili</b> · {src_emoji} {sel.get("source","?")}<br>'
+                                    f'<span style="opacity:0.7;">📜 {lic}</span></div>'
+                                    f'</div>'
+                                )
                             st.markdown(
                                 f'<div style="margin-bottom:8px; padding:8px 10px; '
                                 f'background:rgba(99,102,241,0.05); border-radius:6px;">'
@@ -2981,6 +3296,7 @@ with tab_status:
                                 f'<div style="font-size:0.75rem; opacity:0.7; '
                                 f'margin-top:4px; font-family:monospace;">'
                                 f'🔍 <code>{query}</code></div>'
+                                f'{sel_html}'
                                 f'</div>',
                                 unsafe_allow_html=True,
                             )

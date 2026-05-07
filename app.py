@@ -97,9 +97,26 @@ VNC_ENABLED = bool(HEADLESS_INIT_DISPLAY)
 # extraction) UI'da gizlenir.
 OPENROUTER_API_KEY = os.environ.get("OPENROUTER_API_KEY", "").strip()
 OPENROUTER_MODEL = os.environ.get(
-    "OPENROUTER_MODEL", "google/gemini-2.0-flash-exp:free"
+    "OPENROUTER_MODEL", "qwen/qwen3-next-80b-a3b-instruct:free"
 ).strip()
 LLM_ENABLED = bool(OPENROUTER_API_KEY)
+
+# Kullanıcının UI'dan seçebileceği top free modeller (Mayıs 2026 itibarıyla
+# OpenRouter ücretsiz katmanından el ile seçildi). Hepsi instruct + multilingual.
+# Liste eskirse https://openrouter.ai/models?max_price=0 üzerinden güncelle.
+OPENROUTER_FREE_MODELS: list[tuple[str, str]] = [
+    # (id, label)
+    ("qwen/qwen3-next-80b-a3b-instruct:free",
+     "Qwen3 Next 80B — multilingual, dengeli (varsayılan)"),
+    ("google/gemma-4-31b-it:free",
+     "Gemma 4 31B — Google, hızlı"),
+    ("openai/gpt-oss-120b:free",
+     "GPT-OSS 120B — OpenAI açık-ağırlık, kaliteli"),
+    ("z-ai/glm-4.5-air:free",
+     "GLM 4.5 Air — yaratıcı yazım iyi"),
+    ("nvidia/nemotron-3-super-120b-a12b:free",
+     "Nemotron 3 Super 120B — NVIDIA, derin akıl yürütme"),
+]
 
 PYTHON_BIN = sys.executable  # venv'in içindeki python
 
@@ -503,7 +520,8 @@ SCRIPT_EDITOR_SYSTEM = """You are an expert video script editor for the "Weird F
 Output ONLY the revised script text. No preamble, no explanation, no markdown headers — just the script ready to be sent to NotebookLM. Match the language of the input script (Turkish input → Turkish output)."""
 
 
-def regenerate_script(current_script: str, feedback: str) -> tuple[bool, str]:
+def regenerate_script(current_script: str, feedback: str,
+                      model: Optional[str] = None) -> tuple[bool, str]:
     """Mevcut scripti feedback'e göre yeniden üretir. (success, new_script_or_error) döner."""
     if not feedback.strip():
         return False, "Feedback boş olamaz."
@@ -519,6 +537,7 @@ Generate the revised script."""
             {"role": "system", "content": SCRIPT_EDITOR_SYSTEM},
             {"role": "user", "content": user_prompt},
         ],
+        model=model,
         temperature=0.8,
         max_tokens=3000,
     )
@@ -1669,17 +1688,19 @@ def render_user_view() -> None:
     def _cb_regenerate() -> None:
         current = st.session_state.get("script_draft", "").strip()
         feedback = st.session_state.get("script_feedback", "").strip()
+        model = st.session_state.get("script_model") or OPENROUTER_MODEL
         if not current:
             st.session_state["_script_msg"] = ("err", "Önce bir senaryo yapıştır.")
             return
         if not feedback:
             st.session_state["_script_msg"] = ("err", "Feedback boş.")
             return
-        ok, result = regenerate_script(current, feedback)
+        ok, result = regenerate_script(current, feedback, model=model)
         if ok:
             st.session_state["script_iterations"].append({
                 "script": current,
                 "feedback": feedback,
+                "model": model,
                 "ts": time.time(),
             })
             st.session_state["script_draft"] = result.strip()
@@ -1737,9 +1758,29 @@ def render_user_view() -> None:
             expander_label += f" — {iter_count} iterasyon"
         with st.expander(expander_label, expanded=bool(iter_count)):
             st.caption(
-                f"Model: `{OPENROUTER_MODEL}`. Senaryon hakkında ne değişmeli "
-                f"yaz, AI yeniden üretsin. Beğenmezsen tekrar feedback ver."
+                "Senaryon hakkında ne değişmeli yaz, AI yeniden üretsin. "
+                "Beğenmezsen model değiştir, ya da tekrar feedback ver."
             )
+
+            # Model selector — env'deki default + UI'dan ek seçenekler
+            model_ids = [m[0] for m in OPENROUTER_FREE_MODELS]
+            model_labels = {m[0]: m[1] for m in OPENROUTER_FREE_MODELS}
+            # Env'deki model listede yoksa başa ekle (custom override)
+            if OPENROUTER_MODEL not in model_ids:
+                model_ids.insert(0, OPENROUTER_MODEL)
+                model_labels[OPENROUTER_MODEL] = f"{OPENROUTER_MODEL} — env'den"
+            # Default seçim: önceki seçim varsa onu, yoksa env değeri
+            if "script_model" not in st.session_state or st.session_state["script_model"] not in model_ids:
+                st.session_state["script_model"] = OPENROUTER_MODEL
+            st.selectbox(
+                "Model",
+                options=model_ids,
+                format_func=lambda mid: model_labels.get(mid, mid),
+                key="script_model",
+                help="OpenRouter'ın ücretsiz katmanından. Bir model çalışmazsa "
+                     "(rate limit, 404 vs.) başkasını dene.",
+            )
+
             st.text_area(
                 "Feedback / değişiklik notları",
                 key="script_feedback",
@@ -1773,10 +1814,13 @@ def render_user_view() -> None:
                 for i, it in enumerate(reversed(st.session_state["script_iterations"])):
                     actual_i = iter_count - 1 - i
                     short_fb = (it["feedback"][:60] + "…") if len(it["feedback"]) > 60 else it["feedback"]
+                    used_model = it.get("model", "?")
+                    # Model id'sinden kısa label türet (örn. qwen3-next-80b)
+                    model_short = used_model.split("/")[-1].replace(":free", "")
                     with st.container(border=True):
                         cs2 = st.columns([5, 1])
                         with cs2[0]:
-                            st.caption(f"v{actual_i + 1} — {short_fb}")
+                            st.caption(f"v{actual_i + 1} · `{model_short}` — {short_fb}")
                             with st.expander("Görüntüle", expanded=False):
                                 st.text(it["script"])
                         with cs2[1]:

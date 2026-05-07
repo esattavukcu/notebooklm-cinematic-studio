@@ -739,12 +739,21 @@ _HTTP_TIMEOUT = 12  # seconds — image search'te beklemek istemiyoruz
 
 
 def _http_get_json(url: str, headers: Optional[dict] = None) -> Optional[dict]:
-    """Tek seferlik GET → JSON, hata varsa None."""
+    """Tek seferlik GET → JSON, hata varsa None.
+
+    UA: Cloudflare bot-detection (error 1010) Python urllib UA'sını blokluyor
+    (Pexels gibi). Mozilla-tarzı UA gönderiyoruz.
+    """
     try:
         req = urllib.request.Request(
             url,
             headers={
-                "User-Agent": "NotebookLM-Cinematic-Studio/1.0 (https://llm.yga.tr)",
+                "User-Agent": (
+                    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+                    "AppleWebKit/537.36 (KHTML, like Gecko) "
+                    "Chrome/120.0.0.0 Safari/537.36"
+                ),
+                "Accept": "application/json, */*;q=0.5",
                 **(headers or {}),
             },
         )

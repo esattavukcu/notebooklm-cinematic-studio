@@ -219,6 +219,17 @@ def _launch_kwargs_extra() -> dict:
     return {"executable_path": _SYSTEM_BROWSER_EXEC} if _SYSTEM_BROWSER_EXEC else {}
 
 
+def _xvfb_args() -> list[str]:
+    """Eğer DISPLAY env var Xvfb'yi işaret ediyorsa Chromium'a açıkça x11 ozone
+    platformunu söyle. Yoksa Chrome SIGTRAP ile crash ediyor (auto-detect fail)."""
+    if os.environ.get("DISPLAY", "").startswith(":"):
+        return [
+            "--ozone-platform=x11",
+            "--disable-gpu",  # Xvfb'de GPU yok, swiftshader fallback yeter
+        ]
+    return []
+
+
 # ---------------------------------------------------------------------------
 # Yardımcı: bir selector listesinde ilk eşleşeni bul (timeout küçük). Hiçbiri
 # yoksa None dön (hata atma — caller karar versin).
@@ -294,6 +305,7 @@ def run_init(profile_dir: Path, authuser: int, emitter: EventEmitter) -> int:
             args=[
                 "--disable-blink-features=AutomationControlled",
                 "--disable-features=DownloadBubble,DownloadBubbleV2",
+                *_xvfb_args(),
             ],
             accept_downloads=True,
             **_launch_kwargs_extra(),
@@ -568,6 +580,7 @@ def run_automation(
         launch_args = [
             "--disable-blink-features=AutomationControlled",
             "--disable-features=DownloadBubble,DownloadBubbleV2",
+            *_xvfb_args(),
         ]
 
         # Mod 1: auth.json varsa, paralel-friendly non-persistent context
@@ -819,6 +832,7 @@ def run_harvest(
         launch_args = [
             "--disable-blink-features=AutomationControlled",
             "--disable-features=DownloadBubble,DownloadBubbleV2",
+            *_xvfb_args(),
         ]
 
         try:

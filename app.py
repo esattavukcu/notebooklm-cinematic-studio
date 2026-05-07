@@ -93,6 +93,14 @@ AZURE_ENABLED = bool(AZURE_CONN)
 HEADLESS_INIT_DISPLAY = os.environ.get("HEADLESS_INIT_DISPLAY", "").strip()
 VNC_ENABLED = bool(HEADLESS_INIT_DISPLAY)
 
+# OpenRouter (LLM API). Set edilmediyse AI özellikleri (script iteration, asset
+# extraction) UI'da gizlenir.
+OPENROUTER_API_KEY = os.environ.get("OPENROUTER_API_KEY", "").strip()
+OPENROUTER_MODEL = os.environ.get(
+    "OPENROUTER_MODEL", "google/gemini-2.0-flash-exp:free"
+).strip()
+LLM_ENABLED = bool(OPENROUTER_API_KEY)
+
 PYTHON_BIN = sys.executable  # venv'in içindeki python
 
 # ---------------------------------------------------------------------------
@@ -446,6 +454,74 @@ def upload_to_azure(local_path: Path, job_id: str) -> tuple[bool, str, str]:
         return True, base_url, ""
     except Exception as e:
         return False, "", str(e)[:300]
+
+
+# ---------------------------------------------------------------------------
+# OpenRouter LLM client — script iteration, asset extraction
+# ---------------------------------------------------------------------------
+def _openrouter_chat(messages: list[dict], model: Optional[str] = None,
+                     temperature: float = 0.7, max_tokens: int = 2000) -> tuple[bool, str]:
+    """Returns (success, content_or_error)."""
+    if not LLM_ENABLED:
+        return False, "OPENROUTER_API_KEY .env'de set edilmemiş."
+    try:
+        from openai import OpenAI
+    except ImportError:
+        return False, "openai package kurulu değil (pip install openai)."
+
+    try:
+        client = OpenAI(
+            base_url="https://openrouter.ai/api/v1",
+            api_key=OPENROUTER_API_KEY,
+            default_headers={
+                "HTTP-Referer": "https://llm.yga.tr",
+                "X-Title": "Cinematic Studio",
+            },
+        )
+        response = client.chat.completions.create(
+            model=model or OPENROUTER_MODEL,
+            messages=messages,
+            temperature=temperature,
+            max_tokens=max_tokens,
+        )
+        return True, response.choices[0].message.content or ""
+    except Exception as e:
+        return False, f"LLM hatası: {str(e)[:300]}"
+
+
+# Sistem prompt'u (her script regenerate'de prepend edilir).
+# İleride config dosyasından okunabilir.
+SCRIPT_EDITOR_SYSTEM = """You are an expert video script editor for the "Weird Fact" short-form format on YouTube/social media. Your job is to revise scripts based on user feedback while keeping these principles:
+
+- Hook in the first 3-5 seconds
+- Conversational, energetic narration
+- Concrete facts and numbers, no fluff
+- Clear visual cues (so animation/imagery is obvious)
+- Tight pacing — every sentence earns its place
+- End with a memorable kicker, not a generic CTA
+
+Output ONLY the revised script text. No preamble, no explanation, no markdown headers — just the script ready to be sent to NotebookLM. Match the language of the input script (Turkish input → Turkish output)."""
+
+
+def regenerate_script(current_script: str, feedback: str) -> tuple[bool, str]:
+    """Mevcut scripti feedback'e göre yeniden üretir. (success, new_script_or_error) döner."""
+    if not feedback.strip():
+        return False, "Feedback boş olamaz."
+    user_prompt = f"""CURRENT SCRIPT:
+{current_script.strip()}
+
+USER FEEDBACK (apply these changes):
+{feedback.strip()}
+
+Generate the revised script."""
+    return _openrouter_chat(
+        [
+            {"role": "system", "content": SCRIPT_EDITOR_SYSTEM},
+            {"role": "user", "content": user_prompt},
+        ],
+        temperature=0.8,
+        max_tokens=3000,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -1564,54 +1640,202 @@ def render_user_view() -> None:
             icon="🚫",
         )
 
-    # Submit form — büyük textarea + tek button
+    # ===== Script editor (form değil, session_state-driven) =====
+    # Streamlit kuralı: widget key'ine bağlı session_state, widget render
+    # edildikten SONRA aynı run içinde mutate edilemez (StreamlitAPIException
+    # fırlar). Çözüm: callback'leri (on_click) kullan — callback'ler bir sonraki
+    # run'da widget render etmeden ÖNCE çalışır.
+
+    # Submit sonrası ilk run'da widget'lardan ÖNCE alanları temizle.
+    if st.session_state.pop("_clear_after_submit", False):
+        st.session_state["script_draft"] = ""
+        st.session_state["script_feedback"] = ""
+        st.session_state["script_iterations"] = []
+
+    if "script_draft" not in st.session_state:
+        st.session_state["script_draft"] = ""
+    if "script_iterations" not in st.session_state:
+        st.session_state["script_iterations"] = []
+    if "script_feedback" not in st.session_state:
+        st.session_state["script_feedback"] = ""
+    # Callback'ler arası mesaj geçişi (toast/error). Render'da tüketilir.
+    if "_script_msg" not in st.session_state:
+        st.session_state["_script_msg"] = None  # ("ok"|"err", text)
+    # Submit niyeti — submit callback'i set eder, ana akış kuyruğa ekler.
+    if "_pending_submit" not in st.session_state:
+        st.session_state["_pending_submit"] = False
+
+    # --- Callbacks ---
+    def _cb_regenerate() -> None:
+        current = st.session_state.get("script_draft", "").strip()
+        feedback = st.session_state.get("script_feedback", "").strip()
+        if not current:
+            st.session_state["_script_msg"] = ("err", "Önce bir senaryo yapıştır.")
+            return
+        if not feedback:
+            st.session_state["_script_msg"] = ("err", "Feedback boş.")
+            return
+        ok, result = regenerate_script(current, feedback)
+        if ok:
+            st.session_state["script_iterations"].append({
+                "script": current,
+                "feedback": feedback,
+                "ts": time.time(),
+            })
+            st.session_state["script_draft"] = result.strip()
+            st.session_state["script_feedback"] = ""
+            st.session_state["_script_msg"] = ("ok", "Yeni versiyon hazır.")
+        else:
+            st.session_state["_script_msg"] = ("err", result)
+
+    def _cb_reset_history() -> None:
+        st.session_state["script_iterations"] = []
+
+    def _cb_revert(actual_i: int) -> None:
+        iters = st.session_state["script_iterations"]
+        if 0 <= actual_i < len(iters):
+            st.session_state["script_draft"] = iters[actual_i]["script"]
+            # Bu noktadan sonraki versiyonları sil
+            st.session_state["script_iterations"] = iters[:actual_i]
+            st.session_state["_script_msg"] = ("ok", f"v{actual_i + 1} geri yüklendi.")
+
+    def _cb_submit() -> None:
+        text = st.session_state.get("script_draft", "").strip()
+        if not text:
+            st.session_state["_script_msg"] = ("err", "Senaryo boş olamaz.")
+            return
+        st.session_state["_pending_submit"] = True
+
+    # Önceki run'da bir mesaj set edildiyse göster (callback render'dan önce çalışır)
+    _msg = st.session_state.pop("_script_msg", None)
+
     st.markdown("&nbsp;", unsafe_allow_html=True)
-    with st.form("user_submit", clear_on_submit=True):
+    st.markdown(
+        '<div style="font-size:0.95rem; font-weight:600; margin-bottom:0.3rem;">'
+        '📝 Video senaryonu yapıştır</div>'
+        '<div style="font-size:0.8rem; opacity:0.7; margin-bottom:0.5rem;">'
+        'Uzun yazabilirsin. NotebookLM senaryonu kaynak olarak alıp Cinematic '
+        'video üretecek.'
+        + (' AI ile düzenleyip yeniden üretmek için aşağıdaki <b>✨ AI ile düzenle</b> bölümünü kullan.' if LLM_ENABLED else '')
+        + '</div>',
+        unsafe_allow_html=True,
+    )
+
+    st.text_area(
+        "Senaryo",
+        height=360,
+        placeholder="Senaryon, system prompt'un veya uzun metin...",
+        label_visibility="collapsed",
+        key="script_draft",
+    )
+
+    # ===== AI Editor (LLM aktifse) =====
+    if LLM_ENABLED:
+        iter_count = len(st.session_state["script_iterations"])
+        expander_label = "✨ AI ile düzenle"
+        if iter_count:
+            expander_label += f" — {iter_count} iterasyon"
+        with st.expander(expander_label, expanded=bool(iter_count)):
+            st.caption(
+                f"Model: `{OPENROUTER_MODEL}`. Senaryon hakkında ne değişmeli "
+                f"yaz, AI yeniden üretsin. Beğenmezsen tekrar feedback ver."
+            )
+            st.text_area(
+                "Feedback / değişiklik notları",
+                key="script_feedback",
+                height=80,
+                placeholder=(
+                    "örn. 'biraz daha kısa tut, hook'u güçlendir, sonunda kicker ekle'"
+                ),
+            )
+            cs = st.columns([2, 1])
+            with cs[0]:
+                st.button(
+                    "🔄 AI ile yeniden üret",
+                    type="primary",
+                    use_container_width=True,
+                    on_click=_cb_regenerate,
+                    key="btn_regenerate",
+                )
+            with cs[1]:
+                if iter_count:
+                    st.button(
+                        "🔁 Sıfırla",
+                        use_container_width=True,
+                        help="İterasyon geçmişini temizle",
+                        on_click=_cb_reset_history,
+                        key="btn_reset_history",
+                    )
+
+            # İterasyon geçmişi — geri dönme imkanı
+            if iter_count:
+                st.markdown("**Geçmiş versiyonlar**")
+                for i, it in enumerate(reversed(st.session_state["script_iterations"])):
+                    actual_i = iter_count - 1 - i
+                    short_fb = (it["feedback"][:60] + "…") if len(it["feedback"]) > 60 else it["feedback"]
+                    with st.container(border=True):
+                        cs2 = st.columns([5, 1])
+                        with cs2[0]:
+                            st.caption(f"v{actual_i + 1} — {short_fb}")
+                            with st.expander("Görüntüle", expanded=False):
+                                st.text(it["script"])
+                        with cs2[1]:
+                            st.button(
+                                "↶ Geri dön",
+                                key=f"revert_{actual_i}",
+                                use_container_width=True,
+                                on_click=_cb_revert,
+                                args=(actual_i,),
+                            )
+
+    # ===== Submit button =====
+    st.markdown("&nbsp;", unsafe_allow_html=True)
+    cs = st.columns([3, 1])
+    with cs[0]:
         st.markdown(
-            '<div style="font-size:0.95rem; font-weight:600; margin-bottom:0.3rem;">'
-            '📝 Video senaryonu yapıştır</div>'
-            '<div style="font-size:0.8rem; opacity:0.7; margin-bottom:0.5rem;">'
-            'Uzun yazabilirsin. NotebookLM senaryonu kaynak olarak alıp Cinematic '
-            'video üretecek.</div>',
+            f'<div style="font-size:0.78rem; opacity:0.65;">'
+            f'Gönderen: <b>{_user_name()}</b></div>',
             unsafe_allow_html=True,
         )
-        text = st.text_area(
-            "Senaryo",
-            height=360,
-            placeholder="Senaryon, system prompt'un veya uzun metin...",
-            label_visibility="collapsed",
+    with cs[1]:
+        st.button(
+            "🚀 Video üret",
+            type="primary",
+            use_container_width=True,
+            key="submit_video",
+            on_click=_cb_submit,
         )
-        st.markdown("&nbsp;", unsafe_allow_html=True)
-        cs = st.columns([3, 1])
-        with cs[0]:
-            st.markdown(
-                f'<div style="font-size:0.78rem; opacity:0.65;">'
-                f'Gönderen: <b>{_user_name()}</b></div>',
-                unsafe_allow_html=True,
-            )
-        with cs[1]:
-            submitted = st.form_submit_button(
-                "🚀 Video üret",
-                type="primary",
-                use_container_width=True,
-                disabled=False,
-            )
-        if submitted:
-            if not text.strip():
-                st.error("Senaryo boş olamaz.")
-            else:
-                title = derive_title(text)
-                jobs_all = load_jobs()
-                jobs_all.append(Job(
-                    id=uuid.uuid4().hex[:12],
-                    title=title,
-                    text=text.strip(),
-                    submitted_by=_user_name(),
-                ))
-                save_jobs(jobs_all)
-                st.toast("Kuyruğa eklendi! Birkaç dakika içinde tetiklenecek.", icon="🚀")
-                time.sleep(0.5)
-                st.rerun()
+
+    # Mesajları göster (en son)
+    if _msg:
+        kind, text_msg = _msg
+        if kind == "ok":
+            st.toast(text_msg, icon="✨")
+        else:
+            st.error(text_msg)
+
+    # Submit niyeti varsa şimdi işle (widget'lardan sonra, callback dışında)
+    if st.session_state.get("_pending_submit"):
+        st.session_state["_pending_submit"] = False
+        text_submit = st.session_state.get("script_draft", "").strip()
+        if text_submit:
+            title = derive_title(text_submit)
+            jobs_all = load_jobs()
+            jobs_all.append(Job(
+                id=uuid.uuid4().hex[:12],
+                title=title,
+                text=text_submit,
+                submitted_by=_user_name(),
+            ))
+            save_jobs(jobs_all)
+            # Submit sonrası alanları temizle — widget değerleri callback dışında
+            # ama yeni run başlamadan önce session_state'i temizleyemeyiz çünkü
+            # widget'lar zaten render edildi. Bu yüzden bayrak kullan: bir
+            # sonraki run'ın başında temizle.
+            st.session_state["_clear_after_submit"] = True
+            st.toast("Kuyruğa eklendi! Birkaç dakika içinde tetiklenecek.", icon="🚀")
+            time.sleep(0.5)
+            st.rerun()
 
 
     # Senin son istekleri

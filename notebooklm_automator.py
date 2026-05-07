@@ -215,8 +215,16 @@ _SYSTEM_BROWSER_EXEC = os.environ.get("PLAYWRIGHT_CHROMIUM_EXECUTABLE_PATH", "")
 
 
 def _launch_kwargs_extra() -> dict:
-    """Eğer env var set edilmişse executable_path'i launch kwargs'lara ekle."""
-    return {"executable_path": _SYSTEM_BROWSER_EXEC} if _SYSTEM_BROWSER_EXEC else {}
+    """Chromium launch kwargs — env'e göre dinamik."""
+    kw: dict = {}
+    if _SYSTEM_BROWSER_EXEC:
+        kw["executable_path"] = _SYSTEM_BROWSER_EXEC
+    # Xvfb (DISPLAY=:N) context'te Playwright'ın default --remote-debugging-pipe
+    # Chrome'u SIGTRAP ile crash ettiriyor. Pipe'ı disable et, Playwright otomatik
+    # --remote-debugging-port=0 (random TCP) fallback'e düşer.
+    if os.environ.get("DISPLAY", "").startswith(":"):
+        kw["ignore_default_args"] = ["--remote-debugging-pipe"]
+    return kw
 
 
 def _xvfb_args() -> list[str]:

@@ -228,12 +228,21 @@ def _launch_kwargs_extra() -> dict:
 
 
 def _xvfb_args() -> list[str]:
-    """Eğer DISPLAY env var Xvfb'yi işaret ediyorsa Chromium'a açıkça x11 ozone
-    platformunu söyle. Yoksa Chrome SIGTRAP ile crash ediyor (auto-detect fail)."""
+    """Xvfb context'inde Chromium için ek argümanlar:
+    - ozone=x11: Xvfb display'ini açıkça hedefle
+    - disable-gpu: Xvfb'de GPU yok
+    - remote-debugging-port=0: Pipe yerine TCP port (Playwright pipe handshake
+      Xvfb context'inde kuramıyor → Chrome SIGTRAP ile kill ediliyor)
+    - no-first-run: ilk çalıştırma sihirbazı atla
+    - no-default-browser-check: default browser uyarısı atla
+    """
     if os.environ.get("DISPLAY", "").startswith(":"):
         return [
             "--ozone-platform=x11",
-            "--disable-gpu",  # Xvfb'de GPU yok, swiftshader fallback yeter
+            "--disable-gpu",
+            "--no-first-run",
+            "--no-default-browser-check",
+            "--remote-debugging-port=0",
         ]
     return []
 

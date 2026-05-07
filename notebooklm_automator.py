@@ -352,19 +352,21 @@ def run_init(profile_dir: Path, authuser: int, emitter: EventEmitter) -> int:
     import random
     port = random.randint(9300, 9899)
 
+    # Manuel test'te çalışan minimal flag set'i — Playwright'ın 40+ flag'i
+    # Xvfb'de SIGTRAP'a sebep oluyor. Burada about:blank'a açıp navigation'ı
+    # CDP üzerinden Playwright'a yaptırıyoruz.
     chrome_args = [
         chrome_bin,
         "--no-sandbox",
         "--disable-dev-shm-usage",
+        "--enable-unsafe-swiftshader",  # Xvfb'de software GL fallback
         "--no-first-run",
         "--no-default-browser-check",
-        "--disable-blink-features=AutomationControlled",
         f"--user-data-dir={profile_dir}",
         f"--remote-debugging-port={port}",
-        f"{DEFAULT_HOMEPAGE}?authuser={authuser}",
+        "about:blank",
     ]
     if os.environ.get("DISPLAY", "").startswith(":"):
-        # Xvfb context için ek arg'lar
         chrome_args.insert(1, "--ozone-platform=x11")
         chrome_args.insert(2, "--disable-gpu")
 
@@ -445,6 +447,16 @@ def run_init(profile_dir: Path, authuser: int, emitter: EventEmitter) -> int:
                 page.on("framenavigated", _on_framenav)
             except Exception:
                 pass
+
+            # Chrome about:blank'te açıldı; şimdi Google login'e yönlendir
+            try:
+                page.goto(
+                    f"{DEFAULT_HOMEPAGE}?authuser={authuser}",
+                    wait_until="domcontentloaded",
+                    timeout=30000,
+                )
+            except Exception as e:
+                emitter.emit("init_nav_warning", error=str(e)[:200])
 
             emitter.emit(
                 "init_waiting_for_close",

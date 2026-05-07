@@ -2389,6 +2389,111 @@ def render_login_view() -> None:
 
 
 # ---------------------------------------------------------------------------
+# Style Guides UI — admin tab + user view'da paylaşılan render fonksiyonu.
+# key_prefix farklı çağrı yerleri için widget key conflict'ini önler.
+# ---------------------------------------------------------------------------
+def render_style_guides_ui(key_prefix: str = "sg",
+                           heading: bool = True) -> None:
+    if heading:
+        section_header(
+            "📚 Style Guides",
+            "Reusable kaynaklar — her video job'unda otomatik notebook'a attach edilir"
+        )
+    st.markdown(
+        '<div style="font-size:0.85rem; opacity:0.78; margin-bottom:0.6rem;">'
+        '⚙ Buraya yüklediğin dosyalar (Identity Protocol, Visual Harmony Guide, '
+        '80/20 Model, Narrative Execution Guide gibi) <b>her job\'da</b> '
+        'NotebookLM\'e Add sources akışıyla yüklenir ve Custom Prompt\'tan '
+        'isimleriyle referanslanır.<br>'
+        'Kabul edilen tipler: PDF, TXT, MD, DOCX, image (JPG/PNG/...), audio (MP3/M4A). '
+        'Maksimum dosya: 30 MB.</div>',
+        unsafe_allow_html=True,
+    )
+
+    # Upload form
+    with st.expander("➕ Yeni dosya yükle", expanded=False):
+        up_files = st.file_uploader(
+            "Dosya seç (birden fazla seçebilirsin)",
+            accept_multiple_files=True,
+            key=f"{key_prefix}_uploader",
+            label_visibility="collapsed",
+            help="Sürükle-bırak veya tıklayıp seç. Aynı isimde dosya varsa üzerine yazar.",
+        )
+        if up_files:
+            cs_up = st.columns([1, 4])
+            with cs_up[0]:
+                if st.button("⬆ Yükle", type="primary",
+                              key=f"{key_prefix}_save_btn",
+                              use_container_width=True):
+                    ok_count, err_count = 0, 0
+                    errs = []
+                    for uf in up_files:
+                        ok, msg = save_style_guide(uf.name, uf.read())
+                        if ok:
+                            ok_count += 1
+                        else:
+                            err_count += 1
+                            errs.append(f"{uf.name}: {msg}")
+                    if ok_count:
+                        st.toast(f"{ok_count} dosya kaydedildi.", icon="✅")
+                    if err_count:
+                        st.error("Hatalar:\n" + "\n".join(errs))
+                    st.rerun()
+            with cs_up[1]:
+                st.caption(f"Seçilen: {len(up_files)} dosya — toplam "
+                           f"{sum(uf.size for uf in up_files) // 1024} KB")
+
+    # Mevcut dosyalar
+    guides = list_style_guides()
+    if not guides:
+        empty_state(
+            "📚",
+            "Henüz style guide yüklenmemiş",
+            "Üstteki yükle alanından dosyalarını ekle. Bunlar her job'da "
+            "NotebookLM kaynak listesine otomatik girer.",
+        )
+    else:
+        st.markdown(
+            f'<div style="font-size:0.82rem; opacity:0.7; margin:6px 0;">'
+            f'<b>{len(guides)} dosya</b> · her submit\'te tüm dosyalar '
+            f'NotebookLM\'e gider</div>',
+            unsafe_allow_html=True,
+        )
+        for g in guides:
+            with st.container(border=True):
+                cs_g = st.columns([4, 1.5, 1])
+                with cs_g[0]:
+                    icon = "📄"
+                    ext = Path(g["name"]).suffix.lower()
+                    if ext in (".jpg", ".jpeg", ".png", ".gif", ".webp"):
+                        icon = "🖼"
+                    elif ext in (".mp3", ".m4a", ".wav"):
+                        icon = "🎵"
+                    elif ext == ".pdf":
+                        icon = "📕"
+                    st.markdown(
+                        f'<div style="font-size:0.92rem; font-weight:600;">'
+                        f'{icon} {g["name"]}</div>'
+                        f'<div style="font-size:0.74rem; opacity:0.65; margin-top:2px;">'
+                        f'{g["size"] // 1024} KB · '
+                        f'<i>NotebookLM\'de source adı: <code>{Path(g["name"]).stem}</code></i>'
+                        f'</div>',
+                        unsafe_allow_html=True,
+                    )
+                with cs_g[1]:
+                    st.caption(fmt_time(g["uploaded_at"]))
+                with cs_g[2]:
+                    if st.button("🗑 Sil",
+                                  key=f"{key_prefix}_del_{g['name']}",
+                                  use_container_width=True):
+                        if delete_style_guide(g["name"]):
+                            st.toast(f"{g['name']} silindi.", icon="🗑")
+                            st.rerun()
+                        else:
+                            st.error("Silinemedi.")
+
+
+# ---------------------------------------------------------------------------
 # USER VIEW — Mustafa-tier sadeliği. Tek sayfa, tek textarea, tek button.
 # ---------------------------------------------------------------------------
 def render_user_view() -> None:
@@ -3170,6 +3275,21 @@ def render_user_view() -> None:
                                     on_click=_cb_use_manual_url,
                                     args=(aid, _manual_key2),
                                 )
+
+    # ===== Style Guides kütüphanesi (paylaşılan) =====
+    # Mustafa, Serdar dahil herkes yükleyip silebilir. Her job'da otomatik attach.
+    _existing_guides = list_style_guides()
+    _sg_label = "📚 Style Guides kütüphanesi"
+    if _existing_guides:
+        _sg_label += f" — {len(_existing_guides)} dosya"
+    else:
+        _sg_label += " — boş"
+    with st.expander(_sg_label, expanded=False):
+        st.caption(
+            "Bu klasör ekibinizin paylaştığı kaynak kütüphanesi. Yüklediğin "
+            "her dosya, herkesin video job'larına otomatik kaynak olarak eklenir."
+        )
+        render_style_guides_ui(key_prefix="user_sg", heading=False)
 
     # ===== Phase E: Custom Prompt + paket önizleme =====
     # NotebookLM Cinematic'in "Customize Video Overview → Custom prompt"
@@ -4262,96 +4382,7 @@ with tab_videos:
 
 # -------------------- TAB 4: STYLE GUIDES --------------------
 with tab_guides:
-    section_header(
-        "📚 Style Guides",
-        "Reusable kaynaklar — her video job'unda otomatik notebook'a attach edilir"
-    )
-    st.markdown(
-        '<div style="font-size:0.85rem; opacity:0.78; margin-bottom:0.6rem;">'
-        '⚙ Buraya yüklediğin dosyalar (Identity Protocol, Visual Harmony Guide, '
-        '80/20 Model, Narrative Execution Guide gibi) <b>her job\'da</b> '
-        'NotebookLM\'e Add sources akışıyla yüklenir ve Custom Prompt\'tan '
-        'isimleriyle referanslanır.<br>'
-        'Kabul edilen tipler: PDF, TXT, MD, DOCX, image (JPG/PNG/...), audio (MP3/M4A). '
-        'Maksimum dosya: 30 MB.</div>',
-        unsafe_allow_html=True,
-    )
-
-    # Upload form
-    with st.expander("➕ Yeni dosya yükle", expanded=True):
-        up_files = st.file_uploader(
-            "Dosya seç (birden fazla seçebilirsin)",
-            accept_multiple_files=True,
-            key="sg_uploader",
-            label_visibility="collapsed",
-            help="Sürükle-bırak veya tıklayıp seç. Aynı isimde dosya varsa üzerine yazar.",
-        )
-        if up_files:
-            cs_up = st.columns([1, 4])
-            with cs_up[0]:
-                if st.button("⬆ Yükle", type="primary", key="sg_save_btn", use_container_width=True):
-                    ok_count, err_count = 0, 0
-                    errs = []
-                    for uf in up_files:
-                        ok, msg = save_style_guide(uf.name, uf.read())
-                        if ok:
-                            ok_count += 1
-                        else:
-                            err_count += 1
-                            errs.append(f"{uf.name}: {msg}")
-                    if ok_count:
-                        st.toast(f"{ok_count} dosya kaydedildi.", icon="✅")
-                    if err_count:
-                        st.error("Hatalar:\n" + "\n".join(errs))
-                    st.rerun()
-            with cs_up[1]:
-                st.caption(f"Seçilen: {len(up_files)} dosya — toplam "
-                           f"{sum(uf.size for uf in up_files) // 1024} KB")
-
-    st.markdown("&nbsp;", unsafe_allow_html=True)
-
-    # Mevcut dosyalar
-    guides = list_style_guides()
-    section_header(f"📋 Mevcut style guide'lar", f"{len(guides)} dosya")
-
-    if not guides:
-        empty_state(
-            "📚",
-            "Henüz style guide yüklenmemiş",
-            "Üstteki yükle alanından dosyalarını ekle. Bunlar her job'da "
-            "NotebookLM kaynak listesine otomatik girer.",
-        )
-    else:
-        for g in guides:
-            with st.container(border=True):
-                cs_g = st.columns([4, 1.5, 1])
-                with cs_g[0]:
-                    icon = "📄"
-                    ext = Path(g["name"]).suffix.lower()
-                    if ext in (".jpg", ".jpeg", ".png", ".gif", ".webp"):
-                        icon = "🖼"
-                    elif ext in (".mp3", ".m4a", ".wav"):
-                        icon = "🎵"
-                    elif ext == ".pdf":
-                        icon = "📕"
-                    st.markdown(
-                        f'<div style="font-size:0.92rem; font-weight:600;">'
-                        f'{icon} {g["name"]}</div>'
-                        f'<div style="font-size:0.74rem; opacity:0.65; margin-top:2px;">'
-                        f'{g["size"] // 1024} KB · '
-                        f'<i>NotebookLM\'de source adı: <code>{Path(g["name"]).stem}</code></i>'
-                        f'</div>',
-                        unsafe_allow_html=True,
-                    )
-                with cs_g[1]:
-                    st.caption(fmt_time(g["uploaded_at"]))
-                with cs_g[2]:
-                    if st.button("🗑 Sil", key=f"sg_del_{g['name']}", use_container_width=True):
-                        if delete_style_guide(g["name"]):
-                            st.toast(f"{g['name']} silindi.", icon="🗑")
-                            st.rerun()
-                        else:
-                            st.error("Silinemedi.")
+    render_style_guides_ui(key_prefix="admin_sg")
 
 
 # -------------------- TAB 5: LOG --------------------

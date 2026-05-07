@@ -375,16 +375,12 @@ def run_init(profile_dir: Path, authuser: int, emitter: EventEmitter) -> int:
     # Chrome'u shell wrapper + & ile başlat. Önemli detaylar:
     # - shell=True olmadan Chrome SIGTRAP atıyor (PG/TTY setup farkı)
     # - & olmadan shell foreground'da chrome'u bekleyince yine SIGTRAP
-    # - stdout=file redirect olunca Chrome startup'ta takılıyor (TTY check?)
-    # Bu yüzden chrome'un stdout'unu shell üzerinden bir log dosyasına
-    # > ile yönlendiriyoruz — bu Popen'dan farklı, Chrome bash redirect'i
-    # bir TTY-benzeri olarak tolere ediyor.
-    chrome_log_path = profile_dir / "chrome_init.log"
+    # - ANY stdout redirect (Popen file veya bash >) Chrome startup'ı kilitliyor
+    # En sade yol: hiçbir redirect yok, parent'ın stdout/stderr'i inherit.
+    # Standalone'da TTY'ye, systemd context'te journald'a gider.
+    chrome_log_path = profile_dir / "chrome_init.log"  # placeholder, kullanılmıyor
     import shlex
-    chrome_cmd = (
-        " ".join(shlex.quote(a) for a in chrome_args)
-        + f" > {shlex.quote(str(chrome_log_path))} 2>&1 &"
-    )
+    chrome_cmd = " ".join(shlex.quote(a) for a in chrome_args) + " &"
     try:
         chrome_proc = subprocess.Popen(
             chrome_cmd,
@@ -413,12 +409,7 @@ def run_init(profile_dir: Path, authuser: int, emitter: EventEmitter) -> int:
             time.sleep(1)
 
     if not chrome_ready:
-        tail = ""
-        try:
-            tail = chrome_log_path.read_text(errors="replace")[-1500:]
-        except Exception:
-            pass
-        emitter.emit("init_error", error="Chrome 30 sn içinde port'ta listenleyemedi", chrome_log=tail)
+        emitter.emit("init_error", error="Chrome 30 sn içinde port'ta listenleyemedi")
         return 1
 
     emitter.emit("init_chrome_ready", port=port)

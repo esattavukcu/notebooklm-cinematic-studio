@@ -1379,9 +1379,47 @@ def open_in_browser(url: str) -> None:
 
 
 # ---------------------------------------------------------------------------
-# Auth: session_state.auth ile login/logout, rol-tabanlı routing
+# Auth: session_state.auth ile login/logout, rol-tabanlı routing.
+# Refresh sonrası session korunsun diye URL'de short-lived token tutuyoruz;
+# token → auth mapping'i process memory'sinde (servis restart'ta sıfırlanır).
 # ---------------------------------------------------------------------------
+import secrets  # noqa: E402
+
+# Module-level session token store. Servis restart'ta sıfırlanır (kullanıcılar
+# tekrar login olur). Process içinde paylaşımlı — Worker thread ile aynı.
+_AUTH_TOKENS: dict[str, dict] = {}
+
+
+def _issue_session_token(auth: dict) -> str:
+    token = secrets.token_urlsafe(24)
+    _AUTH_TOKENS[token] = auth
+    return token
+
+
+def _lookup_session_token(token: str) -> Optional[dict]:
+    return _AUTH_TOKENS.get(token) if token else None
+
+
+def _revoke_session_token(token: str) -> None:
+    _AUTH_TOKENS.pop(token, None)
+
+
+def _restore_session_from_url() -> None:
+    """Page load: URL'de ?t=TOKEN varsa session_state'e auth restore et.
+    session_state.auth yoksa ama token geçerliyse re-hydrate."""
+    if st.session_state.get("auth"):
+        return
+    token = st.query_params.get("t", "")
+    if not token:
+        return
+    auth = _lookup_session_token(token)
+    if auth:
+        st.session_state["auth"] = auth
+        st.session_state["session_token"] = token
+
+
 def is_logged_in() -> bool:
+    _restore_session_from_url()
     auth = st.session_state.get("auth")
     return bool(auth and auth.get("username"))
 
@@ -1402,9 +1440,14 @@ def _user_name() -> str:
 
 
 def do_logout() -> None:
+    # Token'ı sunucu memory'sinden de iptal et
+    token = st.session_state.get("session_token", "")
+    if token:
+        _revoke_session_token(token)
     st.session_state.pop("auth", None)
-    # URL query param'ları da temizle
-    for k in ("u", "admin", "reset_name"):
+    st.session_state.pop("session_token", None)
+    # URL query param'ları da temizle (eski legacy + yeni session token)
+    for k in ("u", "admin", "reset_name", "t"):
         try:
             del st.query_params[k]
         except KeyError:
@@ -1434,17 +1477,22 @@ def render_login_view() -> None:
                     if user is None:
                         st.error("Kullanıcı adı veya şifre hatalı.")
                     else:
-                        st.session_state["auth"] = {
+                        auth = {
                             "username": user.username,
                             "role": user.role,
                             "display_name": user.display_name or user.username,
                         }
-                        # URL temiz başlasın
+                        st.session_state["auth"] = auth
+                        # Session token oluştur, URL'e ?t=... ekle ki refresh'te korunsun
+                        token = _issue_session_token(auth)
+                        st.session_state["session_token"] = token
+                        # Eski legacy query params'ı temizle
                         for k in ("u", "admin", "reset_name"):
                             try:
                                 del st.query_params[k]
                             except KeyError:
                                 pass
+                        st.query_params["t"] = token
                         st.rerun()
 
             st.caption("Hesabın yoksa yöneticiden iste.")
@@ -1565,7 +1613,17 @@ def render_user_view() -> None:
     # Senin son istekleri
     st.markdown("&nbsp;", unsafe_allow_html=True)
     user = _user_name()
-    my_jobs = [j for j in jobs if j.submitted_by == user]
+    # Hem display_name hem username ile case-insensitive eşleşme — eski URL-based
+    # ?u=Mustafa job'ları ve yeni auth-based job'ları aynı user'a denk gelsin.
+    auth = current_user() or {}
+    user_lower = user.lower()
+    username_lower = auth.get("username", "").lower()
+
+    def _belongs_to_me(j: Job) -> bool:
+        sb = (j.submitted_by or "").strip().lower()
+        return sb == user_lower or sb == username_lower
+
+    my_jobs = [j for j in jobs if _belongs_to_me(j)]
     my_jobs_sorted = sorted(my_jobs, key=lambda j: j.created_at, reverse=True)[:30]
 
     section_header(f"📋 Senin son isteklerin", f"{len(my_jobs)} kayıt")
@@ -2201,7 +2259,7 @@ with tab_status:
         h = st.columns([1.1, 3.2, 1.6, 1, 1, 2.6, 1.2])
         h[0].markdown("<small style='opacity:0.7; font-weight:600;'>DURUM</small>", unsafe_allow_html=True)
         h[1].markdown("<small style='opacity:0.7; font-weight:600;'>BAŞLIK</small>", unsafe_allow_html=True)
-        h[2].markdown("<small style='opacity:0.7; font-weight:600;'>PROFİL</small>", unsafe_allow_html=True)
+        h[2].markdown("<small style='opacity:0.7; font-weight:600;'>PROFİL / GÖNDEREN</small>", unsafe_allow_html=True)
         h[3].markdown("<small style='opacity:0.7; font-weight:600;'>BAŞLANGIÇ</small>", unsafe_allow_html=True)
         h[4].markdown("<small style='opacity:0.7; font-weight:600;'>SÜRE</small>", unsafe_allow_html=True)
         h[5].markdown("<small style='opacity:0.7; font-weight:600;'>NOTEBOOK / HATA</small>", unsafe_allow_html=True)
@@ -2219,8 +2277,14 @@ with tab_status:
             profile_short = (j.profile_name or "—")
             if len(profile_short) > 22:
                 profile_short = profile_short[:21] + "…"
+            submitter = j.submitted_by or ""
+            submitter_html = (
+                f'<div style="font-size:0.74rem; opacity:0.65; margin-top:2px;">'
+                f'gönderen: <b>{submitter}</b></div>'
+            ) if submitter else ""
             cs[2].markdown(
-                f'<div style="font-size:0.85rem; opacity:0.85;" title="{j.profile_name}">{profile_short}</div>',
+                f'<div style="font-size:0.85rem; opacity:0.85;" title="{j.profile_name}">{profile_short}</div>'
+                f'{submitter_html}',
                 unsafe_allow_html=True,
             )
             cs[3].markdown(f"<span style='font-size:0.85rem;'>{fmt_time(j.started_at)}</span>", unsafe_allow_html=True)

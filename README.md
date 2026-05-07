@@ -36,48 +36,57 @@ chmod +x setup.sh app.sh run.sh && ./setup.sh && ./app.sh
 
 > macOS Gatekeeper, AppTranslocation, vs. sorunu yok — bu pure Python + Streamlit, .app bundle değil.
 
-## İki mod: Kullanıcı vs Yönetim
+## Auth: kullanıcı adı + şifre + rol
 
-Araç iki ayrı arayüz sunar:
+Tek bir login ekranı, kullanıcı + rol bazlı routing:
 
-### 👤 Kullanıcı görünümü (varsayılan, Mustafa-tier)
-- URL: `http://your-domain/` (parametresiz)
-- **Tek sayfa, tek textarea, tek button.** Senaryonu yapıştır → "Video üret" → bekle → notebook'u aç.
-- İlk girişte ismini ister (Mustafa, Ahmet, vb.), sonraki ziyaretlerde sadece kendi gönderilerini görür.
-- Hesap yönetimi, log, profil ayarları **görünmez**.
+- **Login**: `https://your-domain/` → kullanıcı adı + şifre formu
+- **Admin** rolü → admin paneli (sidebar + 5 tab)
+- **User** rolü → tek-sayfa senaryo gönder ekranı (Mustafa-tier)
 
-### ⚙️ Yönetim (admin) görünümü
-- URL: `http://your-domain/?admin=<şifre>` (env var: `ADMIN_PASSWORD`)
-- Lokal kullanım için: `?admin=1` (env var boşsa)
-- Hesap (Google profil) ekleme, login başlatma, tüm job'lar, loglar, kuyruk yönetimi.
+### Default admin
 
-### Admin şifresi tanımla (sunucu dağıtımı için)
+İlk açılışta `data/users.json` yoksa otomatik olarak default admin oluşur:
+- **Kullanıcı adı**: `admin`
+- **Şifre**: `.env`'deki `ADMIN_PASSWORD` (veya yoksa `changeme` — uyarı log'a yazılır)
 
-```bash
-export ADMIN_PASSWORD="senin-secret-string"
-./app.sh
+`.env`:
+```
+ADMIN_PASSWORD=$(openssl rand -hex 32)
 ```
 
-`ADMIN_PASSWORD` set değilse `?admin=1` ile herkes admin olur (lokal geliştirme). Sunucuda mutlaka bir şifre belirle.
+### Admin'in yapacağı
+
+1. `admin` ile login
+2. **👥 Kullanıcılar** sekmesi → **➕ Yeni kullanıcı**
+3. Mustafa için: username + display_name + şifre + rol=user
+4. Şifreyi Mustafa'ya gönder
+5. Mustafa `https://your-domain/` → kendi şifresiyle login → user view
+
+### URL'ler eskiden ne olduydu?
+
+Eski sürümde `?admin=<password>` ve `?u=<name>` query param'ları vardı. Artık deprecated — login ile değiştirildi. Eski URL'ler login ekranına yönlenir.
 
 ## İlk kullanım (yöneticinin yapacakları)
 
-1. Tarayıcıda `http://localhost:8501/?admin=1` aç (veya sunucuda `?admin=<şifre>`)
-2. Sol panelde **+ Yeni hesap ekle**:
-   - Hesap adı: ayırt etmen için (örn. `baran-yga`, `editor-1`, vb.)
-   - Diğer ayarlar opsiyonel — varsayılanlar iyi (3 video/gün, 1 paralel slot)
-3. **🔓 Hesabı aktive et** → açılan Chromium'da Google'a giriş yap → pencereyi kapat
-4. ✨ **Otomatik aktive olur** — auth.json yazılır yazılmaz hesap "🟢 hazır" olur. Manuel buton yok.
-5. Kullanıcılara `http://your-domain/` URL'ini ver — onlar `?admin=` görmüyor, sadece submit ekranını.
+1. Tarayıcıda `https://your-domain/` aç → admin / ADMIN_PASSWORD ile login
+2. **👥 Kullanıcılar** sekmesi → ekibinden herkes için kullanıcı oluştur
+3. Sidebar'da **+ Yeni hesap ekle** (Google hesabı için):
+   - Hesap adı: ayırt etmen için (örn. `baran-yga`)
+4. **🔓 Hesabı aktive et** → Chromium açılır:
+   - **Lokal** kullanım: native pencerede açılır
+   - **Sunucu** kullanım: VNC ekranında (xvfb + noVNC kuruluysa)
+5. ✨ **Otomatik aktive** — auth.json yazılır yazılmaz profil 🟢 olur
 
 ## Kullanıcı için kullanım (Mustafa)
 
-1. Yönetici verdiği URL'e git: `http://your-domain/`
-2. İlk girişte adını yaz → "Devam"
-3. Senaryonu (uzun metin) yapıştır → **🚀 Video üret**
-4. Aşağıdaki listede durumu izle:
+1. URL'e git: `https://your-domain/`
+2. Login: kendi kullanıcı adı + şifre
+3. Senaryonu yapıştır → **🚀 Video üret**
+4. Job listesinde:
    - ⏳ KUYRUKTA → ▶ ÇALIŞIYOR → ✓ TAMAMLANDI
-5. ✓ Tamamlandı olunca **🌐 Notebook'u aç** → NotebookLM'de Studio panelden 25-60 dk içinde video hazır olur.
+   - 🔍 Video kontrol ediliyor → 🎬 Video hazır
+5. **☁️ Video aç** butonu (Azure aktifse) veya **🌐 Notebook** ile aç
 
 ## 🤖 Harvest modülü (auto-collect video links)
 

@@ -59,6 +59,7 @@ PROFILES_DIR = APP_DIR / "chrome_profiles"
 JOBS_FILE = DATA_DIR / "jobs.json"
 PROFILES_FILE = DATA_DIR / "profiles.json"
 DRAFTS_FILE = DATA_DIR / "drafts.json"
+USERS_FILE = DATA_DIR / "users.json"
 LAUNCHER_LOG = LOGS_DIR / "launcher.log"
 
 # Bugünkü kullanım sayımına dahil olan job durumları. Failed da sayılır —
@@ -181,6 +182,106 @@ class Job:
     harvest_attempts: int = 0
     next_harvest_at: float = 0.0
     harvest_error: str = ""
+
+
+@dataclass
+class User:
+    """İç kullanıcı kaydı. Şifreler PBKDF2-HMAC-SHA256 ile hashlenir."""
+    username: str
+    password_hash: str               # "pbkdf2_sha256$<iterations>$<salt_b64>$<hash_b64>"
+    role: str = "user"               # "admin" | "user"
+    display_name: str = ""
+    created_at: float = field(default_factory=time.time)
+
+
+# ---------------------------------------------------------------------------
+# Şifre hash + verify (stdlib pbkdf2_hmac, ek dep gerek yok)
+# ---------------------------------------------------------------------------
+import hashlib  # noqa: E402
+import hmac     # noqa: E402
+import base64   # noqa: E402
+
+PBKDF2_ITERATIONS = 200_000
+
+
+def hash_password(password: str) -> str:
+    """PBKDF2-HMAC-SHA256, 16 byte random salt, 32 byte derived key."""
+    salt = os.urandom(16)
+    h = hashlib.pbkdf2_hmac("sha256", password.encode("utf-8"), salt, PBKDF2_ITERATIONS)
+    return (
+        f"pbkdf2_sha256${PBKDF2_ITERATIONS}$"
+        f"{base64.b64encode(salt).decode()}${base64.b64encode(h).decode()}"
+    )
+
+
+def verify_password(password: str, password_hash: str) -> bool:
+    try:
+        algo, iters_str, salt_b64, hash_b64 = password_hash.split("$")
+        if algo != "pbkdf2_sha256":
+            return False
+        iters = int(iters_str)
+        salt = base64.b64decode(salt_b64)
+        expected = base64.b64decode(hash_b64)
+        actual = hashlib.pbkdf2_hmac("sha256", password.encode("utf-8"), salt, iters)
+        return hmac.compare_digest(expected, actual)
+    except (ValueError, KeyError):
+        return False
+
+
+# ---------------------------------------------------------------------------
+# User CRUD
+# ---------------------------------------------------------------------------
+def load_users() -> list[User]:
+    raw = _read_json(USERS_FILE, [])
+    out: list[User] = []
+    for u in raw:
+        try:
+            out.append(User(**u))
+        except TypeError:
+            continue
+    return out
+
+
+def save_users(users: list[User]) -> None:
+    _atomic_write_json(USERS_FILE, [asdict(u) for u in users])
+
+
+def find_user(username: str) -> Optional[User]:
+    username = username.strip().lower()
+    for u in load_users():
+        if u.username.lower() == username:
+            return u
+    return None
+
+
+def authenticate(username: str, password: str) -> Optional[User]:
+    user = find_user(username)
+    if user and verify_password(password, user.password_hash):
+        return user
+    return None
+
+
+def ensure_seed_admin() -> None:
+    """İlk açılışta users.json yoksa default admin'i oluştur.
+    Şifre: ADMIN_PASSWORD env var → yoksa 'changeme' (uyarı yazılır).
+    Username: 'admin'."""
+    if USERS_FILE.exists():
+        return
+    seed_pw = os.environ.get("ADMIN_PASSWORD", "").strip() or "changeme"
+    seed = User(
+        username="admin",
+        password_hash=hash_password(seed_pw),
+        role="admin",
+        display_name="Admin",
+    )
+    save_users([seed])
+    if seed_pw == "changeme":
+        launcher_log(
+            "⚠ Default admin oluşturuldu (username=admin, password=changeme). "
+            ".env'ye ADMIN_PASSWORD koyup bu mesajdan kurtul."
+        )
+    else:
+        launcher_log("Default admin oluşturuldu (username=admin, ADMIN_PASSWORD env'den).")
 
 
 # ---------------------------------------------------------------------------
@@ -1277,34 +1378,75 @@ def open_in_browser(url: str) -> None:
 
 
 # ---------------------------------------------------------------------------
-# Mode detection: admin (?admin=<pw>) vs user (default)
+# Auth: session_state.auth ile login/logout, rol-tabanlı routing
 # ---------------------------------------------------------------------------
-def _admin_password() -> str:
-    """ADMIN_PASSWORD env var. Boşsa: admin gizli URL devre dışı, herkes
-    user view görür. Set edilmişse: ?admin=<pw> ile admin paneli."""
-    return os.environ.get("ADMIN_PASSWORD", "").strip()
+def is_logged_in() -> bool:
+    auth = st.session_state.get("auth")
+    return bool(auth and auth.get("username"))
+
+
+def current_user() -> Optional[dict]:
+    return st.session_state.get("auth") if is_logged_in() else None
 
 
 def _is_admin() -> bool:
-    pw = _admin_password()
-    if not pw:
-        # Şifre set edilmediyse, ?admin=1 ile admin'e geç (lokal kullanım için).
-        return st.query_params.get("admin", "") != ""
-    return st.query_params.get("admin", "") == pw
+    auth = current_user()
+    return bool(auth and auth.get("role") == "admin")
 
 
 def _user_name() -> str:
-    """Kullanıcı kendi adını bir kez verir. session_state'te tutulur ama
-    sayfa yenilemesinde kaybolmaması için URL query param'dan da restore eder.
-    Bu sayede ?u=Mustafa URL'i bookmark'lanırsa otomatik tanır."""
-    name = st.session_state.get("user_name", "").strip()
-    if name:
-        return name
-    qp_name = st.query_params.get("u", "").strip()
-    if qp_name:
-        st.session_state["user_name"] = qp_name
-        return qp_name
-    return ""
+    """User view'ın "kim gönderdi" alanı için — display_name'den alır."""
+    auth = current_user()
+    return auth.get("display_name", "") if auth else ""
+
+
+def do_logout() -> None:
+    st.session_state.pop("auth", None)
+    # URL query param'ları da temizle
+    for k in ("u", "admin", "reset_name"):
+        try:
+            del st.query_params[k]
+        except KeyError:
+            pass
+
+
+def render_login_view() -> None:
+    """Sayfa açıldığında giriş ekranı. Login başarılı olursa rol'e göre
+    admin veya user view'a yönlendirilir (rerun)."""
+    hero("Cinematic Studio", "Giriş yap")
+
+    st.markdown("&nbsp;", unsafe_allow_html=True)
+    cs = st.columns([1, 2, 1])
+    with cs[1]:
+        with st.container(border=True):
+            st.markdown(
+                '<div style="font-weight:600; font-size:1.05rem; margin-bottom:0.6rem;">'
+                '🔐 Hoş geldin</div>',
+                unsafe_allow_html=True,
+            )
+            with st.form("login_form", clear_on_submit=False):
+                username = st.text_input("Kullanıcı adı", placeholder="örn. mustafa")
+                password = st.text_input("Şifre", type="password")
+                submitted = st.form_submit_button("Giriş yap →", type="primary", use_container_width=True)
+                if submitted:
+                    user = authenticate(username, password)
+                    if user is None:
+                        st.error("Kullanıcı adı veya şifre hatalı.")
+                    else:
+                        st.session_state["auth"] = {
+                            "username": user.username,
+                            "role": user.role,
+                            "display_name": user.display_name or user.username,
+                        }
+                        # URL temiz başlasın
+                        for k in ("u", "admin", "reset_name"):
+                            try:
+                                del st.query_params[k]
+                            except KeyError:
+                                pass
+                        st.rerun()
+
+            st.caption("Hesabın yoksa yöneticiden iste.")
 
 
 # ---------------------------------------------------------------------------
@@ -1361,38 +1503,6 @@ def render_user_view() -> None:
         )
         return
 
-    # İsim sorma (ilk girişte)
-    if not _user_name():
-        st.markdown("&nbsp;", unsafe_allow_html=True)
-        with st.container(border=True):
-            st.markdown(
-                '<div style="font-weight:600; font-size:1.05rem; margin-bottom:0.4rem;">'
-                '👋 Hoş geldin! Adın nedir?</div>'
-                '<div style="font-size:0.85rem; opacity:0.7; margin-bottom:0.6rem;">'
-                'Gönderdiğin videoların burada listelenmesi için.</div>',
-                unsafe_allow_html=True,
-            )
-            with st.form("user_name_form"):
-                cs = st.columns([4, 1])
-                with cs[0]:
-                    name = st.text_input(
-                        "Adın",
-                        placeholder="örn. Mustafa",
-                        label_visibility="collapsed",
-                    )
-                with cs[1]:
-                    submitted = st.form_submit_button("Devam ➜", type="primary", use_container_width=True)
-                if submitted:
-                    if name.strip():
-                        clean = name.strip()
-                        st.session_state["user_name"] = clean
-                        # Sayfa yenilemede kaybolmaması için URL'e de yaz
-                        st.query_params["u"] = clean
-                        st.rerun()
-                    else:
-                        st.error("İsim boş olamaz.")
-        return
-
     # Tüm hesaplar bloke ise uyarı (ama yine de submit göster, kuyruğa atılabilir)
     if all_blocked:
         st.warning(
@@ -1423,8 +1533,7 @@ def render_user_view() -> None:
         with cs[0]:
             st.markdown(
                 f'<div style="font-size:0.78rem; opacity:0.65;">'
-                f'Gönderen: <b>{_user_name()}</b> · '
-                f'<a href="?reset_name=1" style="opacity:0.7;">değiştir</a></div>',
+                f'Gönderen: <b>{_user_name()}</b></div>',
                 unsafe_allow_html=True,
             )
         with cs[1]:
@@ -1451,16 +1560,6 @@ def render_user_view() -> None:
                 time.sleep(0.5)
                 st.rerun()
 
-    # Reset name link — hem session_state'i hem URL'deki ?u=... param'ını temizle
-    if st.query_params.get("reset_name", "") == "1":
-        st.session_state.pop("user_name", None)
-        # query_params.clear() admin param'ı da temizler — sadece u/reset_name'i sil
-        for k in ("u", "reset_name"):
-            try:
-                del st.query_params[k]
-            except KeyError:
-                pass
-        st.rerun()
 
     # Senin son istekleri
     st.markdown("&nbsp;", unsafe_allow_html=True)
@@ -1577,40 +1676,63 @@ def render_user_view() -> None:
                             open_in_browser(j.notebook_url)
         st.markdown('</div>', unsafe_allow_html=True)
 
-    # Admin shortcut
+    # Footer: logout
+    st.markdown("&nbsp;", unsafe_allow_html=True)
+    cs = st.columns([5, 1])
+    with cs[1]:
+        if st.button("🚪 Çıkış", key="user_logout", use_container_width=True):
+            do_logout()
+            st.rerun()
     st.markdown(
-        '<div style="margin-top:3rem; text-align:center; font-size:0.78rem; opacity:0.5;">'
-        f'Sorun var mı? Yöneticiye haber ver. '
-        f'<a href="?admin=1" style="opacity:0.7;">⚙️ Admin</a>'
-        f'</div>',
+        '<div style="margin-top:1rem; text-align:center; font-size:0.78rem; opacity:0.5;">'
+        'Sorun var mı? Yöneticiye haber ver.'
+        '</div>',
         unsafe_allow_html=True,
     )
 
 
-# ===== MODE DISPATCH =====
-# Admin değilse: user view render et, sonra çık. Admin UI hiç render edilmez.
+# ===== AUTH GATE + MODE DISPATCH =====
+# users.json yoksa default admin oluştur (ADMIN_PASSWORD env var'dan).
+ensure_seed_admin()
+
+# Login değilse → login view göster, çık.
+if not is_logged_in():
+    render_login_view()
+    st.stop()
+
+# Login + role=user → user view, çık.
 if not _is_admin():
     render_user_view()
-    # Auto-refresh: running job varsa yenile
     _jobs_now = load_jobs()
     if any(j.status == "running" or j.status == "queued" for j in _jobs_now):
         time.sleep(4)
         st.rerun()
     st.stop()
 
+# Login + role=admin → aşağıdaki admin UI render edilir (sidebar + tab'lar).
+
 
 # ===== SIDEBAR =====
 with st.sidebar:
+    _au = current_user() or {}
     st.markdown(
-        '<div style="padding: 0.4rem 0 0.6rem 0;">'
-        '<div style="font-size: 1.3rem; font-weight: 700; letter-spacing: -0.02em;">🎬 Cinematic Studio</div>'
-        '<div style="font-size: 0.78rem; opacity: 0.7; margin-top: 2px;">NotebookLM toplu video üretici</div>'
-        '</div>',
+        f'<div style="padding: 0.4rem 0 0.6rem 0;">'
+        f'<div style="font-size: 1.3rem; font-weight: 700; letter-spacing: -0.02em;">🎬 Cinematic Studio</div>'
+        f'<div style="font-size: 0.78rem; opacity: 0.7; margin-top: 2px;">'
+        f'Giriş: <b>{_au.get("display_name", "")}</b> · '
+        f'<span style="color:#6366F1;">{_au.get("role", "").upper()}</span></div>'
+        f'</div>',
         unsafe_allow_html=True,
     )
 
-    if st.button("🌐 NotebookLM'i normal Chrome'da aç", use_container_width=True):
-        open_in_browser("https://notebooklm.google.com/")
+    cs_top = st.columns([3, 1])
+    with cs_top[0]:
+        if st.button("🌐 NotebookLM açar", use_container_width=True):
+            open_in_browser("https://notebooklm.google.com/")
+    with cs_top[1]:
+        if st.button("🚪", key="admin_logout", use_container_width=True, help="Çıkış yap"):
+            do_logout()
+            st.rerun()
 
     st.markdown('<div class="sidebar-section">Hesap profilleri</div>', unsafe_allow_html=True)
 
@@ -1800,26 +1922,19 @@ with st.sidebar:
 _init_count = sum(1 for p in load_profiles() if p.initialized)
 _total_count = len(load_profiles())
 st.markdown(
-    f'<div class="app-hero" style="display:flex; align-items:center; gap:1rem;">'
-    f'<div style="flex:1;">'
+    f'<div class="app-hero">'
     f'<h1>🎬 Cinematic Studio  <span style="font-size:0.6em; padding:3px 10px; '
     f'background:rgba(255,255,255,0.18); border-radius:999px; vertical-align:middle; '
     f'font-weight:600; letter-spacing:0.05em;">YÖNETİM</span></h1>'
     f'<p>Toplu metin → paralel video üretimi · {_init_count}/{_total_count} hesap aktif</p>'
-    f'</div>'
-    f'<div style="text-align:right;">'
-    f'<a href="?" style="color:rgba(255,255,255,0.85); text-decoration:none; '
-    f'font-size:0.82rem; padding:6px 12px; border:1px solid rgba(255,255,255,0.3); '
-    f'border-radius:6px;">← Kullanıcı görünümü</a>'
-    f'</div>'
     f'</div>',
     unsafe_allow_html=True,
 )
 
 
 # ===== ANA PANEL — TAB'LAR =====
-tab_prep, tab_status, tab_videos, tab_log = st.tabs(
-    ["📝  Hazırla", "📊  Durum", "🎬  Videolar", "📜  Log"]
+tab_prep, tab_status, tab_videos, tab_log, tab_users = st.tabs(
+    ["📝  Hazırla", "📊  Durum", "🎬  Videolar", "📜  Log", "👥  Kullanıcılar"]
 )
 
 
@@ -2289,6 +2404,109 @@ with tab_log:
                 st.code(content, language="log")
             except OSError as e:
                 st.error(f"Log okunamadı: {e}")
+
+
+# -------------------- TAB 5: KULLANICILAR --------------------
+with tab_users:
+    section_header("👥 Kullanıcılar", "Login + rol yönetimi")
+    me = current_user()
+
+    users = load_users()
+
+    # Mevcut kullanıcı listesi
+    for u in users:
+        is_self = me and u.username.lower() == me.get("username", "").lower()
+        with st.container(border=True):
+            cs = st.columns([2.5, 1, 2, 1, 1])
+            with cs[0]:
+                st.markdown(
+                    f'<div style="font-weight:600;">{u.display_name or u.username}</div>'
+                    f'<div style="font-size:0.78rem; opacity:0.7;">@{u.username}</div>',
+                    unsafe_allow_html=True,
+                )
+            with cs[1]:
+                role_color = "#7C3AED" if u.role == "admin" else "#059669"
+                st.markdown(
+                    f'<span style="display:inline-block; padding:3px 10px; '
+                    f'background:{role_color}1A; color:{role_color}; border-radius:999px; '
+                    f'font-size:0.78rem; font-weight:600;">{u.role.upper()}</span>',
+                    unsafe_allow_html=True,
+                )
+            with cs[2]:
+                created = datetime.fromtimestamp(u.created_at).strftime("%Y-%m-%d %H:%M") if u.created_at else "—"
+                st.markdown(f'<div style="font-size:0.78rem; opacity:0.65;">Oluşturuldu: {created}</div>', unsafe_allow_html=True)
+            with cs[3]:
+                if st.button("🔑", key=f"rotate_{u.username}", help="Şifre değiştir", use_container_width=True):
+                    st.session_state[f"rotating_{u.username}"] = True
+            with cs[4]:
+                if is_self:
+                    st.markdown('<div style="font-size:0.7rem; opacity:0.55; text-align:center; padding-top:8px;">SEN</div>', unsafe_allow_html=True)
+                else:
+                    if st.button("🗑", key=f"del_user_{u.username}", help="Kullanıcıyı sil", use_container_width=True):
+                        new_list = [x for x in load_users() if x.username != u.username]
+                        save_users(new_list)
+                        st.toast(f"{u.username} silindi.", icon="🗑️")
+                        st.rerun()
+
+            # Şifre değiştirme form (toggle)
+            if st.session_state.get(f"rotating_{u.username}"):
+                with st.form(f"rotate_form_{u.username}"):
+                    st.caption(f"@{u.username} için yeni şifre")
+                    new_pw = st.text_input("Yeni şifre", type="password", key=f"newpw_{u.username}")
+                    cs2 = st.columns(2)
+                    with cs2[0]:
+                        if st.form_submit_button("Kaydet", type="primary", use_container_width=True):
+                            if len(new_pw) < 6:
+                                st.error("Şifre en az 6 karakter olmalı.")
+                            else:
+                                ulist = load_users()
+                                for x in ulist:
+                                    if x.username == u.username:
+                                        x.password_hash = hash_password(new_pw)
+                                        break
+                                save_users(ulist)
+                                st.session_state[f"rotating_{u.username}"] = False
+                                st.toast("Şifre güncellendi.", icon="✅")
+                                st.rerun()
+                    with cs2[1]:
+                        if st.form_submit_button("İptal", use_container_width=True):
+                            st.session_state[f"rotating_{u.username}"] = False
+                            st.rerun()
+
+    # Yeni kullanıcı ekle
+    st.markdown("&nbsp;", unsafe_allow_html=True)
+    section_header("➕ Yeni kullanıcı")
+    with st.form("new_user_form", clear_on_submit=True):
+        cs = st.columns([2, 2])
+        with cs[0]:
+            new_username = st.text_input("Kullanıcı adı", placeholder="örn. mustafa")
+        with cs[1]:
+            new_display = st.text_input("Görünen ad (opsiyonel)", placeholder="Mustafa Şapcılı")
+        cs2 = st.columns([2, 2])
+        with cs2[0]:
+            new_password = st.text_input("Şifre", type="password", placeholder="en az 6 karakter")
+        with cs2[1]:
+            new_role = st.selectbox("Rol", ["user", "admin"], index=0,
+                                    help="user: sadece senaryo gönderir. admin: hesap, kullanıcı, kuyruk yönetir.")
+        if st.form_submit_button("➕ Kullanıcı oluştur", type="primary", use_container_width=True):
+            uname = new_username.strip().lower()
+            if not uname or not new_password:
+                st.error("Kullanıcı adı ve şifre zorunlu.")
+            elif len(new_password) < 6:
+                st.error("Şifre en az 6 karakter olmalı.")
+            elif find_user(uname):
+                st.error(f"@{uname} zaten var.")
+            else:
+                ulist = load_users()
+                ulist.append(User(
+                    username=uname,
+                    password_hash=hash_password(new_password),
+                    role=new_role,
+                    display_name=new_display.strip() or uname,
+                ))
+                save_users(ulist)
+                st.toast(f"@{uname} oluşturuldu.", icon="✅")
+                st.rerun()
 
 
 # ---------------------------------------------------------------------------

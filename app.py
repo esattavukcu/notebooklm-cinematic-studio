@@ -107,19 +107,29 @@ LLM_ENABLED = bool(OPENROUTER_API_KEY)
 # NOT: Free tier endpoint'leri sık sık unavailable olabiliyor (404, rate limit).
 # Bir model çalışmazsa diğerine geç.
 OPENROUTER_FREE_MODELS: list[tuple[str, str]] = [
-    # (id, label) — sıra: önce kanıtlanmış çalışanlar
+    # (id, label) — sıra: probe ile doğrulanmış çalışanlar önce
     ("openai/gpt-oss-120b:free",
-     "GPT-OSS 120B — OpenAI açık-ağırlık (varsayılan, kaliteli)"),
+     "GPT-OSS 120B — OpenAI açık-ağırlık (varsayılan)"),
     ("openai/gpt-oss-20b:free",
      "GPT-OSS 20B — OpenAI, daha hızlı"),
-    ("z-ai/glm-4.5-air:free",
-     "GLM 4.5 Air — yaratıcı yazım iyi"),
     ("nvidia/nemotron-3-super-120b-a12b:free",
-     "Nemotron 3 Super 120B — NVIDIA, derin akıl yürütme"),
+     "Nemotron 3 Super 120B — NVIDIA"),
+    ("minimax/minimax-m2.5:free",
+     "MiniMax M2.5 — yaratıcı, multilingual"),
+    # Aşağıdakiler zaman zaman rate-limit yiyor; rate-limit mesajı çıkarsa
+    # yukarıdakilerden birine geç.
+    ("meta-llama/llama-3.3-70b-instruct:free",
+     "Llama 3.3 70B — Meta (sık rate-limit)"),
+    ("nousresearch/hermes-3-llama-3.1-405b:free",
+     "Hermes 3 405B — Nous Research, devasa (sık rate-limit)"),
+    ("z-ai/glm-4.5-air:free",
+     "GLM 4.5 Air — Çince/multilingual (sık rate-limit)"),
     ("qwen/qwen3-next-80b-a3b-instruct:free",
-     "Qwen3 Next 80B — multilingual (bugün unavailable)"),
+     "Qwen3 Next 80B — multilingual (sık rate-limit)"),
     ("google/gemma-4-31b-it:free",
-     "Gemma 4 31B — Google (bugün unavailable)"),
+     "Gemma 4 31B — Google (sık rate-limit)"),
+    ("cognitivecomputations/dolphin-mistral-24b-venice-edition:free",
+     "Dolphin Mistral 24B — uncensored (sık rate-limit)"),
 ]
 
 PYTHON_BIN = sys.executable  # venv'in içindeki python
@@ -507,7 +517,22 @@ def _openrouter_chat(messages: list[dict], model: Optional[str] = None,
         )
         return True, response.choices[0].message.content or ""
     except Exception as e:
-        return False, f"LLM hatası: {str(e)[:300]}"
+        # OpenRouter free tier hatalarını okunaklı hale getir.
+        msg = str(e)
+        used_model = model or OPENROUTER_MODEL
+        if "429" in msg or "rate-limited" in msg.lower():
+            return False, (
+                f"⏳ '{used_model}' şu an provider tarafında rate-limited. "
+                f"Listeden başka bir model seç (örn. GPT-OSS 120B) ve tekrar dene."
+            )
+        if "404" in msg or "No endpoints found" in msg:
+            return False, (
+                f"❌ '{used_model}' artık ücretsiz değil ya da provider'ı yok. "
+                f"Listeden başka bir model seç."
+            )
+        if "401" in msg or "invalid api key" in msg.lower():
+            return False, "🔑 OPENROUTER_API_KEY geçersiz. Sunucudaki .env'i kontrol et."
+        return False, f"LLM hatası: {msg[:300]}"
 
 
 # Sistem prompt'u (her script regenerate'de prepend edilir).

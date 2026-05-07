@@ -162,6 +162,20 @@ INSERT_BUTTON_SELECTORS = [
     'button:has-text("Ekle")',
 ]
 
+# Notebook içinde "+ Add sources" butonu (sources panel header'ında)
+ADD_SOURCES_SELECTORS = [
+    'button:has-text("Add sources")',
+    'button:has-text("Add source")',
+    'button:has-text("Kaynak ekle")',
+    'button:has-text("Kaynakları ekle")',
+    '[aria-label="Add sources"]',
+    '[aria-label="Add source"]',
+    '[aria-label*="Add sources" i]',
+    '[aria-label*="kaynak ekle" i]',
+    'button[mattooltip="Add source"]',
+    'button[mattooltip*="Add" i]',
+]
+
 VIDEO_OVERVIEW_SELECTORS = [
     '[aria-label="Video Overview"]',
     '[aria-label="Video"]',
@@ -692,6 +706,110 @@ def select_cinematic_video_overview(page, emitter: EventEmitter, screenshots_dir
     return True
 
 
+def upload_image_sources(
+    page,
+    image_paths: list[Path],
+    emitter: EventEmitter,
+    screenshots_dir: Path,
+    job_id: str,
+) -> bool:
+    """Notebook içinde "+ Add sources" → "Upload files" akışıyla görselleri yükler.
+
+    NotebookLM Cinematic source olarak imageları kullanıyor. URL paste accept
+    etmediği için (test edildi, hata veriyor), local dosyalardan upload şart.
+
+    Returns True if upload succeeded, False on failure (caller karar verir).
+    """
+    if not image_paths:
+        return True
+
+    # 1) "+ Add sources" butonuna bas (notebook içinde, sources panel header'ında)
+    add_loc = _find_first_visible(page, ADD_SOURCES_SELECTORS, timeout_ms=20000)
+    if add_loc is None:
+        emitter.emit("add_sources_button_not_found")
+        _take_screenshot(page, screenshots_dir, f"{job_id}_no_add_sources")
+        return False
+    if not _click_with_fallback(add_loc, page):
+        emitter.emit("add_sources_click_failed")
+        return False
+    emitter.emit("add_sources_clicked")
+
+    # 2) Modal açılsın diye küçük bekleme
+    time.sleep(1.5)
+
+    # 3) Dialog içindeki file input'u bul ve dosyaları yükle.
+    # Hidden input olabilir (state="attached" kullan, "visible" değil).
+    file_input_selectors = [
+        '[role="dialog"] input[type="file"]',
+        'mat-dialog-container input[type="file"]',
+        '.cdk-overlay-pane input[type="file"]',
+        'input[type="file"]',
+    ]
+    file_input = None
+    for sel in file_input_selectors:
+        try:
+            cand = page.locator(sel).first
+            cand.wait_for(state="attached", timeout=5000)
+            file_input = cand
+            emitter.emit("file_input_found", selector=sel)
+            break
+        except Exception:
+            continue
+    if file_input is None:
+        emitter.emit("file_input_not_found")
+        _take_screenshot(page, screenshots_dir, f"{job_id}_no_file_input")
+        return False
+
+    # 4) Dosyaları toplu upload (set_input_files multiple kabul ediyor)
+    paths_str = [str(p.resolve()) for p in image_paths if p.exists()]
+    if not paths_str:
+        emitter.emit("no_valid_image_paths")
+        return False
+    try:
+        file_input.set_input_files(paths_str)
+        emitter.emit("files_set", count=len(paths_str))
+    except Exception as e:
+        emitter.emit("set_input_files_failed", error=str(e))
+        _take_screenshot(page, screenshots_dir, f"{job_id}_upload_fail")
+        return False
+
+    # 5) Upload tamamlanmasını bekle.
+    # Sinyal: dialog kapansın (auto-close after upload), ya da source list
+    # büyüsün. Strateji: önce 5sn fixed wait, sonra modal görünmüyorsa OK kabul.
+    time.sleep(5)
+
+    deadline = time.time() + 120  # max 2 dk
+    last_emit = 0
+    while time.time() < deadline:
+        modal_visible = False
+        for sel in ('[role="dialog"]', 'mat-dialog-container', '.mat-mdc-dialog-container'):
+            try:
+                if page.locator(sel).first.is_visible(timeout=300):
+                    modal_visible = True
+                    break
+            except Exception:
+                continue
+        if not modal_visible:
+            emitter.emit("upload_modal_closed")
+            return True
+        if time.time() - last_emit > 10:
+            emitter.emit("upload_in_progress",
+                         elapsed=int(time.time() - (deadline - 120)))
+            last_emit = time.time()
+        time.sleep(2)
+
+    # Timeout — modal hâlâ açık. Yine de devam etmeyi dene (görsel'ler işlenmiş
+    # olabilir). Modal'i manuel kapatmaya çalış (X butonu / Esc).
+    emitter.emit("upload_timeout_modal_still_open")
+    _take_screenshot(page, screenshots_dir, f"{job_id}_upload_timeout")
+    try:
+        page.keyboard.press("Escape")
+        time.sleep(1)
+    except Exception:
+        pass
+    return True  # best-effort: continue, kullanıcı admin panelden görür
+
+
 def run_automation(
     text: str,
     profile_dir: Path,
@@ -702,6 +820,7 @@ def run_automation(
     job_id: str,
     download_dir: Path,
     screenshots_dir: Path,
+    image_paths: Optional[list[Path]] = None,
 ) -> int:
     from playwright.sync_api import sync_playwright
 
@@ -873,6 +992,26 @@ def run_automation(
 
             # Studio paneli yüklensin diye küçük bir bekleme
             time.sleep(3)
+
+            # Phase E: Eğer image source'lar varsa, Cinematic generate'den ÖNCE
+            # bunları "+ Add sources" → "Upload files" akışıyla yükle.
+            # Cinematic, source'ları input olarak kullanıyor (script + görseller).
+            if image_paths:
+                emitter.emit(
+                    "image_upload_starting",
+                    count=len(image_paths),
+                    paths=[str(p) for p in image_paths],
+                )
+                up_ok = upload_image_sources(
+                    page=page,
+                    image_paths=image_paths,
+                    emitter=emitter,
+                    screenshots_dir=screenshots_dir,
+                    job_id=job_id,
+                )
+                emitter.emit("image_upload_done", success=up_ok)
+                # Source list refresh + Studio panel re-render için biraz bekle
+                time.sleep(4)
 
             # Cinematic Video Overview seç ve Generate'e bas
             ok = select_cinematic_video_overview(page, emitter, screenshots_dir, job_id)
@@ -1315,6 +1454,13 @@ def main(argv: Optional[list[str]] = None) -> int:
     parser.add_argument("--job-id", default="cli", help="screenshot/log isimleri için")
     parser.add_argument("--download-dir", default="data/downloads")
     parser.add_argument("--screenshots-dir", default="data/logs/screenshots")
+    # Phase E: image source paths (notebook'a upload edilecek)
+    parser.add_argument(
+        "--images",
+        nargs="*",
+        default=[],
+        help="Notebook'a Add Sources → Upload akışıyla yüklenecek görsel dosya path'leri",
+    )
     args = parser.parse_args(argv)
 
     profile_dir = Path(args.profile_dir).resolve()
@@ -1352,6 +1498,14 @@ def main(argv: Optional[list[str]] = None) -> int:
         emitter.emit("error", message="text boş — automation modunda gerekli")
         return 64
 
+    image_paths: list[Path] = []
+    for ip in (args.images or []):
+        p = Path(ip).resolve()
+        if p.exists() and p.is_file():
+            image_paths.append(p)
+        else:
+            emitter.emit("image_path_skipped", path=str(p), reason="not_found")
+
     return run_automation(
         text=args.text,
         profile_dir=profile_dir,
@@ -1362,6 +1516,7 @@ def main(argv: Optional[list[str]] = None) -> int:
         job_id=args.job_id,
         download_dir=download_dir,
         screenshots_dir=screenshots_dir,
+        image_paths=image_paths or None,
     )
 
 

@@ -61,6 +61,7 @@ PROFILES_FILE = DATA_DIR / "profiles.json"
 DRAFTS_FILE = DATA_DIR / "drafts.json"
 USERS_FILE = DATA_DIR / "users.json"
 SCRIPT_DRAFTS_FILE = DATA_DIR / "script_drafts.json"  # Phase A in-progress drafts
+JOB_ASSETS_DIR = DATA_DIR / "job_assets"  # Phase E: per-job indirilen görseller
 LAUNCHER_LOG = LOGS_DIR / "launcher.log"
 
 # Bugünkü kullanım sayımına dahil olan job durumları. Failed da sayılır —
@@ -918,6 +919,106 @@ def _search_pexels(query: str, limit: int = 4) -> list[dict]:
 
 
 # ---------------------------------------------------------------------------
+# Phase E: Asset image download — submit anında selected_image URL'lerini
+# disk'e indir, automator'a path olarak ver. Pollinations URL'leri ilk fetch'te
+# generation tetikliyor, 5-15s sürüyor; paralel indir.
+# ---------------------------------------------------------------------------
+_DOWNLOAD_HEADERS = {
+    "User-Agent": (
+        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) "
+        "Chrome/120.0.0.0 Safari/537.36"
+    ),
+    "Accept": "image/*,*/*;q=0.8",
+}
+
+
+def _ext_from_content_type(ctype: str, fallback_url: str) -> str:
+    """Content-Type → uzantı. NotebookLM image upload'ı dosya tipini denetliyor."""
+    ctype = (ctype or "").lower().split(";")[0].strip()
+    mapping = {
+        "image/jpeg": ".jpg",
+        "image/jpg": ".jpg",
+        "image/png": ".png",
+        "image/gif": ".gif",
+        "image/webp": ".webp",
+        "image/svg+xml": ".svg",
+        "image/bmp": ".bmp",
+        "image/tiff": ".tif",
+    }
+    if ctype in mapping:
+        return mapping[ctype]
+    # URL'den çıkar fallback
+    lower = fallback_url.lower().split("?")[0]
+    for ext in (".jpg", ".jpeg", ".png", ".gif", ".webp", ".svg", ".bmp"):
+        if lower.endswith(ext):
+            return ".jpg" if ext == ".jpeg" else ext
+    return ".jpg"  # safe default — NotebookLM jpg kabul ediyor
+
+
+def download_image(url: str, dest_dir: Path, name_prefix: str,
+                   timeout: int = 60) -> Optional[Path]:
+    """Tek görseli indir, dosya path'i döndür. Hata varsa None.
+
+    Pollinations URL'leri server-side gen yapıyor — timeout uzun tutmak gerek.
+    """
+    if not url or not url.startswith(("http://", "https://")):
+        return None
+    dest_dir.mkdir(parents=True, exist_ok=True)
+    try:
+        req = urllib.request.Request(url, headers=_DOWNLOAD_HEADERS)
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            data = r.read()
+            if not data or len(data) < 100:  # boş ya da bozuk
+                return None
+            ctype = r.headers.get("Content-Type", "")
+            ext = _ext_from_content_type(ctype, url)
+        out_path = dest_dir / f"{name_prefix}{ext}"
+        out_path.write_bytes(data)
+        return out_path
+    except Exception:
+        return None
+
+
+def download_job_images(job_id: str, assets: list) -> list[Path]:
+    """Job'ın selected_image'lerini paralel indir, local path listesi döndür.
+
+    Sadece selected_image olan asset'ler indirilir (kullanıcı seçmediyse skip).
+    Hata olan görsel atılır, kalanlar yine de upload edilir.
+    """
+    if not assets:
+        return []
+    selected = []
+    for i, a in enumerate(assets):
+        sel = a.get("selected_image") or {}
+        url = sel.get("full_url") or sel.get("thumb_url") or ""
+        if not url:
+            continue
+        # Anlamlı dosya adı: indeks + asset id (sıralı upload için)
+        name = f"{i+1:02d}_{a.get('id','asset')[:8]}"
+        selected.append((url, name))
+    if not selected:
+        return []
+
+    job_dir = JOB_ASSETS_DIR / job_id
+    job_dir.mkdir(parents=True, exist_ok=True)
+
+    paths: list[Optional[Path]] = [None] * len(selected)
+    from concurrent.futures import ThreadPoolExecutor
+
+    def _dl(idx: int) -> None:
+        url, name = selected[idx]
+        p = download_image(url, job_dir, name)
+        paths[idx] = p
+
+    # Pollinations gen 5-15s × N parallel; max 4 thread iyi denge
+    with ThreadPoolExecutor(max_workers=4) as ex:
+        list(ex.map(_dl, range(len(selected))))
+
+    return [p for p in paths if p is not None]
+
+
+# ---------------------------------------------------------------------------
 # Phase D: Image generation fallback (Pollinations.ai — free, key gerek yok)
 # ---------------------------------------------------------------------------
 # Pollinations URL-based: GET request hem trigger hem result. CDN cache'liyor,
@@ -1200,6 +1301,19 @@ class Worker:
         job.started_at = time.time()
         job.error = ""
 
+        # Phase E: Eğer asset'lerin selected_image'leri varsa indir, automator'a
+        # local path olarak ver. Pollinations URL'leri ilk fetch'te gen yapıyor
+        # (5-15s × N), spawn'dan ÖNCE burada paralel indiriyoruz ki automator
+        # yürürken bekleme olmasın.
+        image_paths: list[Path] = []
+        if job.assets:
+            launcher_log(f"Job {job.id}: indiriliyor → {sum(1 for a in job.assets if a.get('selected_image'))} selected image")
+            try:
+                image_paths = download_job_images(job.id, job.assets)
+                launcher_log(f"Job {job.id}: {len(image_paths)} image indirildi → {JOB_ASSETS_DIR / job.id}")
+            except Exception as e:
+                launcher_log(f"Job {job.id}: image download hata, devam: {e}")
+
         cmd = [
             PYTHON_BIN,
             str(APP_DIR / "notebooklm_automator.py"),
@@ -1213,6 +1327,9 @@ class Worker:
             "--screenshots-dir", str(SCREENSHOTS_DIR),
         ]
         cmd.append("--headless" if profile.headless else "--no-headless")
+        if image_paths:
+            cmd.append("--images")
+            cmd.extend(str(p) for p in image_paths)
 
         log_path = job_log_path(job.id)
         log_path.parent.mkdir(parents=True, exist_ok=True)

@@ -917,6 +917,74 @@ def _search_pexels(query: str, limit: int = 4) -> list[dict]:
     return results
 
 
+# ---------------------------------------------------------------------------
+# Phase D: Image generation fallback (Pollinations.ai — free, key gerek yok)
+# ---------------------------------------------------------------------------
+# Pollinations URL-based: GET request hem trigger hem result. CDN cache'liyor,
+# aynı seed+prompt+model = aynı görsel.
+# Probe ile çalıştığını teyit ettiklerimiz:
+POLLINATIONS_MODELS: list[tuple[str, str]] = [
+    ("flux", "Flux — kaliteli, dengeli (varsayılan)"),
+    ("turbo", "Turbo — daha hızlı (SDXL Turbo)"),
+    ("flux-pro", "Flux Pro — yüksek kalite"),
+]
+
+# Style → prompt suffix (Flux daha "photorealistic" gibi keyword'lere iyi tepki veriyor)
+_STYLE_SUFFIX = {
+    "photo": "photorealistic, high detail, sharp focus, professional photography",
+    "illustration": "digital illustration, vibrant colors, detailed, concept art",
+    "diagram": "clean infographic, vector style, flat design, white background",
+    "archive": "vintage archival photograph, sepia tone, film grain, historical",
+}
+
+
+def generate_images(prompt: str, count: int = 4, model: str = "flux",
+                    style: str = "photo") -> list[dict]:
+    """Pollinations.ai ile farklı seed'lerde N varyant üret.
+
+    Aslında üretim yapmıyor — sadece doğru URL'leri inşa ediyor. Browser'in
+    img tag'i URL'i fetch ettiğinde Pollinations server-side üretiyor (5-15s).
+    Cache'lendikten sonra anlık.
+    """
+    if not prompt.strip():
+        return []
+    suffix = _STYLE_SUFFIX.get(style, _STYLE_SUFFIX["photo"])
+    full_prompt = f"{prompt.strip()}, {suffix}"
+
+    out = []
+    base_seed = int(time.time() * 1000) % 1_000_000
+    for i in range(count):
+        seed = base_seed + i * 7919  # asal ile çoğalt → daha çeşitli seedler
+        params = {
+            "width": "1024",
+            "height": "1024",
+            "model": model,
+            "seed": str(seed),
+            "nologo": "true",
+        }
+        url = (
+            "https://image.pollinations.ai/prompt/"
+            + urllib.parse.quote(full_prompt)
+            + "?" + urllib.parse.urlencode(params)
+        )
+        out.append({
+            "source": "pollinations",
+            "thumb_url": url,
+            "full_url": url,
+            "title": full_prompt[:120],
+            "license": "Pollinations (free)",
+            "attribution": f"AI · {model} · seed {seed}",
+            "page_url": url,
+            "width": 1024,
+            "height": 1024,
+            # Debug/regen için ek alanlar
+            "_seed": seed,
+            "_model": model,
+            "_prompt": full_prompt,
+        })
+    return out
+
+
 def search_images(query: str, limit: int = 12) -> list[dict]:
     """Aynı query'yi tüm aktif kaynaklarda ara, sonuçları interleave et.
 
@@ -2269,6 +2337,34 @@ def render_user_view() -> None:
                 _persist_draft()
                 break
 
+    def _cb_generate_images(asset_id: str) -> None:
+        """Phase D: Pollinations.ai ile 4 varyant üret, candidates'e koy."""
+        for a in st.session_state.get("script_assets", []):
+            if a.get("id") != asset_id:
+                continue
+            # Prompt önceliği: query (EN) > description (TR fallback)
+            q = (a.get("query") or "").strip()
+            desc = (a.get("description") or "").strip()
+            prompt = q or desc
+            if not prompt:
+                st.session_state["_script_msg"] = (
+                    "err", "Üretim için query ya da description gerek."
+                )
+                return
+            model = st.session_state.get(f"asset_genmodel_{asset_id}") or "flux"
+            style = a.get("style", "photo")
+            results = generate_images(prompt, count=4, model=model, style=style)
+            if not results:
+                st.session_state["_script_msg"] = ("err", "Üretim başlatılamadı.")
+                return
+            a["candidates"] = results
+            a["search_done_at"] = time.time()
+            st.session_state["_script_msg"] = (
+                "ok", f"{len(results)} AI varyant hazır. Yüklemesi 5-15 sn sürebilir."
+            )
+            _persist_draft()
+            break
+
     def _cb_use_manual_url(asset_id: str, widget_key: str) -> None:
         """Kullanıcının yapıştırdığı URL'i selected_image olarak set et."""
         url = (st.session_state.get(widget_key) or "").strip()
@@ -2526,9 +2622,11 @@ def render_user_view() -> None:
                                 except Exception:
                                     st.caption("(thumbnail yüklenemedi)")
                             with sc[1]:
-                                src_emoji = {"wikimedia": "🌐", "openverse": "🎨"}.get(
-                                    selected.get("source", ""), "🖼"
-                                )
+                                src_emoji = {
+                                    "wikimedia": "🌐", "openverse": "🌍",
+                                    "pixabay": "🎯", "pexels": "📸",
+                                    "pollinations": "🤖", "manual": "✏",
+                                }.get(selected.get("source", ""), "🖼")
                                 st.markdown(
                                     f'<div style="font-size:0.85rem;">'
                                     f'<b>✅ Seçili</b> · {src_emoji} {selected.get("source","?")}<br>'
@@ -2554,9 +2652,9 @@ def render_user_view() -> None:
                                     help="Seçimi kaldır, başka görsel seç",
                                 )
                         elif not candidates:
-                            # Henüz arama yapılmamış — buton göster
+                            # Henüz arama yapılmamış — search + generate butonları
                             st.markdown("&nbsp;", unsafe_allow_html=True)
-                            search_cs = st.columns([2, 3])
+                            search_cs = st.columns([2, 2, 1.5])
                             with search_cs[0]:
                                 st.button(
                                     "🔍 Görsel ara",
@@ -2567,15 +2665,40 @@ def render_user_view() -> None:
                                     help="Aktif kaynaklarda bu query ile ara",
                                 )
                             with search_cs[1]:
-                                # Aktif kaynak listesi
-                                _active = ["Wikimedia", "Openverse"]
-                                if PIXABAY_API_KEY:
-                                    _active.append("Pixabay")
-                                if PEXELS_API_KEY:
-                                    _active.append("Pexels")
-                                st.caption(
-                                    f"Aktif kaynaklar: **{' · '.join(_active)}**"
+                                st.button(
+                                    "🎨 AI ile üret",
+                                    key=f"asset_gen_{aid}",
+                                    on_click=_cb_generate_images,
+                                    args=(aid,),
+                                    use_container_width=True,
+                                    help="Pollinations.ai ile 4 varyant üret (free, key gerek yok)",
                                 )
+                            with search_cs[2]:
+                                # Pollinations model selector
+                                _pmodel_ids = [m[0] for m in POLLINATIONS_MODELS]
+                                _pmodel_lbls = {m[0]: m[1] for m in POLLINATIONS_MODELS}
+                                _pmkey = f"asset_genmodel_{aid}"
+                                if _pmkey not in st.session_state:
+                                    st.session_state[_pmkey] = "flux"
+                                st.selectbox(
+                                    "AI modeli",
+                                    options=_pmodel_ids,
+                                    format_func=lambda m: _pmodel_lbls.get(m, m).split(" — ")[0],
+                                    key=_pmkey,
+                                    label_visibility="collapsed",
+                                    help="AI üretim modeli (üret butonunda kullanılır)",
+                                )
+
+                            # Aktif kaynak listesi
+                            _active = ["Wikimedia", "Openverse"]
+                            if PIXABAY_API_KEY:
+                                _active.append("Pixabay")
+                            if PEXELS_API_KEY:
+                                _active.append("Pexels")
+                            st.caption(
+                                f"Arama kaynakları: **{' · '.join(_active)}** "
+                                f"&nbsp;·&nbsp; AI üretim: **Pollinations.ai** (free)"
+                            )
 
                             # Manuel URL paste — kullanıcı kendisi URL bulup yapıştırabilir
                             with st.expander("✏ Manuel URL yapıştır", expanded=False):
@@ -2608,21 +2731,34 @@ def render_user_view() -> None:
                             # Aday görseller var, henüz seçim yok
                             st.markdown("---")
                             n_cands = len(candidates)
-                            head_cs = st.columns([3, 2])
+                            # Tipini belirt (gerçek arama sonuçları mı, AI üretim mi)
+                            sources_in_cands = {c.get("source", "?") for c in candidates}
+                            is_all_ai = sources_in_cands == {"pollinations"}
+                            label_kind = "AI varyant" if is_all_ai else "aday görsel"
+                            head_cs = st.columns([3, 1.3, 1.3])
                             with head_cs[0]:
                                 st.markdown(
-                                    f'<small><b>{n_cands} aday görsel</b> · '
+                                    f'<small><b>{n_cands} {label_kind}</b> · '
                                     f'birini seç ↓</small>',
                                     unsafe_allow_html=True,
                                 )
                             with head_cs[1]:
                                 st.button(
-                                    "🔄 Yenile",
+                                    "🔄 Yeniden ara",
                                     key=f"asset_research_{aid}",
                                     on_click=_cb_search_images,
                                     args=(aid,),
                                     use_container_width=True,
-                                    help="Aramayı yenile (query değiştiyse)",
+                                    help="Aramayı yenile",
+                                )
+                            with head_cs[2]:
+                                st.button(
+                                    "🎨 AI üret",
+                                    key=f"asset_gen2_{aid}",
+                                    on_click=_cb_generate_images,
+                                    args=(aid,),
+                                    use_container_width=True,
+                                    help="Beğenmediysen Pollinations'la 4 varyant üret",
                                 )
 
                             # Thumbnail grid — 4 sütun
@@ -2643,7 +2779,11 @@ def render_user_view() -> None:
                                             st.caption("⚠ yüklenemedi")
                                         src_short = {
                                             "wikimedia": "🌐 wm",
-                                            "openverse": "🎨 ov",
+                                            "openverse": "🌍 ov",
+                                            "pixabay": "🎯 pix",
+                                            "pexels": "📸 pex",
+                                            "pollinations": "🤖 AI",
+                                            "manual": "✏ man",
                                         }.get(cand.get("source", ""), "?")
                                         license_short = (cand.get("license") or "")[:14]
                                         st.markdown(

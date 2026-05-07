@@ -26,9 +26,14 @@ RestartSec=5
 StandardOutput=journal
 StandardError=journal
 
-# Güvenlik (opsiyonel sıkılaştırmalar)
-NoNewPrivileges=true
-PrivateTmp=true
+# Güvenlik sıkılaştırmaları KAPALI:
+# - PrivateTmp=true → /tmp izole olur, Xvfb'nin /tmp/.X11-unix/X99 socket'ini
+#   göremez, init için Chromium başlatmak fail eder. xvfb ayrı service'de.
+# - NoNewPrivileges=true → bazı browser sandbox setup'ı tetikler, gereksiz.
+# Bu service VPS'de kendi user'ı altında zaten izole, bu flag'ler bonus
+# güvenlik sağlamadan Chromium'u kıran katma sebep oluyor.
+# NoNewPrivileges=true
+# PrivateTmp=true
 # ProtectSystem=full   # data/ ve chrome_profiles/ writable kalsın diye kapalı
 
 [Install]

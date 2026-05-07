@@ -176,6 +176,43 @@ ADD_SOURCES_SELECTORS = [
     'button[mattooltip*="Add" i]',
 ]
 
+# Cinematic Customize dialog'unda "Custom prompt" button/toggle.
+# NotebookLM bunu bazen ikon, bazen text olarak gösterir. Multi-variant.
+CUSTOM_PROMPT_BUTTON_SELECTORS = [
+    'button:has-text("Custom prompt")',
+    'button:has-text("Custom Prompt")',
+    'button:has-text("Özel istem")',
+    'button:has-text("Özel Prompt")',
+    '[aria-label*="custom prompt" i]',
+    '[aria-label*="özel istem" i]',
+    'button:has-text("Customize")',  # bazen "Customize" → custom prompt'a açar
+]
+
+# Custom prompt dialog/modal — pasted text alanı
+CUSTOM_PROMPT_INPUT_SELECTORS = [
+    # Custom Prompt dialog özelinde
+    'text=/Custom Prompt/i >> .. >> textarea',
+    '[role="dialog"]:has-text("Custom Prompt") textarea',
+    'mat-dialog-container:has-text("Custom Prompt") textarea',
+    '.cdk-overlay-pane:has-text("Custom Prompt") textarea',
+    # Genel — dialog içindeki en uzun textarea genelde custom prompt
+    '[role="dialog"] textarea',
+    'mat-dialog-container textarea',
+    '.cdk-overlay-pane textarea',
+]
+
+# Custom Prompt dialog'undaki Save / Apply / OK / Done butonu (modal'i kapat)
+CUSTOM_PROMPT_SAVE_SELECTORS = [
+    '[role="dialog"] button:has-text("Save")',
+    '[role="dialog"] button:has-text("Apply")',
+    '[role="dialog"] button:has-text("Done")',
+    '[role="dialog"] button:has-text("OK")',
+    '[role="dialog"] button:has-text("Kaydet")',
+    '[role="dialog"] button:has-text("Uygula")',
+    'mat-dialog-container button:has-text("Save")',
+    'mat-dialog-container button:has-text("Apply")',
+]
+
 VIDEO_OVERVIEW_SELECTORS = [
     '[aria-label="Video Overview"]',
     '[aria-label="Video"]',
@@ -519,10 +556,17 @@ def run_init(profile_dir: Path, authuser: int, emitter: EventEmitter) -> int:
 # ---------------------------------------------------------------------------
 # OTOMASYON: notebook oluştur, metin ekle, Cinematic video tetikle.
 # ---------------------------------------------------------------------------
-def select_cinematic_video_overview(page, emitter: EventEmitter, screenshots_dir: Path, job_id: str) -> bool:
+def select_cinematic_video_overview(
+    page,
+    emitter: EventEmitter,
+    screenshots_dir: Path,
+    job_id: str,
+    custom_prompt: str = "",
+) -> bool:
     """
     Studio panelinden Video Overview kartını tıklar, customize dialog'u açar,
     Cinematic'in seçili olduğunu doğrular (üzerine tıklamaz — toggle eder).
+    Eğer custom_prompt verilmişse Custom Prompt alanını doldurur.
     Generate butonu enabled olduğunda True döner.
     """
     last_screenshot = time.time()
@@ -596,27 +640,38 @@ def select_cinematic_video_overview(page, emitter: EventEmitter, screenshots_dir
     # 3) Cinematic seçili durumda — ÜSTÜNE TIKLAMA (toggle ediyor, kapatıyor).
     # Sadece varsayılan olduğunu varsayarız.
 
-    # 4) Description input varsa, BOŞ ise doldur. NotebookLM bazen Cinematic
-    # için suggestion otomatik dolduruyor — onu silmemek için kontrol et.
-    desc_loc = _find_first_visible(page, DESCRIPTION_INPUT_SELECTORS, timeout_ms=2000)
-    if desc_loc is not None:
-        try:
-            existing = ""
+    # 4) Custom Prompt varsa onu kullan (description'ı override eder).
+    # NotebookLM Customize dialog'u tek textarea'lı; custom prompt'umuz role +
+    # constraints + source listing içerdiği için "description" yerine bu girer.
+    if custom_prompt and custom_prompt.strip():
+        cp_ok = apply_custom_prompt_to_cinematic_dialog(
+            page=page,
+            custom_prompt=custom_prompt,
+            emitter=emitter,
+            screenshots_dir=screenshots_dir,
+            job_id=job_id,
+        )
+        emitter.emit("custom_prompt_applied", success=cp_ok)
+    else:
+        # Custom prompt yoksa eski davranış: BOŞ description'ı doldur.
+        desc_loc = _find_first_visible(page, DESCRIPTION_INPUT_SELECTORS, timeout_ms=2000)
+        if desc_loc is not None:
             try:
-                existing = desc_loc.input_value(timeout=1000) or ""
-            except Exception:
-                # contenteditable için input_value çalışmaz
+                existing = ""
                 try:
-                    existing = (desc_loc.text_content(timeout=1000) or "").strip()
+                    existing = desc_loc.input_value(timeout=1000) or ""
                 except Exception:
-                    pass
-            if not existing.strip():
-                desc_loc.fill("Cinematic style with clear narration.", timeout=3000)
-                emitter.emit("description_filled")
-            else:
-                emitter.emit("description_already_filled", chars=len(existing))
-        except Exception as e:
-            emitter.emit("description_fill_failed", error=str(e))
+                    try:
+                        existing = (desc_loc.text_content(timeout=1000) or "").strip()
+                    except Exception:
+                        pass
+                if not existing.strip():
+                    desc_loc.fill("Cinematic style with clear narration.", timeout=3000)
+                    emitter.emit("description_filled")
+                else:
+                    emitter.emit("description_already_filled", chars=len(existing))
+            except Exception as e:
+                emitter.emit("description_fill_failed", error=str(e))
 
     # 5) Generate butonunu bul ve disabled durumunu kontrol et.
     gen_loc = _find_first_visible(page, GENERATE_SELECTORS, timeout_ms=5000)
@@ -706,39 +761,37 @@ def select_cinematic_video_overview(page, emitter: EventEmitter, screenshots_dir
     return True
 
 
-def upload_image_sources(
+def upload_files_to_notebook(
     page,
-    image_paths: list[Path],
+    file_paths: list[Path],
     emitter: EventEmitter,
     screenshots_dir: Path,
     job_id: str,
+    label: str = "files",
 ) -> bool:
-    """Notebook içinde "+ Add sources" → "Upload files" akışıyla görselleri yükler.
+    """Notebook içinde "+ Add sources" → file input set akışıyla dosyaları yükler.
 
-    NotebookLM Cinematic source olarak imageları kullanıyor. URL paste accept
-    etmediği için (test edildi, hata veriyor), local dosyalardan upload şart.
-
-    Returns True if upload succeeded, False on failure (caller karar verir).
+    Tek toplu upload (multiple file kabul). Style guides + images karışık olabilir.
+    Returns True if upload succeeded (modal closed), False on failure.
     """
-    if not image_paths:
+    if not file_paths:
         return True
 
-    # 1) "+ Add sources" butonuna bas (notebook içinde, sources panel header'ında)
+    # 1) "+ Add sources" butonuna bas
     add_loc = _find_first_visible(page, ADD_SOURCES_SELECTORS, timeout_ms=20000)
     if add_loc is None:
-        emitter.emit("add_sources_button_not_found")
-        _take_screenshot(page, screenshots_dir, f"{job_id}_no_add_sources")
+        emitter.emit("add_sources_button_not_found", label=label)
+        _take_screenshot(page, screenshots_dir, f"{job_id}_no_add_sources_{label}")
         return False
     if not _click_with_fallback(add_loc, page):
-        emitter.emit("add_sources_click_failed")
+        emitter.emit("add_sources_click_failed", label=label)
         return False
-    emitter.emit("add_sources_clicked")
+    emitter.emit("add_sources_clicked", label=label)
 
     # 2) Modal açılsın diye küçük bekleme
     time.sleep(1.5)
 
-    # 3) Dialog içindeki file input'u bul ve dosyaları yükle.
-    # Hidden input olabilir (state="attached" kullan, "visible" değil).
+    # 3) Dialog içindeki file input'u bul (hidden olabilir)
     file_input_selectors = [
         '[role="dialog"] input[type="file"]',
         'mat-dialog-container input[type="file"]',
@@ -751,34 +804,31 @@ def upload_image_sources(
             cand = page.locator(sel).first
             cand.wait_for(state="attached", timeout=5000)
             file_input = cand
-            emitter.emit("file_input_found", selector=sel)
+            emitter.emit("file_input_found", selector=sel, label=label)
             break
         except Exception:
             continue
     if file_input is None:
-        emitter.emit("file_input_not_found")
-        _take_screenshot(page, screenshots_dir, f"{job_id}_no_file_input")
+        emitter.emit("file_input_not_found", label=label)
+        _take_screenshot(page, screenshots_dir, f"{job_id}_no_file_input_{label}")
         return False
 
-    # 4) Dosyaları toplu upload (set_input_files multiple kabul ediyor)
-    paths_str = [str(p.resolve()) for p in image_paths if p.exists()]
+    # 4) Toplu upload
+    paths_str = [str(p.resolve()) for p in file_paths if p.exists()]
     if not paths_str:
-        emitter.emit("no_valid_image_paths")
+        emitter.emit("no_valid_file_paths", label=label)
         return False
     try:
         file_input.set_input_files(paths_str)
-        emitter.emit("files_set", count=len(paths_str))
+        emitter.emit("files_set", count=len(paths_str), label=label)
     except Exception as e:
-        emitter.emit("set_input_files_failed", error=str(e))
-        _take_screenshot(page, screenshots_dir, f"{job_id}_upload_fail")
+        emitter.emit("set_input_files_failed", error=str(e), label=label)
+        _take_screenshot(page, screenshots_dir, f"{job_id}_upload_fail_{label}")
         return False
 
-    # 5) Upload tamamlanmasını bekle.
-    # Sinyal: dialog kapansın (auto-close after upload), ya da source list
-    # büyüsün. Strateji: önce 5sn fixed wait, sonra modal görünmüyorsa OK kabul.
+    # 5) Upload tamamlanmasını bekle (modal kapanması signal)
     time.sleep(5)
-
-    deadline = time.time() + 120  # max 2 dk
+    deadline = time.time() + 180  # max 3 dk (PDF/image karışık olabilir)
     last_emit = 0
     while time.time() < deadline:
         modal_visible = False
@@ -790,24 +840,122 @@ def upload_image_sources(
             except Exception:
                 continue
         if not modal_visible:
-            emitter.emit("upload_modal_closed")
+            emitter.emit("upload_modal_closed", label=label)
             return True
-        if time.time() - last_emit > 10:
-            emitter.emit("upload_in_progress",
-                         elapsed=int(time.time() - (deadline - 120)))
+        if time.time() - last_emit > 15:
+            emitter.emit("upload_in_progress", label=label,
+                         elapsed=int(time.time() - (deadline - 180)))
             last_emit = time.time()
         time.sleep(2)
 
-    # Timeout — modal hâlâ açık. Yine de devam etmeyi dene (görsel'ler işlenmiş
-    # olabilir). Modal'i manuel kapatmaya çalış (X butonu / Esc).
-    emitter.emit("upload_timeout_modal_still_open")
-    _take_screenshot(page, screenshots_dir, f"{job_id}_upload_timeout")
+    emitter.emit("upload_timeout_modal_still_open", label=label)
+    _take_screenshot(page, screenshots_dir, f"{job_id}_upload_timeout_{label}")
     try:
         page.keyboard.press("Escape")
         time.sleep(1)
     except Exception:
         pass
-    return True  # best-effort: continue, kullanıcı admin panelden görür
+    return True
+
+
+# Backward-compat alias — önceki adıyla çağrılan varsa
+def upload_image_sources(page, image_paths, emitter, screenshots_dir, job_id):
+    return upload_files_to_notebook(
+        page, image_paths, emitter, screenshots_dir, job_id, label="images"
+    )
+
+
+def apply_custom_prompt_to_cinematic_dialog(
+    page,
+    custom_prompt: str,
+    emitter: EventEmitter,
+    screenshots_dir: Path,
+    job_id: str,
+) -> bool:
+    """Customize Video Overview dialog AÇIKKEN, Custom Prompt alanını doldurur.
+
+    NotebookLM 2 farklı UI'a sahip olabilir:
+    (a) Customize dialog içinde ayrı bir "Custom prompt" textarea hazır
+    (b) "Custom prompt" butonu var → ona basınca yeni dialog açılıyor
+
+    Önce (a)'yı dene, sonra (b)'yi.
+    Returns True if applied, False otherwise (caller fallback yapabilir).
+    """
+    if not custom_prompt.strip():
+        return True
+
+    # Strategy A: Mevcut dialog'da textarea bul ve doldur
+    # NotebookLM Customize dialog'u genelde tek textarea'lı, oraya custom prompt
+    # girilebiliyor. Description input ile aynı element olabilir.
+    direct_loc = None
+    for sel in CUSTOM_PROMPT_INPUT_SELECTORS:
+        try:
+            cand = page.locator(sel).first
+            cand.wait_for(state="visible", timeout=2000)
+            direct_loc = cand
+            emitter.emit("custom_prompt_input_found_direct", selector=sel)
+            break
+        except Exception:
+            continue
+
+    # Strategy B: Eğer A çalışmadıysa "Custom prompt" butonuna bas
+    if direct_loc is None:
+        btn_loc = _find_first_visible(
+            page, CUSTOM_PROMPT_BUTTON_SELECTORS, timeout_ms=3000
+        )
+        if btn_loc is not None and _click_with_fallback(btn_loc, page):
+            emitter.emit("custom_prompt_button_clicked")
+            time.sleep(1.0)
+            for sel in CUSTOM_PROMPT_INPUT_SELECTORS:
+                try:
+                    cand = page.locator(sel).first
+                    cand.wait_for(state="visible", timeout=3000)
+                    direct_loc = cand
+                    emitter.emit("custom_prompt_input_found_via_button", selector=sel)
+                    break
+                except Exception:
+                    continue
+
+    if direct_loc is None:
+        emitter.emit("custom_prompt_input_not_found")
+        _take_screenshot(page, screenshots_dir, f"{job_id}_no_custom_prompt_input")
+        return False
+
+    # Doldur — clear + fill
+    try:
+        try:
+            direct_loc.fill("", timeout=2000)
+        except Exception:
+            pass
+        # Çok uzun olabilir, timeout'u uzat
+        direct_loc.fill(custom_prompt, timeout=15000)
+        emitter.emit("custom_prompt_filled", chars=len(custom_prompt))
+    except Exception as e:
+        # contenteditable fallback
+        try:
+            direct_loc.click()
+            page.keyboard.press("Control+A")
+            page.keyboard.press("Delete")
+            page.keyboard.insert_text(custom_prompt)
+            emitter.emit("custom_prompt_filled_kb", chars=len(custom_prompt))
+        except Exception as e2:
+            emitter.emit("custom_prompt_fill_failed", error=str(e), error2=str(e2))
+            _take_screenshot(page, screenshots_dir, f"{job_id}_prompt_fill_fail")
+            return False
+
+    # Eğer ayrı bir custom prompt dialog açıldıysa onu kaydedip kapat
+    save_loc = _find_first_visible(
+        page, CUSTOM_PROMPT_SAVE_SELECTORS, timeout_ms=1500
+    )
+    if save_loc is not None:
+        try:
+            _click_with_fallback(save_loc, page)
+            emitter.emit("custom_prompt_saved")
+            time.sleep(0.8)
+        except Exception:
+            pass
+
+    return True
 
 
 def run_automation(
@@ -821,6 +969,9 @@ def run_automation(
     download_dir: Path,
     screenshots_dir: Path,
     image_paths: Optional[list[Path]] = None,
+    script_file: Optional[Path] = None,
+    style_guide_paths: Optional[list[Path]] = None,
+    custom_prompt: str = "",
 ) -> int:
     from playwright.sync_api import sync_playwright
 
@@ -924,97 +1075,160 @@ def run_automation(
                 raise RuntimeError("Create new butonuna tıklanamadı")
             emitter.emit("create_clicked")
 
-            # Source seçim ekranı: Copied text
-            copied_loc = _find_first_visible(page, COPIED_TEXT_SELECTORS, timeout_ms=20000)
-            if copied_loc is None:
-                emitter.emit("copied_text_not_found")
-                _take_screenshot(page, screenshots_dir, f"{job_id}_no_copied_text")
-                raise RuntimeError("Copied text butonu bulunamadı")
-            if not _click_with_fallback(copied_loc, page):
-                raise RuntimeError("Copied text butonuna tıklanamadı")
-            emitter.emit("copied_text_clicked")
+            # ===== Phase E: 2 farklı akış =====
+            # (a) script_file verilmişse: ilk source'u "Upload files"'tan yükle
+            #     (script + style guides + images bir arada). Custom prompt için
+            #     source isimleri filename'den geliyor, "Copied text" auto-name
+            #     verir (kontrol edemeyiz). Bu yüzden file upload tercih.
+            # (b) Yoksa eski akış: "Copied text" → text yapıştır (legacy / dev test)
 
-            # Açılan dialog'da textarea / contenteditable bul, metni yapıştır
-            text_loc = None
-            for sel in (
-                '[role="dialog"] textarea',
-                '[role="dialog"] [contenteditable="true"]',
-                'textarea',
-                '[contenteditable="true"]',
-            ):
-                try:
-                    candidate = page.locator(sel).first
-                    candidate.wait_for(state="visible", timeout=5000)
-                    text_loc = candidate
-                    break
-                except Exception:
-                    continue
-            if text_loc is None:
-                emitter.emit("text_input_not_found")
-                _take_screenshot(page, screenshots_dir, f"{job_id}_no_textarea")
-                raise RuntimeError("Metin alanı bulunamadı")
+            if script_file is not None and script_file.exists():
+                # YENİ AKIŞ: ilk modal'da "Upload files" → script.txt + (varsa)
+                # style guides + images hep birlikte yükle. NotebookLM dosya
+                # ismini source ismi olarak kullanıyor, custom prompt'tan ref edilebilir.
+                emitter.emit("flow_mode", mode="upload_files_pack")
 
-            try:
-                text_loc.fill(text, timeout=10000)
-            except Exception:
-                # contenteditable için fill bazen çalışmıyor — keyboard fallback
+                # İlk modal otomatik açılıyor (Create new sonrası source seçim).
+                # Bu modal'da hidden input[type=file] mevcut.
+                first_files: list[Path] = [script_file]
+                if style_guide_paths:
+                    first_files.extend([p for p in style_guide_paths if p.exists()])
+                if image_paths:
+                    first_files.extend([p for p in image_paths if p.exists()])
+
+                # File input'u bul (modal henüz açık olmalı)
+                file_input = None
+                for sel in (
+                    '[role="dialog"] input[type="file"]',
+                    'mat-dialog-container input[type="file"]',
+                    '.cdk-overlay-pane input[type="file"]',
+                    'input[type="file"]',
+                ):
+                    try:
+                        cand = page.locator(sel).first
+                        cand.wait_for(state="attached", timeout=8000)
+                        file_input = cand
+                        emitter.emit("first_modal_file_input_found", selector=sel)
+                        break
+                    except Exception:
+                        continue
+                if file_input is None:
+                    emitter.emit("first_modal_file_input_not_found")
+                    _take_screenshot(page, screenshots_dir, f"{job_id}_no_first_modal_input")
+                    raise RuntimeError("İlk modal'da file input bulunamadı")
+
+                paths_str = [str(p.resolve()) for p in first_files if p.exists()]
+                emitter.emit("first_modal_uploading",
+                             count=len(paths_str),
+                             files=[Path(p).name for p in paths_str])
                 try:
-                    text_loc.click()
-                    page.keyboard.insert_text(text)
+                    file_input.set_input_files(paths_str)
                 except Exception as e:
-                    raise RuntimeError(f"Metin yapıştırma başarısız: {e}")
-            emitter.emit("text_inserted", chars=len(text))
+                    emitter.emit("first_modal_upload_failed", error=str(e))
+                    _take_screenshot(page, screenshots_dir, f"{job_id}_first_upload_fail")
+                    raise RuntimeError(f"Toplu upload başarısız: {e}")
+                emitter.emit("first_modal_files_set", count=len(paths_str))
 
-            # Insert butonu
-            insert_loc = _find_first_visible(page, INSERT_BUTTON_SELECTORS, timeout_ms=10000)
-            if insert_loc is None:
-                emitter.emit("insert_button_not_found")
-                _take_screenshot(page, screenshots_dir, f"{job_id}_no_insert")
-                raise RuntimeError("Insert butonu bulunamadı")
-            if not _click_with_fallback(insert_loc, page):
-                raise RuntimeError("Insert butonu tıklanamadı")
-            emitter.emit("insert_clicked")
+                # Notebook URL'i yakala (upload tamamlanınca redirect olur)
+                try:
+                    page.wait_for_url(re.compile(r".*/notebook/[^/?#]+"), timeout=180000)
+                except Exception:
+                    pass
 
-            # Notebook URL'i yakalamak için biraz bekle (URL /notebook/<id>'ye dönecek)
-            try:
-                page.wait_for_url(re.compile(r".*/notebook/[^/?#]+"), timeout=60000)
-            except Exception:
-                # bazen URL hızlı değişmiyor, devam et — sonra tekrar al
-                pass
+                cur = page.url or ""
+                m = re.search(r"/notebook/([^/?#]+)", cur)
+                if m:
+                    authuser_part = f"?authuser={authuser}"
+                    notebook_url = f"https://notebooklm.google.com/notebook/{m.group(1)}{authuser_part}"
+                    emitter.emit("notebook_created", notebook_url=notebook_url)
 
-            cur = page.url or ""
-            m = re.search(r"/notebook/([^/?#]+)", cur)
-            if m:
-                # authuser query param'ını koru
-                authuser_part = f"?authuser={authuser}"
-                notebook_url = f"https://notebooklm.google.com/notebook/{m.group(1)}{authuser_part}"
-                emitter.emit("notebook_created", notebook_url=notebook_url)
+                # Source'ların processing'i bitsin (PDF/image ingest)
+                # Source listesi büyük ise 30-60 sn alabilir
+                wait_secs = 12 + 3 * len(paths_str)
+                emitter.emit("waiting_source_ingest", expected_secs=wait_secs)
+                time.sleep(min(wait_secs, 60))
+
+            else:
+                # ESKI AKIŞ (legacy): Copied text → text yapıştır
+                emitter.emit("flow_mode", mode="copied_text_legacy")
+
+                copied_loc = _find_first_visible(page, COPIED_TEXT_SELECTORS, timeout_ms=20000)
+                if copied_loc is None:
+                    emitter.emit("copied_text_not_found")
+                    _take_screenshot(page, screenshots_dir, f"{job_id}_no_copied_text")
+                    raise RuntimeError("Copied text butonu bulunamadı")
+                if not _click_with_fallback(copied_loc, page):
+                    raise RuntimeError("Copied text butonuna tıklanamadı")
+                emitter.emit("copied_text_clicked")
+
+                text_loc = None
+                for sel in (
+                    '[role="dialog"] textarea',
+                    '[role="dialog"] [contenteditable="true"]',
+                    'textarea',
+                    '[contenteditable="true"]',
+                ):
+                    try:
+                        candidate = page.locator(sel).first
+                        candidate.wait_for(state="visible", timeout=5000)
+                        text_loc = candidate
+                        break
+                    except Exception:
+                        continue
+                if text_loc is None:
+                    emitter.emit("text_input_not_found")
+                    _take_screenshot(page, screenshots_dir, f"{job_id}_no_textarea")
+                    raise RuntimeError("Metin alanı bulunamadı")
+
+                try:
+                    text_loc.fill(text, timeout=10000)
+                except Exception:
+                    try:
+                        text_loc.click()
+                        page.keyboard.insert_text(text)
+                    except Exception as e:
+                        raise RuntimeError(f"Metin yapıştırma başarısız: {e}")
+                emitter.emit("text_inserted", chars=len(text))
+
+                insert_loc = _find_first_visible(page, INSERT_BUTTON_SELECTORS, timeout_ms=10000)
+                if insert_loc is None:
+                    emitter.emit("insert_button_not_found")
+                    _take_screenshot(page, screenshots_dir, f"{job_id}_no_insert")
+                    raise RuntimeError("Insert butonu bulunamadı")
+                if not _click_with_fallback(insert_loc, page):
+                    raise RuntimeError("Insert butonu tıklanamadı")
+                emitter.emit("insert_clicked")
+
+                try:
+                    page.wait_for_url(re.compile(r".*/notebook/[^/?#]+"), timeout=60000)
+                except Exception:
+                    pass
+
+                cur = page.url or ""
+                m = re.search(r"/notebook/([^/?#]+)", cur)
+                if m:
+                    authuser_part = f"?authuser={authuser}"
+                    notebook_url = f"https://notebooklm.google.com/notebook/{m.group(1)}{authuser_part}"
+                    emitter.emit("notebook_created", notebook_url=notebook_url)
+
+                # Legacy mode: image_paths varsa şimdi "+ Add sources" ile ekle
+                if image_paths:
+                    emitter.emit("legacy_image_upload_starting", count=len(image_paths))
+                    upload_files_to_notebook(
+                        page=page, file_paths=image_paths,
+                        emitter=emitter, screenshots_dir=screenshots_dir,
+                        job_id=job_id, label="images",
+                    )
+                    time.sleep(4)
 
             # Studio paneli yüklensin diye küçük bir bekleme
             time.sleep(3)
 
-            # Phase E: Eğer image source'lar varsa, Cinematic generate'den ÖNCE
-            # bunları "+ Add sources" → "Upload files" akışıyla yükle.
-            # Cinematic, source'ları input olarak kullanıyor (script + görseller).
-            if image_paths:
-                emitter.emit(
-                    "image_upload_starting",
-                    count=len(image_paths),
-                    paths=[str(p) for p in image_paths],
-                )
-                up_ok = upload_image_sources(
-                    page=page,
-                    image_paths=image_paths,
-                    emitter=emitter,
-                    screenshots_dir=screenshots_dir,
-                    job_id=job_id,
-                )
-                emitter.emit("image_upload_done", success=up_ok)
-                # Source list refresh + Studio panel re-render için biraz bekle
-                time.sleep(4)
-
             # Cinematic Video Overview seç ve Generate'e bas
-            ok = select_cinematic_video_overview(page, emitter, screenshots_dir, job_id)
+            ok = select_cinematic_video_overview(
+                page, emitter, screenshots_dir, job_id,
+                custom_prompt=custom_prompt or "",
+            )
             if not ok:
                 emitter.emit("video_generation_failed_in_dialog")
                 # yine de notebook_url'i dön — kullanıcı manuel devam edebilir
@@ -1461,6 +1675,25 @@ def main(argv: Optional[list[str]] = None) -> int:
         default=[],
         help="Notebook'a Add Sources → Upload akışıyla yüklenecek görsel dosya path'leri",
     )
+    # Phase E: script'i .txt dosyasından yükle (Copied text yerine)
+    parser.add_argument(
+        "--script-file",
+        default="",
+        help="Script .txt dosyası — varsa Copied text yerine ilk source olarak upload edilir.",
+    )
+    # Phase E: admin'in style guide kütüphanesi (PDF/MD/DOCX vs.)
+    parser.add_argument(
+        "--style-guides",
+        nargs="*",
+        default=[],
+        help="Notebook'a attach edilecek reusable style guide dosyaları",
+    )
+    # Phase E: Cinematic Customize → Custom Prompt'a yapışacak metin
+    parser.add_argument(
+        "--custom-prompt-file",
+        default="",
+        help="Custom prompt'u dosyadan oku (CLI escape sorunlarını ortadan kaldırır)",
+    )
     args = parser.parse_args(argv)
 
     profile_dir = Path(args.profile_dir).resolve()
@@ -1494,8 +1727,11 @@ def main(argv: Optional[list[str]] = None) -> int:
             screenshots_dir=screenshots_dir,
         )
 
-    if not args.text.strip():
-        emitter.emit("error", message="text boş — automation modunda gerekli")
+    # Phase E: text boş olabilir (script_file ile yüklenecekse). En az birinden
+    # script gelmeli.
+    if not args.text.strip() and not args.script_file:
+        emitter.emit("error",
+                     message="text ya da --script-file gerekli (automation modunda)")
         return 64
 
     image_paths: list[Path] = []
@@ -1505,6 +1741,31 @@ def main(argv: Optional[list[str]] = None) -> int:
             image_paths.append(p)
         else:
             emitter.emit("image_path_skipped", path=str(p), reason="not_found")
+
+    style_guide_paths: list[Path] = []
+    for gp in (args.style_guides or []):
+        p = Path(gp).resolve()
+        if p.exists() and p.is_file():
+            style_guide_paths.append(p)
+        else:
+            emitter.emit("style_guide_skipped", path=str(p), reason="not_found")
+
+    script_file: Optional[Path] = None
+    if args.script_file:
+        p = Path(args.script_file).resolve()
+        if p.exists() and p.is_file():
+            script_file = p
+        else:
+            emitter.emit("script_file_skipped", path=str(p), reason="not_found")
+
+    custom_prompt = ""
+    if args.custom_prompt_file:
+        p = Path(args.custom_prompt_file).resolve()
+        if p.exists() and p.is_file():
+            try:
+                custom_prompt = p.read_text(encoding="utf-8")
+            except OSError as e:
+                emitter.emit("custom_prompt_read_failed", error=str(e))
 
     return run_automation(
         text=args.text,
@@ -1517,6 +1778,9 @@ def main(argv: Optional[list[str]] = None) -> int:
         download_dir=download_dir,
         screenshots_dir=screenshots_dir,
         image_paths=image_paths or None,
+        script_file=script_file,
+        style_guide_paths=style_guide_paths or None,
+        custom_prompt=custom_prompt,
     )
 
 

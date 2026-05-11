@@ -83,8 +83,9 @@ class NlmError(Exception):
 def extract_nlm_cookies(auth_json_path: Path) -> str:
     """Playwright storage_state JSON'dan nlm-uyumlu cookie string'i üretir.
 
-    Format: 'name1=value1; name2=value2; ...'
-    En az SID + HSID + SSID + APISID + SAPISID bulunmalı; yoksa NlmError.
+    Tüm Google domain cookie'lerini birleştir — sadece SID/HSID/SSID değil,
+    Google'ın iç servisleri farklı cookie'lere bakıyor (NID, AEC, OTZ, vs.).
+    En az SID + HSID + SSID + APISID + SAPISID bulunmalı (sanity check).
     """
     if not auth_json_path.exists():
         raise NlmError(f"auth.json bulunamadı: {auth_json_path}")
@@ -95,16 +96,25 @@ def extract_nlm_cookies(auth_json_path: Path) -> str:
         raise NlmError(f"auth.json okunamadı: {e}")
 
     cookies = data.get("cookies") or []
+    # Tüm Google domain'leri (.google.com, accounts.google.com, notebooklm vs.)
     pairs: dict[str, str] = {}
     for c in cookies:
         name = c.get("name", "")
         value = c.get("value", "")
-        domain = c.get("domain", "")
-        # Sadece Google domain'lerindeki cookie'leri al
-        if not domain or "google" not in domain:
+        domain = (c.get("domain", "") or "").lower()
+        if not name or value is None:
             continue
-        if name in _REQUIRED_COOKIES or name in _OPTIONAL_COOKIES:
-            # Aynı isimle birden çok domain'de varsa, sonuncusu kazansın
+        if not domain:
+            continue
+        # Google ve alt-domain'leri kabul
+        if not ("google.com" in domain or "googleapis.com" in domain
+                or "gstatic.com" in domain):
+            continue
+        # Aynı isimde başka domain'den varsa root (.google.com) tercihen
+        # önce kayıt — ama .google.com değer büyük şans daha doğru.
+        if name in pairs and domain.startswith(".google.com"):
+            pairs[name] = value
+        elif name not in pairs:
             pairs[name] = value
 
     missing = [n for n in _REQUIRED_COOKIES if n not in pairs]

@@ -46,6 +46,25 @@ except ImportError:
 
 import streamlit as st
 
+# Phase 3: tmc/nlm wrapper — NotebookLM internal API üzerinden source upload +
+# create-video. Playwright DOM scraping yerine kullanılır. Import erken
+# yapılmalı (worker thread'leri spawn etmeden önce module hazır olsun).
+try:
+    from nlm_client import (
+        NlmError,
+        extract_nlm_cookies,
+        fetch_nlm_auth_token,
+        nlm_create_notebook,
+        nlm_source_add,
+        nlm_create_video,
+        notebook_web_url,
+        nlm_smoke_test,
+    )
+    _NLM_AVAILABLE = True
+except ImportError as _nlm_imp_err:
+    _NLM_AVAILABLE = False
+    _nlm_imp_err_msg = str(_nlm_imp_err)
+
 # ---------------------------------------------------------------------------
 # Sabitler ve yollar
 # ---------------------------------------------------------------------------
@@ -1644,31 +1663,64 @@ class Worker:
         log_path = job_log_path(job.id)
         log_path.parent.mkdir(parents=True, exist_ok=True)
 
+        # Submit path seçimi: USE_PLAYWRIGHT_SUBMIT=1 → eski Playwright path;
+        # default (yokken) → tmc/nlm CLI path (daha hızlı, daha stabil).
+        use_playwright = os.environ.get("USE_PLAYWRIGHT_SUBMIT", "").strip() == "1"
+        if not _NLM_AVAILABLE:
+            use_playwright = True  # nlm_client import edilemediyse zorunlu fallback
+
         try:
             log_fp = log_path.open("w", encoding="utf-8", buffering=1)
             log_fp.write(f"# Job {job.id} — Profile {profile.name} ({profile.id})\n")
-            log_fp.write(f"# Cmd: {' '.join(cmd)}\n\n")
-            log_fp.flush()
-            proc = subprocess.Popen(
-                cmd,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.STDOUT,
-                cwd=str(APP_DIR),
-                text=True,
-                bufsize=1,
-            )
-            job.pid = proc.pid
-            with self._proc_lock:
-                self._procs[job.id] = proc
-            # stdout reader thread başlat — JSON event'leri parse etsin
-            t = threading.Thread(
-                target=self._stdout_reader,
-                args=(job.id, proc, log_fp),
-                name=f"stdout-{job.id}",
-                daemon=True,
-            )
-            t.start()
-            launcher_log(f"Job {job.id} launched on profile {profile.name} (pid={proc.pid})")
+
+            if use_playwright:
+                # ===== LEGACY Playwright submit path =====
+                log_fp.write(f"# Submit path: Playwright (subprocess automator)\n")
+                log_fp.write(f"# Cmd: {' '.join(cmd)}\n\n")
+                log_fp.flush()
+                proc = subprocess.Popen(
+                    cmd,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.STDOUT,
+                    cwd=str(APP_DIR),
+                    text=True,
+                    bufsize=1,
+                )
+                job.pid = proc.pid
+                with self._proc_lock:
+                    self._procs[job.id] = proc
+                t = threading.Thread(
+                    target=self._stdout_reader,
+                    args=(job.id, proc, log_fp),
+                    name=f"stdout-{job.id}",
+                    daemon=True,
+                )
+                t.start()
+                launcher_log(
+                    f"Job {job.id} launched via Playwright on profile "
+                    f"{profile.name} (pid={proc.pid})"
+                )
+            else:
+                # ===== NEW: tmc/nlm CLI submit path =====
+                log_fp.write(f"# Submit path: nlm CLI (tmc/nlm via subprocess)\n")
+                log_fp.write(
+                    f"# Files: script={script_path}, "
+                    f"images={len(image_paths)}, "
+                    f"prompt_chars={len(job.custom_prompt or '')}\n\n"
+                )
+                log_fp.flush()
+                t = threading.Thread(
+                    target=self._run_job_via_nlm,
+                    args=(job.id, profile, script_path, image_paths,
+                          job.custom_prompt or "", log_fp),
+                    name=f"nlm-{job.id}",
+                    daemon=True,
+                )
+                t.start()
+                launcher_log(
+                    f"Job {job.id} launched via nlm on profile "
+                    f"{profile.name} (thread)"
+                )
         except Exception as e:
             job.status = "failed"
             job.error = f"Launch failed: {e!r}"
@@ -1690,6 +1742,191 @@ class Worker:
                 profiles_all[i] = p
                 break
         save_profiles(profiles_all)
+
+    def _run_job_via_nlm(self, job_id: str, profile: "Profile",
+                          script_path: Optional[Path],
+                          image_paths: list[Path],
+                          custom_prompt: str,
+                          log_fp) -> None:
+        """tmc/nlm CLI üzerinden notebook create + sources upload + create-video.
+
+        Bu fonksiyon Worker thread'inde çalışır. nlm subprocess çağrıları senkron
+        (her biri saniyeler). Job state'i nlm event'leri yerine direkt
+        _apply_event() ile güncellenir (compat path).
+        """
+        import traceback as _tb
+        try:
+            # Auth setup
+            auth_json = PROFILES_DIR / profile.id / "auth.json"
+            if not auth_json.exists():
+                raise NlmError(
+                    f"auth.json yok: {auth_json}. Profile init et."
+                )
+            cookies = extract_nlm_cookies(auth_json)
+            log_fp.write(f"## auth: cookies extracted ({len(cookies)} chars)\n")
+            log_fp.flush()
+            try:
+                auth_token = fetch_nlm_auth_token(cookies, authuser=profile.authuser)
+                log_fp.write(f"## auth: token fetched ({auth_token[:6]}…{auth_token[-4:]})\n")
+            except NlmError as e:
+                # Token expired ya da cookie geçersiz — Playwright init gerek
+                log_fp.write(f"## auth FAIL: {e}\n")
+                log_fp.flush()
+                self._apply_event(job_id, {
+                    "type": "automation_error",
+                    "error": f"NLM auth: {str(e)[:200]}",
+                })
+                # Job'ı failed olarak işaretle
+                jobs_all = load_jobs()
+                for j in jobs_all:
+                    if j.id == job_id:
+                        j.status = "failed"
+                        j.error = f"NLM auth: {str(e)[:200]}"
+                        j.finished_at = time.time()
+                        # auth.json'u sil ki "Hesabı aktive et" tekrar gözüksün
+                        try:
+                            auth_json.unlink()
+                        except OSError:
+                            pass
+                        # Profile'i initialized=False yap
+                        try:
+                            ps = load_profiles()
+                            for p in ps:
+                                if p.id == profile.id:
+                                    p.initialized = False
+                                    break
+                            save_profiles(ps)
+                        except Exception:
+                            pass
+                        break
+                save_jobs(jobs_all)
+                return
+            log_fp.flush()
+
+            # 1) Notebook create
+            title = (load_jobs() and next(
+                (j.title for j in load_jobs() if j.id == job_id), "Untitled"
+            )) or "Untitled"
+            try:
+                nb_id = nlm_create_notebook(
+                    title, cookies, auth_token=auth_token,
+                    authuser=profile.authuser,
+                )
+            except NlmError as e:
+                # Kota dolması bu yolla gelebilir
+                msg = str(e).lower()
+                if "kota" in msg or "limit" in msg or "quota" in msg:
+                    log_fp.write(f"## NLM quota: {e}\n")
+                    self._apply_event(job_id, {"type": "quota_exceeded", "raw": str(e)})
+                    log_fp.flush()
+                    return
+                raise
+            notebook_url = notebook_web_url(nb_id, authuser=profile.authuser)
+            log_fp.write(f"## NLM notebook created: {nb_id}\n")
+            log_fp.write(f"## URL: {notebook_url}\n")
+            log_fp.flush()
+            self._apply_event(job_id, {
+                "type": "notebook_created", "notebook_url": notebook_url,
+            })
+
+            # 2) Sources upload (script + images, sırasıyla)
+            sources_to_upload: list[Path] = []
+            if script_path and script_path.exists():
+                sources_to_upload.append(script_path)
+            for p in (image_paths or []):
+                if isinstance(p, Path) and p.exists():
+                    sources_to_upload.append(p)
+
+            n_ok, n_fail = 0, 0
+            for i, src in enumerate(sources_to_upload):
+                log_fp.write(
+                    f"## Uploading source [{i+1}/{len(sources_to_upload)}]: "
+                    f"{src.name} ({src.stat().st_size // 1024} KB)\n"
+                )
+                log_fp.flush()
+                try:
+                    src_id = nlm_source_add(
+                        nb_id, src, cookies, auth_token=auth_token,
+                        authuser=profile.authuser, timeout=300,
+                    )
+                    log_fp.write(f"##   → source_id={src_id}\n")
+                    n_ok += 1
+                except NlmError as e:
+                    log_fp.write(f"##   → FAILED: {str(e)[:200]}\n")
+                    n_fail += 1
+                    # Devam et — kısmi sources daha iyi sonuçtan vazgeçmek
+                log_fp.flush()
+            log_fp.write(f"## Sources summary: {n_ok} OK, {n_fail} failed\n")
+
+            if n_ok == 0:
+                # Hiç source yüklenememişse — fail
+                raise NlmError(
+                    f"Tüm source upload'ları başarısız ({len(sources_to_upload)} dosya). "
+                    f"Bu notebook boş kalır, generation anlamsız."
+                )
+
+            # 3) create-video
+            log_fp.write(f"## Creating Cinematic Video Overview...\n")
+            log_fp.flush()
+            try:
+                out = nlm_create_video(
+                    nb_id, custom_prompt, cookies, auth_token=auth_token,
+                    authuser=profile.authuser, timeout=60,
+                )
+                log_fp.write(f"## create-video output: {out[:400]}\n")
+            except NlmError as e:
+                log_fp.write(f"## create-video FAILED: {e}\n")
+                # Notebook oluşturuldu, sources yüklendi, ama generate fail —
+                # kullanıcı manuel olarak NotebookLM'den Cinematic'i tetikleyebilir
+                raise
+            log_fp.flush()
+
+            # 4) Başarı — automation_complete event'i (status=generating)
+            self._apply_event(job_id, {
+                "type": "automation_complete",
+                "exit_code": 0,
+                "notebook_url": notebook_url,
+            })
+            log_fp.write(f"## ALL DONE — job status=generating, harvest will pick up.\n")
+            log_fp.flush()
+
+        except NlmError as e:
+            log_fp.write(f"## NLM ERROR: {e}\n")
+            if e.stderr:
+                log_fp.write(f"##   stderr: {e.stderr[:400]}\n")
+            log_fp.flush()
+            self._apply_event(job_id, {
+                "type": "automation_error", "error": str(e)[:300],
+            })
+            jobs_all = load_jobs()
+            for j in jobs_all:
+                if j.id == job_id and j.status not in ("queued",):
+                    j.status = "failed"
+                    if not j.error:
+                        j.error = f"NLM: {str(e)[:200]}"
+                    j.finished_at = time.time()
+                    break
+            save_jobs(jobs_all)
+        except Exception as e:
+            log_fp.write(
+                f"## Unexpected error: {type(e).__name__}: {e}\n"
+            )
+            log_fp.write(_tb.format_exc() + "\n")
+            log_fp.flush()
+            jobs_all = load_jobs()
+            for j in jobs_all:
+                if j.id == job_id and j.status not in ("queued",):
+                    j.status = "failed"
+                    if not j.error:
+                        j.error = f"{type(e).__name__}: {str(e)[:200]}"
+                    j.finished_at = time.time()
+                    break
+            save_jobs(jobs_all)
+        finally:
+            try:
+                log_fp.close()
+            except Exception:
+                pass
 
     def _stdout_reader(self, job_id: str, proc: subprocess.Popen, log_fp) -> None:
         """Subprocess stdout'unu satır satır oku, ##JSON## event'lerini parse et."""

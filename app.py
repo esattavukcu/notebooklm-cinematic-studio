@@ -254,6 +254,11 @@ class Job:
     # Phase E: Custom Prompt + style guide source listesi (audit ve admin display için)
     custom_prompt: str = ""          # NotebookLM Cinematic Customize → Custom Prompt'a yapışan metin
     style_guides_used: list = field(default_factory=list)  # [filename, ...] — submit anında attach edilenler
+    # Phase 4: Video Edit / Revize — bu job başka bir job'ı revize ediyorsa
+    parent_job_id: str = ""              # Hangi job'ı revize ediyor (boş = orijinal)
+    revision_instructions: str = ""      # "Ne değişsin?" (user'ın yazdığı revize prompt'u)
+    revision_video_url: str = ""         # Parent'in Azure URL'si (download için referans)
+    revision_video_local: str = ""       # İndirilen MP4'ün lokal path'i (job_assets/<id>/_parent.mp4)
     # Harvest (video collection) fields
     video_url: str = ""              # NotebookLM tarafındaki direkt <video src> URL
     video_local_path: str = ""       # data/downloads/<job_id>.mp4 (relative)
@@ -1270,6 +1275,28 @@ def download_image(url: str, dest_dir: Path, name_prefix: str,
         return None
 
 
+def download_video_for_revision(url: str, dest_path: Path,
+                                 timeout: int = 300) -> Optional[Path]:
+    """Revize için parent video MP4'ünü Azure URL'sinden indir.
+
+    Azure SAS URL'leri public — auth gerekmez (SAS token URL'de). Büyük
+    dosyalar (40-50MB) için stream-based write.
+    """
+    if not url or not url.startswith(("http://", "https://")):
+        return None
+    dest_path.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        req = urllib.request.Request(url, headers=_DOWNLOAD_HEADERS)
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            with dest_path.open("wb") as out:
+                shutil.copyfileobj(r, out, length=1024 * 64)
+        if dest_path.exists() and dest_path.stat().st_size > 10_000:
+            return dest_path
+        return None
+    except Exception:
+        return None
+
+
 def download_job_images(job_id: str, assets: list) -> list[Path]:
     """Job'ın selected_image'lerini paralel indir, local path listesi döndür.
 
@@ -1597,10 +1624,39 @@ class Worker:
         job_pack_dir = JOB_ASSETS_DIR / job.id
         job_pack_dir.mkdir(parents=True, exist_ok=True)
 
-        # 1) Script'i .txt olarak yaz — NotebookLM'de "Script.txt" görünecek
-        # Custom prompt'taki source listing ile eşleşmesi için title prefix:
+        # ===== Phase 4: Revision job — parent video MP4'ünü indir =====
+        # Bu, image_paths'in BAŞINA eklenecek (ilk source önceki video olsun)
+        revision_video_path: Optional[Path] = None
+        if job.parent_job_id and job.revision_video_url:
+            launcher_log(
+                f"Job {job.id}: revision → parent video indiriliyor "
+                f"({job.revision_video_url[:60]}...)"
+            )
+            target = job_pack_dir / "_parent_video.mp4"
+            got = download_video_for_revision(job.revision_video_url, target)
+            if got and got.exists():
+                revision_video_path = got
+                try:
+                    job.revision_video_local = str(got.resolve().relative_to(APP_DIR))
+                except (ValueError, OSError):
+                    job.revision_video_local = str(got)
+                launcher_log(
+                    f"Job {job.id}: parent video indirildi "
+                    f"({got.stat().st_size // (1024 * 1024)} MB)"
+                )
+            else:
+                launcher_log(
+                    f"Job {job.id}: parent video indirilemedi — devam, ama "
+                    f"revize source eksik kalacak"
+                )
+
+        # 1) Script'i (revize için: revision_instructions) .txt olarak yaz
         safe_title = re.sub(r"[^A-Za-z0-9_\-]+", "_", job.title or "Script")[:60].strip("_") or "Script"
-        script_filename = f"{safe_title}_Script.txt"
+        # Revize ise script alanı revize talimatlarını içerir → adı RevisionInstructions
+        if job.parent_job_id:
+            script_filename = f"{safe_title}_RevisionInstructions.txt"
+        else:
+            script_filename = f"{safe_title}_Script.txt"
         script_path = job_pack_dir / script_filename
         try:
             script_path.write_text(job.text or "", encoding="utf-8")
@@ -1647,6 +1703,11 @@ class Worker:
         ]
         cmd.append("--headless" if profile.headless else "--no-headless")
 
+        # Revize MP4'ü image_paths'in BAŞINA ekle → ilk upload edilen source bu olur
+        # (Custom prompt'ta "Source 1 is the PREVIOUS VIDEO" diyorsa eşleşir)
+        if revision_video_path and revision_video_path.exists():
+            image_paths = [revision_video_path] + image_paths
+
         if script_path is not None:
             cmd += ["--script-file", str(script_path)]
         if image_paths:
@@ -1656,7 +1717,8 @@ class Worker:
             cmd += ["--custom-prompt-file", str(prompt_path)]
 
         launcher_log(
-            f"Job {job.id} packet: 1 script + {len(image_paths)} images + "
+            f"Job {job.id} packet: 1 script + {len(image_paths)} attachments"
+            f"{' (incl parent video for revision)' if revision_video_path else ''} + "
             f"custom_prompt={'yes' if prompt_path else 'no'}"
         )
 
@@ -2909,6 +2971,122 @@ def render_user_view() -> None:
         status_line = f"{len(available_profiles)} hesap hazır · bugün {today_total} video tetiklendi"
 
     hero("Senaryonu Gönder, Video Üretelim", status_line)
+
+    # ===== Phase 4: Revize Modal =====
+    # Job history'deki '✏ Revize et' butonuna basılınca revize_target_id set
+    # edilir; aşağıda render edilir.
+    _revize_target_id = st.session_state.get("revize_target_id", "")
+    if _revize_target_id:
+        _target_job = next((x for x in jobs if x.id == _revize_target_id), None)
+        if _target_job and _target_job.video_remote_url:
+            with st.container(border=True):
+                st.markdown(
+                    f'<div style="font-size:1.05rem; font-weight:700; margin-bottom:0.2rem;">'
+                    f'✏ Videoyu Revize Et</div>'
+                    f'<div style="font-size:0.85rem; opacity:0.75; margin-bottom:0.5rem;">'
+                    f'Önceki video yeni notebook\'a source olarak eklenir. '
+                    f'Yazdığın talimat + opsiyonel yeni görseller ile NotebookLM '
+                    f'yeni bir Cinematic versiyon üretir.</div>',
+                    unsafe_allow_html=True,
+                )
+                st.markdown(
+                    f'<div style="font-size:0.85rem; padding:8px 12px; '
+                    f'background:rgba(99,102,241,0.06); border-radius:6px; margin-bottom:8px;">'
+                    f'<b>📹 Revize edilecek video:</b><br>'
+                    f'<span style="font-size:0.78rem; opacity:0.85; font-style:italic;">'
+                    f'{(_target_job.title or "(başlıksız)")[:80]}</span><br>'
+                    f'<a href="{_target_job.video_remote_url}" target="_blank" '
+                    f'style="font-size:0.8rem;">☁️ Mevcut videoyu oynat</a>'
+                    f'</div>',
+                    unsafe_allow_html=True,
+                )
+
+                # Session_state key — modal kapatınca temizle
+                if "revize_instructions" not in st.session_state:
+                    st.session_state["revize_instructions"] = ""
+
+                def _cb_revize_cancel() -> None:
+                    st.session_state["revize_target_id"] = ""
+                    st.session_state["revize_instructions"] = ""
+
+                def _cb_revize_submit() -> None:
+                    instr = (st.session_state.get("revize_instructions", "") or "").strip()
+                    if not instr:
+                        st.session_state["_script_msg"] = (
+                            "err", "Revize talimatı boş olamaz."
+                        )
+                        return
+                    parent = next((x for x in load_jobs()
+                                   if x.id == st.session_state.get("revize_target_id")), None)
+                    if not parent or not parent.video_remote_url:
+                        st.session_state["_script_msg"] = (
+                            "err", "Parent video bulunamadı veya Azure URL eksik."
+                        )
+                        return
+                    # Yeni revize job'u oluştur — text alanı revize talimatı
+                    # (script yerine geçer; create-video custom prompt'u
+                    # gerçek revize bilgisini içerir)
+                    new_id = uuid.uuid4().hex[:12]
+                    rev_title = f"[Revize] {(parent.title or 'Untitled')[:60]}"
+                    # Custom prompt: revize bağlamını ekle, kalan template'i kullan
+                    rev_custom_prompt = (
+                        f"Role: You are a video revision editor. The user submitted a "
+                        f"previous Cinematic video (Source 1, MP4) and wants a revised "
+                        f"version following these instructions:\n\n"
+                        f"{instr}\n\n"
+                        f"Constraints:\n"
+                        f"1. Use the previous video (Source 1) as the visual and narrative baseline.\n"
+                        f"2. Apply the user's revision instructions above.\n"
+                        f"3. Keep the same overall topic/learning objective.\n"
+                        f"4. Maintain zero-text visuals, high-key lighting, soft geometry.\n"
+                        f"5. 80% photorealistic, 20% illustration; no mixed frames.\n"
+                        f"6. Cinematic style throughout.\n"
+                    )
+                    new_job = Job(
+                        id=new_id,
+                        title=rev_title,
+                        text=instr,  # script alanı revize talimatı
+                        submitted_by=_user_name(),
+                        custom_prompt=rev_custom_prompt,
+                        parent_job_id=parent.id,
+                        revision_instructions=instr,
+                        revision_video_url=parent.video_remote_url,
+                    )
+                    jobs_all = load_jobs()
+                    jobs_all.append(new_job)
+                    save_jobs(jobs_all)
+                    st.session_state["revize_target_id"] = ""
+                    st.session_state["revize_instructions"] = ""
+                    st.session_state["_script_msg"] = (
+                        "ok", f"Revize kuyruğa eklendi: {rev_title[:50]}"
+                    )
+
+                st.text_area(
+                    "Ne değişsin? (revize talimatı)",
+                    key="revize_instructions",
+                    height=160,
+                    placeholder=(
+                        "Örn. 'Narration daha yavaş olsun, hook'a 1 cümle ekle, "
+                        "kapanış kısmını değiştir.' "
+                        "Bu metin NotebookLM'e source olarak ek olarak custom "
+                        "prompt'tan referans edilir."
+                    ),
+                )
+
+                cs_r = st.columns([2, 1, 1.4])
+                with cs_r[1]:
+                    st.button("İptal", on_click=_cb_revize_cancel,
+                              use_container_width=True, key="btn_revize_cancel")
+                with cs_r[2]:
+                    st.button("🚀 Revize gönder",
+                              type="primary",
+                              on_click=_cb_revize_submit,
+                              use_container_width=True, key="btn_revize_submit")
+
+            st.markdown("&nbsp;", unsafe_allow_html=True)
+        else:
+            # Target bulunamadı, modal'ı kapat
+            st.session_state["revize_target_id"] = ""
 
     # Eğer hiç hesap yoksa erken çık
     if no_profile:
@@ -4235,6 +4413,15 @@ def render_user_view() -> None:
                     elif j.notebook_url and j.status in TERMINAL_STATUSES:
                         if st.button("🌐 Notebook'u aç", key=f"u_open_{j.id}", use_container_width=True):
                             open_in_browser(j.notebook_url)
+
+                    # Phase 4: Revize butonu — sadece video Azure'da hazırsa
+                    if j.video_remote_url and j.status == "done":
+                        if st.button("✏ Revize et",
+                                      key=f"u_revize_{j.id}",
+                                      use_container_width=True,
+                                      help="Bu videoyu source yapıp yeni bir Cinematic üret"):
+                            st.session_state["revize_target_id"] = j.id
+                            st.rerun()
         st.markdown('</div>', unsafe_allow_html=True)
 
     # Footer: logout

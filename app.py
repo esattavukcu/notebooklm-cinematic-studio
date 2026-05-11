@@ -794,14 +794,120 @@ Generate the revised script."""
 
 
 # ---------------------------------------------------------------------------
+# Phase 1 (Step 1): Script generation from prompt
+# Kullanıcı text area'ya prompt yapıştırır → "Çıktı oluştur" → LLM script verir.
+# Ya da Weird Facts template'ini form'la doldurup oradan üretir.
+# ---------------------------------------------------------------------------
+
+# Weird Facts system prompt — Twin Learning Vision'ın script writer'ı.
+# {TOPIC}/{GRADE_LEVEL}/{LANGUAGE}/{LEARNING_OBJECTIVE} placeholder'ları
+# render_weird_facts_prompt() tarafından doldurulur.
+WEIRD_FACTS_TEMPLATE = """You are the Twin Learning Vision Weird Facts Script Writer.
+
+Your job is to produce a single narration script in the Weird Facts format. The script will be sent to NotebookLM, which will generate the final video. Write only what should be spoken aloud — no scene directions, no shot lists, no headers, no markdown, no on-screen text cues.
+
+WHAT "WEIRD FACTS" IS
+A short, single-narrator video script that lands ONE surprising, counter-intuitive idea tied to a curriculum learning objective. It is written for a curious student, not a textbook. The script is a short narrative — not a topic summary, not a definition list. ONE strong "weird fact" is the spine of the script from the opening question all the way to the closing line. Every paragraph should still be feeding that one fact.
+
+If your draft starts to feel like "Topic: X. Definition: Y. Examples: Z." — stop and rewrite. The voice should feel like a friend who just learned something cool and is telling you about it, not like a teacher delivering a lesson plan.
+
+THE ARC
+
+1) HOOK QUESTION — a real mystery, not a yes/no opener.
+Open with a question that creates genuine intrigue: a concrete puzzle, an absurd-sounding-but-true situation, a counter-intuitive image, or a tiny scenario the viewer can picture. The viewer should think "wait, really?" — not "obviously yes" or "obviously no". Avoid generic conversational openers. The hook should already point at the weird fact.
+
+2) THE WEIRD FACT ITSELF — within the first 2–3 sentences.
+Deliver the surprising claim quickly. Do not bury it. Do NOT use the literal words "weird fact" or "tuhaf gerçek" in the script — the surprise should land through the content, not through a label.
+
+3) WHY IT'S TRUE — woven, not listed.
+Explain the science or reasoning in plain language a student at the target grade can follow. This is where the learning objective gets covered — but weave it into the story of the weird fact. Do NOT march through the LO's sub-items one by one. Choose ONE concrete situation and let the sub-items surface naturally.
+
+4) REAL-WORLD TIE-IN — concrete, age-appropriate.
+Connect the fact to something tangible from the student's real life at that grade level.
+
+5) ENGINEERING / SCIENTIFIC FRAMING + CALLBACK TO THE HOOK.
+End with the bigger picture: what humans do with this knowledge. The closing must call back to the puzzle raised in the hook.
+
+6) SIGN-OFF — warm, topic-specific.
+Address the viewer directly. Brand convention: "Twinner" in English or "Tivinır" in Turkish. The sign-off line MUST be specific to this script's topic.
+
+HARD RULES (non-negotiable)
+• Output one language only, matching the requested LANGUAGE.
+• No on-screen text. Convey everything through spoken narration.
+• No bullet lists, no headers, no markdown, no stage directions. Continuous prose only.
+• First sentence is always a question — and a question that creates real intrigue.
+• Target length: 220–300 words. Do not exceed 320 words.
+• Cover the learning objective directly. Use the EXACT scientific terms from the LEARNING OBJECTIVE — no synonyms.
+• Match the grade level. Define any technical term a student that age wouldn't know.
+• One narrator, one voice. No dialogue.
+• Scientific accuracy is non-negotiable. Simplification must not introduce misconceptions.
+• Do not anthropomorphize the body or natural systems for grades 5+.
+• For LOs with process-verbs (problem-solving, hypothesizing, observing, classifying), structure the script around that process.
+• ONE weird fact per script.
+
+STYLE
+• Warm, curious, slightly playful. A friend sharing something cool, not a teacher.
+• Avoid didactic opening sentences in body paragraphs. Embed definitions inside scenes.
+• Short sentences. Vary rhythm. Concrete imagery.
+• End on agency tied to THIS topic.
+
+ANTI-PATTERNS — REWRITE IF YOUR DRAFT DOES ANY OF THESE
+• Hook question whose answer is obvious yes or obvious no.
+• Listing every sub-clause of the LO in order.
+• Substituting curriculum vocabulary with "simpler" synonyms.
+• Cartoonish anthropomorphism for grades 5+.
+• Generic closing line.
+• The literal words "weird fact" or "tuhaf gerçek" in the narration.
+
+OUTPUT FORMAT
+Output only the script text. No preamble, no explanation, no metadata, no title. Just the narration paragraphs.
+
+INPUT
+TOPIC: {TOPIC}
+GRADE LEVEL: {GRADE_LEVEL}
+LANGUAGE: {LANGUAGE}
+LEARNING OBJECTIVE:
+{LEARNING_OBJECTIVE}
+
+Now write the script. Output only the narration."""
+
+
+def render_weird_facts_prompt(topic: str, grade_level: str,
+                              language: str, learning_objective: str) -> str:
+    """Weird Facts template'inin placeholder'larını doldurur."""
+    return (
+        WEIRD_FACTS_TEMPLATE
+        .replace("{TOPIC}", (topic or "").strip())
+        .replace("{GRADE_LEVEL}", (grade_level or "").strip())
+        .replace("{LANGUAGE}", (language or "TR").strip())
+        .replace("{LEARNING_OBJECTIVE}", (learning_objective or "").strip())
+    )
+
+
+def generate_script_from_prompt(prompt: str,
+                                 model: Optional[str] = None) -> tuple[bool, str]:
+    """Verilen prompt'u LLM'e gönder, script çıktısı al. (success, script_or_error)."""
+    if not prompt.strip():
+        return False, "Prompt boş olamaz."
+    return _openrouter_chat(
+        [
+            {"role": "user", "content": prompt.strip()},
+        ],
+        model=model,
+        temperature=0.8,
+        max_tokens=2000,
+    )
+
+
+# ---------------------------------------------------------------------------
 # Phase B: Asset extraction — script'ten görsel listesi çıkar
 # ---------------------------------------------------------------------------
-ASSET_EXTRACTOR_SYSTEM = """You are a visual director for short-form factual videos (Weird Facts / explainer style).
+ASSET_EXTRACTOR_SYSTEM = """You analyze short educational video scripts for grade-school students. The script will be visualized/illustrated, and we need to show some items in their REAL STATE for educational purposes (e.g. solar panels, microscopes, animals, historical artifacts, real people).
 
-Given a video narration script, extract a list of visual assets (images, illustrations, footage frames) that should appear during narration. Each asset must:
-- Match a specific narration moment (a phrase or sentence)
-- Have a CONCRETE, searchable subject — no abstract concepts, metaphors, or feelings
-- Be the kind of thing findable on stock-image sites (Wikimedia Commons, Openverse, Flickr CC) OR generatable by an AI image model
+Given a video narration script, extract a list of the important OBJECTS and PERSONS mentioned (or strongly implied) in the text that should be shown in their true real-world form. Each asset must:
+- Be a CONCRETE, real-world subject (a thing, a person, a place, a specific phenomenon) — not an abstract concept, metaphor, or feeling
+- Match a specific narration moment (a phrase or sentence) where that object/person comes up
+- Be the kind of thing a stock-image site (Wikimedia Commons, Openverse, Pexels) could provide, or an AI image model could render realistically
 
 Output ONLY a JSON array. No preamble, no markdown fences, no explanation. Strictly this schema:
 
@@ -825,18 +931,22 @@ Rules:
 Return ONLY the JSON array. Anything else breaks the parser."""
 
 
-def extract_assets(script: str, model: Optional[str] = None) -> tuple[bool, list, str]:
+def extract_assets(script: str, model: Optional[str] = None,
+                   system_prompt_override: Optional[str] = None) -> tuple[bool, list, str]:
     """Script'ten asset listesi çıkar. (success, assets_list, error_msg) döner.
 
     assets_list elemanları: {position, description, query, style}.
+    system_prompt_override boş değilse default ASSET_EXTRACTOR_SYSTEM yerine kullanılır.
     Hata durumunda assets_list = [].
     """
     if not script.strip():
         return False, [], "Senaryo boş olamaz."
 
+    sys_prompt = (system_prompt_override or "").strip() or ASSET_EXTRACTOR_SYSTEM
+
     ok, raw = _openrouter_chat(
         [
-            {"role": "system", "content": ASSET_EXTRACTOR_SYSTEM},
+            {"role": "system", "content": sys_prompt},
             {"role": "user", "content": f"SCRIPT:\n{script.strip()}\n\nExtract assets as JSON array."},
         ],
         model=model,
@@ -2593,6 +2703,7 @@ def render_user_view() -> None:
         st.session_state["script_assets"] = []
         st.session_state["script_custom_prompt"] = ""
         st.session_state["script_custom_prompt_user_edited"] = False
+        st.session_state["ui_step"] = 1  # baştan başla
 
     # İlk yüklemede disk'ten restore (refresh / yeni sekme / başka cihazdan
     # gelirken yarım kalan draft'ı geri getir). Sadece ilk run'da çalışır.
@@ -2641,6 +2752,29 @@ def render_user_view() -> None:
     # Submit niyeti — submit callback'i set eder, ana akış kuyruğa ekler.
     if "_pending_submit" not in st.session_state:
         st.session_state["_pending_submit"] = False
+
+    # ===== 3-Step UI state machine =====
+    # ui_step = 1 → Step 1 (Senaryo)
+    # ui_step = 2 → Step 1 tamam + Step 2 (Görseller) açık
+    # ui_step = 3 → Step 1+2 tamam + Step 3 (Cinematic) açık
+    if "ui_step" not in st.session_state:
+        # Disk'ten restore edilen draft varsa ileri adımdan başlat
+        if st.session_state.get("script_assets"):
+            st.session_state["ui_step"] = 3
+        elif (st.session_state.get("script_draft") or "").strip():
+            st.session_state["ui_step"] = 2
+        else:
+            st.session_state["ui_step"] = 1
+    # Step 1 — Weird Facts template form alanları
+    for _k, _default in (
+        ("wf_topic", ""),
+        ("wf_grade", "7"),
+        ("wf_language", "TR"),
+        ("wf_lo", ""),
+        ("wf_template_open", False),  # gizli expander state
+    ):
+        if _k not in st.session_state:
+            st.session_state[_k] = _default
 
     # --- Persistence helper (disk autosave) ---
     def _persist_draft() -> None:
@@ -2699,6 +2833,76 @@ def render_user_view() -> None:
         """text_area on_change: kullanıcı yazıp blur ettiğinde disk'e kaydet."""
         _persist_draft()
 
+    # --- Step 1 callbacks ---
+    def _cb_apply_wf_template() -> None:
+        """Weird Facts form alanlarını template'e doldur, text area'ya yapıştır."""
+        rendered = render_weird_facts_prompt(
+            st.session_state.get("wf_topic", ""),
+            st.session_state.get("wf_grade", ""),
+            st.session_state.get("wf_language", ""),
+            st.session_state.get("wf_lo", ""),
+        )
+        st.session_state["script_draft"] = rendered
+        st.session_state["_script_msg"] = (
+            "ok", "Weird Facts template'i dolduruldu. Şimdi 'Çıktı oluştur' butonuna bas."
+        )
+        _persist_draft()
+
+    def _cb_generate_output() -> None:
+        """'Çıktı oluştur': text area'daki prompt'u LLM'e gönder, script al."""
+        prompt = st.session_state.get("script_draft", "").strip()
+        model = st.session_state.get("script_model") or OPENROUTER_MODEL
+        if not prompt:
+            st.session_state["_script_msg"] = (
+                "err", "Text area boş — önce prompt yapıştır ya da template doldur."
+            )
+            return
+        ok, result = generate_script_from_prompt(prompt, model=model)
+        if ok:
+            # Orijinal prompt'u history'ye kaydet (input olarak)
+            st.session_state["script_iterations"].append({
+                "script": prompt,            # input prompt
+                "feedback": "(initial output generation)",
+                "model": model,
+                "ts": time.time(),
+            })
+            st.session_state["script_draft"] = result.strip()
+            st.session_state["ui_step"] = max(st.session_state.get("ui_step", 1), 2)
+            st.session_state["_script_msg"] = (
+                "ok", "Script üretildi. Sonraki adım: görseller."
+            )
+            _persist_draft()
+        else:
+            st.session_state["_script_msg"] = ("err", result)
+
+    def _cb_use_output() -> None:
+        """'Çıktıyı kullan': text area'daki içeriği script olarak kabul et, Step 2'ye geç."""
+        text = st.session_state.get("script_draft", "").strip()
+        if not text:
+            st.session_state["_script_msg"] = (
+                "err", "Text area boş — script yapıştır."
+            )
+            return
+        st.session_state["ui_step"] = max(st.session_state.get("ui_step", 1), 2)
+        st.session_state["_script_msg"] = (
+            "ok", "Script onaylandı. Sonraki adım: görseller."
+        )
+        _persist_draft()
+
+    def _cb_back_to_step(step: int) -> None:
+        """Önceki adıma dön — sadece ui_step değişir, veri kaybolmaz."""
+        st.session_state["ui_step"] = max(1, step)
+        st.session_state["_script_msg"] = ("ok", f"Step {step}'e geri döndün.")
+
+    def _cb_skip_step2() -> None:
+        """Step 2'yi atla — assets'i temizle, ui_step=3."""
+        st.session_state["script_assets"] = []
+        st.session_state["ui_step"] = 3
+        st.session_state["_script_msg"] = (
+            "ok", "Görseller atlandı. Custom Prompt ile devam edebilirsin."
+        )
+        _persist_draft()
+
     def _cb_submit() -> None:
         text = st.session_state.get("script_draft", "").strip()
         if not text:
@@ -2710,10 +2914,16 @@ def render_user_view() -> None:
     def _cb_extract_assets() -> None:
         script = st.session_state.get("script_draft", "").strip()
         model = st.session_state.get("script_model") or OPENROUTER_MODEL
+        override = (
+            st.session_state.get("asset_extractor_prompt_override", "") or ""
+        ).strip()
         if not script:
             st.session_state["_script_msg"] = ("err", "Önce senaryo yapıştır.")
             return
-        ok, assets, err = extract_assets(script, model=model)
+        ok, assets, err = extract_assets(
+            script, model=model,
+            system_prompt_override=override if override else None,
+        )
         if ok:
             st.session_state["script_assets"] = assets
             st.session_state["_script_msg"] = (
@@ -2874,58 +3084,187 @@ def render_user_view() -> None:
     # Önceki run'da bir mesaj set edildiyse göster (callback render'dan önce çalışır)
     _msg = st.session_state.pop("_script_msg", None)
 
+    # ===== 3-Step pipeline state =====
+    ui_step = int(st.session_state.get("ui_step", 1))
+
+    # Step indicator stripe (her zaman görünür)
+    def _step_pill(num: int, label: str, active: bool, done: bool) -> str:
+        if done:
+            bg, fg, icon = "#10B981", "#FFFFFF", "✓"
+        elif active:
+            bg, fg, icon = "#6366F1", "#FFFFFF", str(num)
+        else:
+            bg, fg, icon = "rgba(156,163,175,0.25)", "#9CA3AF", str(num)
+        return (
+            f'<span style="display:inline-flex; align-items:center; gap:6px; '
+            f'padding:4px 10px; background:{bg}; color:{fg}; border-radius:14px; '
+            f'font-size:0.8rem; font-weight:600;">'
+            f'<span style="background:rgba(255,255,255,0.2); width:18px; height:18px; '
+            f'border-radius:9px; display:inline-flex; align-items:center; justify-content:center; '
+            f'font-size:0.72rem;">{icon}</span>{label}</span>'
+        )
+
     st.markdown("&nbsp;", unsafe_allow_html=True)
     st.markdown(
-        '<div style="font-size:0.95rem; font-weight:600; margin-bottom:0.3rem;">'
-        '📝 Video senaryonu yapıştır</div>'
-        '<div style="font-size:0.8rem; opacity:0.7; margin-bottom:0.5rem;">'
-        'Uzun yazabilirsin. NotebookLM senaryonu kaynak olarak alıp Cinematic '
-        'video üretecek.'
-        + (' AI ile düzenleyip yeniden üretmek için aşağıdaki <b>✨ AI ile düzenle</b> bölümünü kullan.' if LLM_ENABLED else '')
+        '<div style="display:flex; gap:8px; flex-wrap:wrap; margin-bottom:10px;">'
+        + _step_pill(1, "Senaryo", ui_step == 1, ui_step > 1)
+        + _step_pill(2, "Görseller", ui_step == 2, ui_step > 2)
+        + _step_pill(3, "Cinematic", ui_step == 3, False)
         + '</div>',
         unsafe_allow_html=True,
     )
 
-    st.text_area(
-        "Senaryo",
-        height=360,
-        placeholder="Senaryon, system prompt'un veya uzun metin...",
-        label_visibility="collapsed",
-        key="script_draft",
-        on_change=_cb_text_changed,  # blur'da disk'e autosave
-    )
+    # ===== STEP 1: Senaryonu Hazırla =====
+    if ui_step == 1:
+        st.markdown(
+            '<div style="font-size:1.05rem; font-weight:700; margin-bottom:0.2rem;">'
+            '1️⃣ Senaryonu Hazırla</div>'
+            '<div style="font-size:0.8rem; opacity:0.7; margin-bottom:0.5rem;">'
+            'Aşağıya ya hazır <b>script</b>\'i yapıştır → <b>Çıktıyı kullan</b>, '
+            'ya da <b>prompt</b>\'u yapıştır → <b>Çıktı oluştur</b> (LLM script üretir). '
+            'Yardımcı: <b>🤖 Weird Facts template</b>\'ini aşağıdaki form\'la doldurabilirsin.</div>',
+            unsafe_allow_html=True,
+        )
 
-    # ===== AI Editor (LLM aktifse) =====
-    if LLM_ENABLED:
-        iter_count = len(st.session_state["script_iterations"])
-        expander_label = "✨ AI ile düzenle"
-        if iter_count:
-            expander_label += f" — {iter_count} iterasyon"
-        with st.expander(expander_label, expanded=bool(iter_count)):
-            st.caption(
-                "Senaryon hakkında ne değişmeli yaz, AI yeniden üretsin. "
-                "Beğenmezsen model değiştir, ya da tekrar feedback ver."
-            )
+        # --- Weird Facts template form (opsiyonel, kolay prompt üretme) ---
+        if LLM_ENABLED:
+            with st.expander("🤖 Weird Facts template kullan", expanded=False):
+                st.caption(
+                    "Bu form, Twin Learning Vision'ın Weird Facts script writer "
+                    "prompt'unu inşa eder ve text alanına yapıştırır. Sonra "
+                    "'Çıktı oluştur' butonuna bas."
+                )
+                wf_cs = st.columns(2)
+                with wf_cs[0]:
+                    st.text_input(
+                        "Konu (TOPIC)",
+                        key="wf_topic",
+                        placeholder="örn. Işığın madde ile etkileşimi sonucunda soğurulma",
+                    )
+                    st.text_input(
+                        "Sınıf seviyesi (GRADE)",
+                        key="wf_grade",
+                        placeholder="örn. 7",
+                    )
+                with wf_cs[1]:
+                    st.selectbox(
+                        "Dil",
+                        options=["TR", "EN"],
+                        key="wf_language",
+                    )
+                    st.text_area(
+                        "Kazanım (LEARNING OBJECTIVE)",
+                        key="wf_lo",
+                        height=80,
+                        placeholder="a) ...\nb) ...\nc) ...",
+                    )
+                st.button(
+                    "📋 Template'i text alanına yapıştır",
+                    on_click=_cb_apply_wf_template,
+                    use_container_width=True,
+                    key="btn_wf_apply",
+                )
 
-            # Model selector — env'deki default + UI'dan ek seçenekler
+        st.text_area(
+            "Senaryo / Prompt",
+            height=360,
+            placeholder="Senaryo veya prompt'u yapıştır...\n\n"
+                        "Hazır script'in varsa direkt yapıştır + 'Çıktıyı kullan'.\n"
+                        "Prompt yapıştırırsan + 'Çıktı oluştur' → LLM script üretecek.",
+            label_visibility="collapsed",
+            key="script_draft",
+            on_change=_cb_text_changed,
+        )
+
+        # --- Step 1 action buttons ---
+        if LLM_ENABLED:
+            # Model selector — sadece "Çıktı oluştur" için kullanılır
             model_ids = [m[0] for m in OPENROUTER_FREE_MODELS]
             model_labels = {m[0]: m[1] for m in OPENROUTER_FREE_MODELS}
-            # Env'deki model listede yoksa başa ekle (custom override)
             if OPENROUTER_MODEL not in model_ids:
                 model_ids.insert(0, OPENROUTER_MODEL)
                 model_labels[OPENROUTER_MODEL] = f"{OPENROUTER_MODEL} — env'den"
-            # Default seçim: önceki seçim varsa onu, yoksa env değeri
             if "script_model" not in st.session_state or st.session_state["script_model"] not in model_ids:
                 st.session_state["script_model"] = OPENROUTER_MODEL
-            st.selectbox(
-                "Model",
-                options=model_ids,
-                format_func=lambda mid: model_labels.get(mid, mid),
-                key="script_model",
-                help="OpenRouter'ın ücretsiz katmanından. Bir model çalışmazsa "
-                     "(rate limit, 404 vs.) başkasını dene.",
+
+            cs_s1 = st.columns([1.2, 1.4, 1.4])
+            with cs_s1[0]:
+                st.selectbox(
+                    "AI Model",
+                    options=model_ids,
+                    format_func=lambda mid: model_labels.get(mid, mid).split(" — ")[0],
+                    key="script_model",
+                    label_visibility="collapsed",
+                )
+            with cs_s1[1]:
+                st.button(
+                    "🤖 Çıktı oluştur",
+                    type="secondary",
+                    use_container_width=True,
+                    on_click=_cb_generate_output,
+                    key="btn_generate_output",
+                    help="Text alandaki PROMPT'u LLM'e gönder, script üret. 5-15 sn sürer.",
+                )
+            with cs_s1[2]:
+                st.button(
+                    "✓ Çıktıyı kullan",
+                    type="primary",
+                    use_container_width=True,
+                    on_click=_cb_use_output,
+                    key="btn_use_output",
+                    help="Text alandaki SCRIPT'i kabul et, Step 2'ye geç.",
+                )
+        else:
+            # LLM kapalıysa sadece "kullan" butonu
+            st.button(
+                "✓ Çıktıyı kullan ve devam et",
+                type="primary",
+                use_container_width=True,
+                on_click=_cb_use_output,
+                key="btn_use_output_only",
             )
 
+    else:
+        # ui_step > 1 → Step 1 collapsed summary
+        _draft_preview = (st.session_state.get("script_draft") or "").strip()
+        _preview = (_draft_preview[:120] + "…") if len(_draft_preview) > 120 else _draft_preview
+        cs_sum = st.columns([5, 1])
+        with cs_sum[0]:
+            st.markdown(
+                f'<div style="padding:10px 14px; background:rgba(16,185,129,0.08); '
+                f'border-left:3px solid #10B981; border-radius:6px; margin-bottom:8px;">'
+                f'<div style="font-size:0.85rem; font-weight:600;">✓ 1. Senaryo hazır</div>'
+                f'<div style="font-size:0.78rem; opacity:0.75; margin-top:4px; font-style:italic;">'
+                f'"{_preview}"</div></div>',
+                unsafe_allow_html=True,
+            )
+        with cs_sum[1]:
+            st.button(
+                "↩ Düzenle",
+                on_click=_cb_back_to_step,
+                args=(1,),
+                use_container_width=True,
+                key="btn_back_step1",
+            )
+
+    # ===== AI Editor (LLM aktifse, sadece Step 1'de görünür) =====
+    # Script üretildikten sonra feedback'le ince ayar (eski Phase A iter loop).
+    # Model selector Step 1 ana row'da zaten var — burada dup eklemiyoruz.
+    if LLM_ENABLED and ui_step == 1:
+        iter_count = len(st.session_state["script_iterations"])
+        # Sadece initial-generation dışı gerçek iterasyon varsa label'da göster
+        real_iters = sum(
+            1 for it in st.session_state["script_iterations"]
+            if it.get("feedback", "") and not it["feedback"].startswith("(initial")
+        )
+        expander_label = "✨ AI ile rafine et (feedback ver)"
+        if real_iters:
+            expander_label += f" — {real_iters} iterasyon"
+        with st.expander(expander_label, expanded=False):
+            st.caption(
+                "Script'i beğendinse atla. Beğenmediysen aşağıya 'ne değişsin' "
+                "yaz, üstteki model'le AI yeniden üretsin."
+            )
             st.text_area(
                 "Feedback / değişiklik notları",
                 key="script_feedback",
@@ -2977,26 +3316,30 @@ def render_user_view() -> None:
                                 args=(actual_i,),
                             )
 
-    # ===== Phase B: Asset extraction (görsel listesi) =====
-    if LLM_ENABLED:
+    # ===== STEP 2: Görseller (Phase B/C/D) =====
+    # ui_step >= 2 olunca açılır. ui_step > 2 ise collapsed summary.
+    if ui_step >= 2 and LLM_ENABLED:
         assets = st.session_state.get("script_assets", []) or []
         n_assets = len(assets)
-        b_label = "🖼 Görseller (Phase B)"
-        if n_assets:
-            b_label += f" — {n_assets} öneri"
-        with st.expander(b_label, expanded=bool(n_assets)):
-            st.caption(
-                "Senaryon hazır olunca aşağıdaki butona bas — LLM, video için "
-                "lazım olan görsellerin listesini çıkarır. Her birini "
-                "düzenleyebilir, silebilir, manuel ekleyebilirsin. Bu liste "
-                "Phase C'de image search'e girecek."
+        n_selected = sum(1 for a in assets if a.get("selected_image"))
+
+        if ui_step == 2:
+            st.markdown("&nbsp;", unsafe_allow_html=True)
+            st.markdown(
+                '<div style="font-size:1.05rem; font-weight:700; margin-bottom:0.2rem;">'
+                '2️⃣ Görseller</div>'
+                '<div style="font-size:0.8rem; opacity:0.7; margin-bottom:0.5rem;">'
+                'LLM script\'ten gerçek-durum nesneleri çıkarır → her biri için '
+                'görsel ara / AI ile üret / manuel URL. Beğendiklerinden seç. '
+                'İstemiyorsan <b>Bu adımı atla</b> butonuyla geç.</div>',
+                unsafe_allow_html=True,
             )
-            cs_b = st.columns([2, 1, 1])
-            with cs_b[0]:
-                if n_assets:
-                    extract_label = "🔄 Yeniden çıkar (listeyi sıfırlar)"
-                else:
-                    extract_label = "🖼 Görselleri çıkar"
+
+            # Step 2 action row: extract + skip + next
+            top_cs = st.columns([1.6, 1, 1, 1])
+            with top_cs[0]:
+                extract_label = ("🔄 Yeniden çıkar (listeyi sıfırlar)"
+                                 if n_assets else "🖼 Görselleri çıkar")
                 st.button(
                     extract_label,
                     type="primary",
@@ -3005,24 +3348,94 @@ def render_user_view() -> None:
                     key="btn_extract_assets",
                     help="Aktif senaryoyu LLM'e gönderir, görsel listesi çıkarır."
                 )
-            with cs_b[1]:
+            with top_cs[1]:
                 if n_assets:
                     st.button(
                         "➕ Manuel ekle",
                         use_container_width=True,
                         on_click=_cb_add_asset,
-                        key="btn_add_asset",
+                        key="btn_add_asset_top",
                     )
-            with cs_b[2]:
-                if n_assets:
-                    st.button(
-                        "🗑 Tümünü sil",
-                        use_container_width=True,
-                        on_click=_cb_clear_assets,
-                        key="btn_clear_assets",
-                    )
+            with top_cs[2]:
+                st.button(
+                    "⏭ Bu adımı atla",
+                    use_container_width=True,
+                    on_click=_cb_skip_step2,
+                    key="btn_skip_step2",
+                    help="Görselsiz devam et — Cinematic sadece script'i kullanır."
+                )
+            with top_cs[3]:
+                _can_next = (n_selected > 0) or (n_assets == 0)  # ya seçim ya hiç asset yok
+                if st.button(
+                    "Step 3 ▶",
+                    type="primary" if n_selected > 0 else "secondary",
+                    use_container_width=True,
+                    key="btn_next_step3",
+                    disabled=not n_selected and bool(n_assets),
+                    help=("En az 1 görsel seç ya da atla." if n_assets and not n_selected
+                          else "Cinematic adımına geç."),
+                ):
+                    st.session_state["ui_step"] = 3
+                    st.rerun()
 
-            if n_assets:
+            # Asset extractor prompt override (gizli expander)
+            with st.expander("⚙ Gelişmiş: Asset extractor prompt'unu düzenle", expanded=False):
+                st.caption(
+                    "Default: kodda sabit prompt (gerçek-durum nesneler için). "
+                    "Buradan değiştirirsen, sadece bu oturumda 'Görselleri çıkar' "
+                    "çağrılarında kullanılır."
+                )
+                st.text_area(
+                    "Asset extractor system prompt",
+                    key="asset_extractor_prompt_override",
+                    value=st.session_state.get(
+                        "asset_extractor_prompt_override", ""
+                    ),
+                    height=180,
+                    placeholder="Boş bırak = default prompt kullanılır",
+                    help="Boş bırakırsan kodda tanımlı ASSET_EXTRACTOR_SYSTEM kullanılır.",
+                )
+
+            st.markdown("&nbsp;", unsafe_allow_html=True)
+        else:
+            # ui_step == 3 → Step 2 collapsed summary
+            _summary = f"{n_assets} öneri · {n_selected} seçili" if n_assets else "atlandı"
+            cs_sum2 = st.columns([5, 1])
+            with cs_sum2[0]:
+                st.markdown(
+                    f'<div style="padding:10px 14px; background:rgba(16,185,129,0.08); '
+                    f'border-left:3px solid #10B981; border-radius:6px; margin-bottom:8px;">'
+                    f'<div style="font-size:0.85rem; font-weight:600;">✓ 2. Görseller — {_summary}</div></div>',
+                    unsafe_allow_html=True,
+                )
+            with cs_sum2[1]:
+                st.button(
+                    "↩ Düzenle",
+                    on_click=_cb_back_to_step,
+                    args=(2,),
+                    use_container_width=True,
+                    key="btn_back_step2",
+                )
+
+    # ===== Phase B detail UI: sadece ui_step == 2 iken render =====
+    # Asset listesinin ayrıntılı per-item UI'sı (eski expander içeriği,
+    # şimdi açık layout). Üst butonlar (extract/skip/next) yukarıdaki
+    # wrapper'da Step 2 header'ında yer alıyor.
+    if ui_step == 2 and LLM_ENABLED:
+        assets = st.session_state.get("script_assets", []) or []
+        n_assets = len(assets)
+        if n_assets:
+            # "Tümünü sil" küçük buton (top row'dan ayrı)
+            del_cs = st.columns([5, 1])
+            with del_cs[1]:
+                st.button(
+                    "🗑 Tümünü sil",
+                    use_container_width=True,
+                    on_click=_cb_clear_assets,
+                    key="btn_clear_assets",
+                )
+
+            if True:
                 st.markdown("&nbsp;", unsafe_allow_html=True)
                 STYLE_OPTS = ["photo", "illustration", "diagram", "archive"]
                 STYLE_ICON = {
@@ -3301,11 +3714,9 @@ def render_user_view() -> None:
                                     args=(aid, _manual_key2),
                                 )
 
-    # ===== Phase E: Custom Prompt + paket önizleme =====
-    # NotebookLM Cinematic'in "Customize Video Overview → Custom prompt"
-    # alanına yapışacak metin. Source listesi her seçili görselin description+
-    # position bilgisiyle birlikte enumere edilir → NotebookLM hangi görseli
-    # script'in hangi anında göstereceğini bilir.
+    # ===== STEP 3: Cinematic Video (Custom Prompt + Submit) =====
+    # Source listesi her seçili görselin description+position bilgisiyle birlikte
+    # enumere edilir → NotebookLM hangi görseli script'in hangi anında göstereceğini bilir.
     _assets_now = st.session_state.get("script_assets", []) or []
     _selected_assets = [a for a in _assets_now if a.get("selected_image")]
     _title_now = derive_title(st.session_state.get("script_draft", "")) or "Untitled"
@@ -3322,19 +3733,20 @@ def render_user_view() -> None:
             DEFAULT_CUSTOM_PROMPT_TEMPLATE, _title_now, _selected_assets
         )
 
-    n_images = max(0, _total_sources - 1)
-    cp_label = (
-        f"📋 Custom Prompt + Paket · 1 script + {n_images} görsel"
-        if _total_sources > 0 else "📋 Custom Prompt"
-    )
-    with st.expander(cp_label, expanded=False):
-        st.caption(
-            "Bu metin NotebookLM'de Cinematic Customize → Custom prompt alanına "
-            "yapıştırılır. Görsellerin script'in hangi anında gösterileceğini "
-            "buradaki 'Source N: ... show when narration says: \"...\"' "
-            "satırlarından NotebookLM çıkarır."
+    if ui_step >= 3:
+        st.markdown("&nbsp;", unsafe_allow_html=True)
+        st.markdown(
+            '<div style="font-size:1.05rem; font-weight:700; margin-bottom:0.2rem;">'
+            '3️⃣ Cinematic Video</div>'
+            '<div style="font-size:0.8rem; opacity:0.7; margin-bottom:0.5rem;">'
+            'Custom Prompt NotebookLM\'in Customize → Custom prompt alanına '
+            'gidecek. Source listesi otomatik enumere edildi. Beğenmediysen '
+            'aşağıdaki text alanı edit edilebilir. Hazır olunca '
+            '<b>🚀 Video üret</b>.</div>',
+            unsafe_allow_html=True,
         )
 
+        n_images = max(0, _total_sources - 1)
         # Paket önizleme — neler upload edilecek
         st.markdown(
             f'<div style="font-size:0.85rem; padding:8px 12px; '
@@ -3347,49 +3759,66 @@ def render_user_view() -> None:
             unsafe_allow_html=True,
         )
 
-        cs_p = st.columns([1.2, 4])
-        with cs_p[0]:
-            st.button(
-                "🔄 Template'den doldur",
-                key="btn_autofill_prompt",
-                on_click=_cb_autofill_prompt,
-                use_container_width=True,
-                help="Default template + güncel source listesiyle yeniden doldur (manuel düzenlemen silinir)",
-            )
-        with cs_p[1]:
-            edited_flag = st.session_state.get("script_custom_prompt_user_edited", False)
+        with st.expander("📋 Custom Prompt (edit edilebilir)", expanded=False):
             st.caption(
-                ("✏ Manuel düzenledin — auto-refresh kapalı." if edited_flag
-                 else "📝 Auto-render: source eklediğinde/sildiğinde template güncellenir.")
+                "Bu metin NotebookLM'de Cinematic Customize → Custom prompt "
+                "alanına yapıştırılır. Source listesinin satırlarındaki 'show "
+                "when narration says: \"...\"' kısımları görsel-anlatım eşlemesini "
+                "yönlendirir."
             )
 
-        st.text_area(
-            "Custom Prompt (NotebookLM'e yapışacak)",
-            key="script_custom_prompt",
-            height=300,
-            on_change=_cb_prompt_edited,
-            help="Kendi role/constraint metnini yazabilirsin. "
-                 "{{SOURCES_LIST}} placeholder'ı template'de otomatik doldurulur.",
-        )
+            cs_p = st.columns([1.2, 4])
+            with cs_p[0]:
+                st.button(
+                    "🔄 Template'den doldur",
+                    key="btn_autofill_prompt",
+                    on_click=_cb_autofill_prompt,
+                    use_container_width=True,
+                    help="Default template + güncel source listesiyle yeniden doldur (manuel düzenlemen silinir)",
+                )
+            with cs_p[1]:
+                edited_flag = st.session_state.get("script_custom_prompt_user_edited", False)
+                st.caption(
+                    ("✏ Manuel düzenledin — auto-refresh kapalı." if edited_flag
+                     else "📝 Auto-render: source eklediğinde/sildiğinde template güncellenir.")
+                )
 
-    # ===== Submit button =====
-    st.markdown("&nbsp;", unsafe_allow_html=True)
-    cs = st.columns([3, 1])
-    with cs[0]:
-        st.markdown(
-            f'<div style="font-size:0.78rem; opacity:0.65;">'
-            f'Gönderen: <b>{_user_name()}</b> · Paket: '
-            f'<b>{_total_sources}</b> source</div>',
-            unsafe_allow_html=True,
-        )
-    with cs[1]:
-        st.button(
-            "🚀 Video üret",
-            type="primary",
-            use_container_width=True,
-            key="submit_video",
-            on_click=_cb_submit,
-        )
+            st.text_area(
+                "Custom Prompt (NotebookLM'e yapışacak)",
+                key="script_custom_prompt",
+                height=300,
+                on_change=_cb_prompt_edited,
+                help="Kendi role/constraint metnini yazabilirsin. "
+                     "{{SOURCES_LIST}} placeholder'ı template'de otomatik doldurulur.",
+            )
+
+    # ===== Submit button (ui_step >= 3) =====
+    if ui_step >= 3:
+        st.markdown("&nbsp;", unsafe_allow_html=True)
+        cs = st.columns([2, 1.4, 1.4])
+        with cs[0]:
+            st.markdown(
+                f'<div style="font-size:0.78rem; opacity:0.65; margin-top:8px;">'
+                f'Gönderen: <b>{_user_name()}</b> · Paket: '
+                f'<b>{_total_sources}</b> source</div>',
+                unsafe_allow_html=True,
+            )
+        with cs[1]:
+            st.button(
+                "↩ Step 2'ye dön",
+                on_click=_cb_back_to_step,
+                args=(2,),
+                use_container_width=True,
+                key="btn_back_step2_from3",
+            )
+        with cs[2]:
+            st.button(
+                "🚀 Video üret",
+                type="primary",
+                use_container_width=True,
+                key="submit_video",
+                on_click=_cb_submit,
+            )
 
     # Mesajları göster (en son)
     if _msg:

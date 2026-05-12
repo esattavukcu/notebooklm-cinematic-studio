@@ -85,6 +85,14 @@ def extract_nlm_cookies(auth_json_path: Path) -> str:
 
     Tüm Google domain cookie'lerini birleştir — sadece SID/HSID/SSID değil,
     Google'ın iç servisleri farklı cookie'lere bakıyor (NID, AEC, OTZ, vs.).
+
+    KRITİK: `accounts.google.com` host-only cookies (LSID, ACCOUNT_CHOOSER,
+    __Host-1PLSID, vs.) ATLANIYOR. Çünkü bunlar varsa Google NotebookLM
+    request'lerini "passive flow" üzerinden accountchooser sayfasına bounce
+    ediyor (interactive auth refresh için). API çağrıları bu state'te 401
+    döner. Sadece `.google.com` (cross-subdomain) cookies + notebooklm.google.com
+    OSID/Secure-OSID yeterli — bunlar gerçek session token'larıdır.
+
     En az SID + HSID + SSID + APISID + SAPISID bulunmalı (sanity check).
     """
     if not auth_json_path.exists():
@@ -96,22 +104,21 @@ def extract_nlm_cookies(auth_json_path: Path) -> str:
         raise NlmError(f"auth.json okunamadı: {e}")
 
     cookies = data.get("cookies") or []
-    # Tüm Google domain'leri (.google.com, accounts.google.com, notebooklm vs.)
     pairs: dict[str, str] = {}
     for c in cookies:
         name = c.get("name", "")
         value = c.get("value", "")
         domain = (c.get("domain", "") or "").lower()
-        if not name or value is None:
+        if not name or value is None or not domain:
             continue
-        if not domain:
+        # accounts.google.com host-only cookies skip — passive-flow tetikliyor
+        if domain == "accounts.google.com":
             continue
         # Google ve alt-domain'leri kabul
         if not ("google.com" in domain or "googleapis.com" in domain
                 or "gstatic.com" in domain):
             continue
-        # Aynı isimde başka domain'den varsa root (.google.com) tercihen
-        # önce kayıt — ama .google.com değer büyük şans daha doğru.
+        # Aynı isimde başka domain'den varsa .google.com tercihli
         if name in pairs and domain.startswith(".google.com"):
             pairs[name] = value
         elif name not in pairs:

@@ -382,18 +382,51 @@ def _take_screenshot(page, screenshots_dir: Path, tag: str) -> Optional[Path]:
 #   4) Chrome kapanınca finalize et
 # ---------------------------------------------------------------------------
 def _find_chrome_binary() -> Optional[str]:
-    """Önce env var'dan, sonra Playwright bundled, sonra system Chrome."""
+    """Önce env var'dan, sonra Playwright bundled (Linux/macOS), sonra system Chrome."""
     env = os.environ.get("PLAYWRIGHT_CHROMIUM_EXECUTABLE_PATH", "").strip()
     if env and Path(env).exists():
         return env
-    # Playwright bundled chromium
-    cache = Path.home() / ".cache" / "ms-playwright"
-    for d in sorted(cache.glob("chromium-*"), reverse=True):
-        candidate = d / "chrome-linux64" / "chrome"
-        if candidate.exists():
-            return str(candidate)
-    # System Google Chrome
-    for p in ("/usr/bin/google-chrome-stable", "/usr/bin/google-chrome", "/usr/bin/chromium"):
+
+    # Playwright bundled chromium — platform-spesifik cache yolları
+    # Linux: ~/.cache/ms-playwright/chromium-XXXX/chrome-linux64/chrome
+    # macOS: ~/Library/Caches/ms-playwright/chromium-XXXX/chrome-mac{-arm64}/
+    #         Google Chrome for Testing.app/Contents/MacOS/Google Chrome for Testing
+    cache_dirs: list[Path] = [
+        Path.home() / ".cache" / "ms-playwright",                 # Linux/CI
+        Path.home() / "Library" / "Caches" / "ms-playwright",     # macOS
+        Path.home() / "AppData" / "Local" / "ms-playwright",      # Windows
+    ]
+    # Adaylar — her platform için olası binary yolu pattern'ları
+    bin_patterns = [
+        # Linux
+        "chrome-linux64/chrome",
+        "chrome-linux/chrome",
+        # macOS (yeni: 'Google Chrome for Testing', eski: 'Chromium')
+        "chrome-mac-arm64/Google Chrome for Testing.app/Contents/MacOS/Google Chrome for Testing",
+        "chrome-mac/Google Chrome for Testing.app/Contents/MacOS/Google Chrome for Testing",
+        "chrome-mac-arm64/Chromium.app/Contents/MacOS/Chromium",
+        "chrome-mac/Chromium.app/Contents/MacOS/Chromium",
+        # Windows
+        "chrome-win/chrome.exe",
+    ]
+    for cache in cache_dirs:
+        if not cache.exists():
+            continue
+        for d in sorted(cache.glob("chromium-*"), reverse=True):
+            for pat in bin_patterns:
+                candidate = d / pat
+                if candidate.exists():
+                    return str(candidate)
+
+    # System Google Chrome (Linux + macOS yolları)
+    for p in (
+        "/usr/bin/google-chrome-stable",
+        "/usr/bin/google-chrome",
+        "/usr/bin/chromium",
+        "/usr/bin/chromium-browser",
+        "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
+        "/Applications/Chromium.app/Contents/MacOS/Chromium",
+    ):
         if Path(p).exists():
             return p
     return None

@@ -3264,7 +3264,11 @@ def render_user_view() -> None:
         _persist_draft()
 
     def _cb_generate_output() -> None:
-        """'Çıktı oluştur': text area'daki prompt'u LLM'e gönder, script al."""
+        """'Çıktı oluştur': text area'daki prompt'u LLM'e gönder, script al.
+
+        Üretilen script text alana yazılır, ui_step DEĞİŞMEZ (kullanıcı Step 1'de
+        kalır, üretileni görüp düzenleyebilir). 'Çıktıyı kullan' → Step 2.
+        """
         prompt = st.session_state.get("script_draft", "").strip()
         model = st.session_state.get("script_model") or OPENROUTER_MODEL
         if not prompt:
@@ -3282,9 +3286,13 @@ def render_user_view() -> None:
                 "ts": time.time(),
             })
             st.session_state["script_draft"] = result.strip()
-            st.session_state["ui_step"] = max(st.session_state.get("ui_step", 1), 2)
+            # ui_step DEĞİŞMEZ — user üretileni görsün, düzenlerse düzenlesin,
+            # hazır olunca 'Çıktıyı kullan' ile Step 2'ye geçsin.
             st.session_state["_script_msg"] = (
-                "ok", "Script üretildi. Sonraki adım: görseller."
+                "ok",
+                f"Script üretildi ({len(result)} karakter). "
+                "Aşağıda görebilirsin — düzenleyebilir veya direkt "
+                "'Çıktıyı kullan' ile Step 2'ye geçebilirsin."
             )
             _persist_draft()
         else:

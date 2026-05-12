@@ -527,23 +527,37 @@ def run_init(profile_dir: Path, authuser: int, emitter: EventEmitter) -> int:
             context = contexts[0]
             page = context.pages[0] if context.pages else context.new_page()
 
-            def _save_storage_state() -> None:
+            # Cookies count'una göre "en zengin" save'i koruyalım — login
+            # tamamlanmadan önce save edilirse cookies az, sonra daha çok olur.
+            # Daha çok cookie'li save var ise üzerine yazmamalıyız.
+            best_save = {"n_cookies": 0}
+
+            def _save_storage_state(reason: str = "framenav") -> None:
                 try:
                     state = context.storage_state()
+                    n = len(state.get("cookies") or [])
+                    # Daha az cookie'li bir state üzerine yazma (regression koruması)
+                    if n < best_save["n_cookies"]:
+                        return
                     tmp = auth_json.with_suffix(".json.tmp")
                     tmp.write_text(json.dumps(state), encoding="utf-8")
                     tmp.replace(auth_json)
-                    emitter.emit("auth_saved", path=str(auth_json))
+                    best_save["n_cookies"] = n
+                    emitter.emit(
+                        "auth_saved", path=str(auth_json),
+                        cookies=n, reason=reason,
+                    )
                     saved_once["value"] = True
                 except Exception as e:
-                    emitter.emit("auth_save_error", error=str(e))
+                    emitter.emit("auth_save_error", error=str(e), reason=reason)
 
             def _on_framenav(frame) -> None:
-                if saved_once["value"]:
+                url = (frame.url or "").lower()
+                # Login sayfalarında save etme (cookies henüz eksik)
+                if not url or "accounts.google.com" in url:
                     return
-                url = frame.url or ""
                 if "notebooklm.google.com" in url:
-                    _save_storage_state()
+                    _save_storage_state(reason="framenav")
 
             try:
                 page.on("framenavigated", _on_framenav)
@@ -565,9 +579,18 @@ def run_init(profile_dir: Path, authuser: int, emitter: EventEmitter) -> int:
                 hint="Tarayıcıda Google ile giriş yap, ardından pencereyi kapat.",
             )
 
-            # Chrome'un ölümünü port-polling ile izle (& nedeniyle shell pid
-            # chrome'un değil; chrome devTools port'unda dinlerken hayatta sayılır)
+            # Chrome'un ölümünü port-polling ile izle + periyodik save.
+            # Her 5 sn'de bir state'i yakala — login tamamlandıkça cookies
+            # birikecek, son successful save final state'i tutar.
+            _last_periodic = 0.0
             while True:
+                now = time.time()
+                if now - _last_periodic >= 5.0:
+                    try:
+                        _save_storage_state(reason="periodic")
+                    except Exception:
+                        pass
+                    _last_periodic = now
                 try:
                     urllib.request.urlopen(cdp_url, timeout=2)
                     time.sleep(2)
@@ -575,9 +598,10 @@ def run_init(profile_dir: Path, authuser: int, emitter: EventEmitter) -> int:
                     # Port cevap vermiyor → chrome öldü
                     break
 
-            # Final save denemesi
+            # Final save denemesi (genelde context kapanmış olur, periyodik
+            # save zaten son state'i yakalamış olmalı)
             try:
-                _save_storage_state()
+                _save_storage_state(reason="final")
             except Exception:
                 pass
 

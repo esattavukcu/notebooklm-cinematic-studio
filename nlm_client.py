@@ -142,17 +142,11 @@ _BROWSER_UA = (
 )
 
 
-def fetch_nlm_auth_token(cookies: str, *,
-                         authuser: int = 0,
-                         timeout: int = 30) -> str:
-    """NotebookLM ana sayfasından auth token (WIZ_global_data.SNlM0e) çek.
+def _try_fetch_token(cookies: str, authuser: int, timeout: int) -> str:
+    """Tek authuser değeri ile token fetch dener.
 
-    Cookie geçerli olmalı (extract_nlm_cookies'in çıktısı). Token ~30 karakter,
-    alfanümerik + bazı sembol içerir. Süreli — Google rotation politikasına
-    göre 1-24 saat arası geçerli. Per-call fetch öneriliyor.
+    Başarısızsa NlmError. urllib redirect-loop hatasını da yakalar.
     """
-    if not cookies:
-        raise NlmError("cookies boş — fetch_nlm_auth_token çağrısı geçersiz")
     url = _NLM_HOMEPAGE + ("?authuser=" + str(authuser) if authuser else "")
     req = urllib.request.Request(
         url,
@@ -168,31 +162,62 @@ def fetch_nlm_auth_token(cookies: str, *,
             final_url = resp.url
             body = resp.read()
     except urllib.error.HTTPError as e:
+        # Sadece error mesajının ilk satırını al, "lead to an infinite loop"
+        # gibi multi-line reason'ları kısalt
+        reason = str(e.reason).split('\n')[0][:80]
         raise NlmError(
-            f"NotebookLM fetch HTTP {e.code}: {e.reason}. "
-            f"Cookie expired olabilir, profile re-init gerekebilir."
+            f"authuser={authuser} HTTP {e.code}: {reason}"
         )
+    except urllib.error.URLError as e:
+        raise NlmError(f"authuser={authuser} URLError: {str(e.reason)[:80]}")
     except Exception as e:
-        raise NlmError(f"NotebookLM fetch error: {type(e).__name__}: {e}")
+        raise NlmError(f"authuser={authuser} {type(e).__name__}: {str(e)[:80]}")
 
-    # Login sayfasına redirect olduysa cookie geçersiz
     if "accounts.google.com" in final_url or "/signin" in final_url:
-        raise NlmError(
-            f"NotebookLM login sayfasına redirect ({final_url[:80]}). "
-            f"Cookie expired — profile re-init gerek."
-        )
+        raise NlmError(f"authuser={authuser} redirected to login")
 
     text = body.decode("utf-8", errors="replace")
     m = _AUTH_TOKEN_REGEX.search(text)
     if not m:
-        # Bazen WIZ_global_data farklı bir formatta — başka kalıbı dene
         m = re.search(r'WIZ_global_data\s*=\s*\{[^}]*"SNlM0e"\s*:\s*"([^"]+)"', text)
     if not m:
-        raise NlmError(
-            "NotebookLM HTML'inde auth token (SNlM0e) bulunamadı. "
-            "Sayfa formatı değişmiş olabilir, ya da auth flow başarısız."
-        )
+        raise NlmError(f"authuser={authuser}: SNlM0e bulunamadı")
     return m.group(1)
+
+
+def fetch_nlm_auth_token(cookies: str, *,
+                         authuser: int = 0,
+                         timeout: int = 30) -> str:
+    """NotebookLM ana sayfasından auth token (WIZ_global_data.SNlM0e) çek.
+
+    Cookie geçerli olmalı (extract_nlm_cookies'in çıktısı). Token ~30 karakter.
+    Süreli — Google rotation politikasına göre 1-24 saat arası geçerli.
+
+    NotebookLM bazen profile'in cookie'leri için spesifik authuser bekliyor;
+    yanlış authuser ile redirect loop oluyor. Bu yüzden parametre olarak
+    verilen authuser'ı önce dene, sonra 0/1/2/3'ü fallback olarak dene.
+    """
+    if not cookies:
+        raise NlmError("cookies boş — fetch_nlm_auth_token çağrısı geçersiz")
+
+    # Aday authuser değerleri: önce verilen, sonra 0/1/2/3 fallback
+    candidates: list[int] = []
+    for au in [authuser, 0, 1, 2, 3]:
+        if au not in candidates:
+            candidates.append(au)
+
+    last_err: Optional[NlmError] = None
+    for au in candidates:
+        try:
+            return _try_fetch_token(cookies, au, timeout)
+        except NlmError as e:
+            last_err = e
+            continue
+
+    raise NlmError(
+        f"NotebookLM auth token tüm authuser (0-3) için başarısız. "
+        f"Son hata: {last_err}. Cookie expired olabilir — profile re-init gerek."
+    )
 
 
 # ---------------------------------------------------------------------------

@@ -3758,6 +3758,25 @@ def render_user_view() -> None:
                 unsafe_allow_html=True,
             )
 
+            # Model selector — bu Step 2 LLM çağrılarında (asset extract) kullanılır.
+            # Step 1'le aynı key ('script_model'), ama Step 1 collapsed olduğu için
+            # widget burada görünür, session state'i paylaşır.
+            _s2_model_ids = [m[0] for m in OPENROUTER_FREE_MODELS]
+            _s2_model_labels = {m[0]: m[1] for m in OPENROUTER_FREE_MODELS}
+            if OPENROUTER_MODEL not in _s2_model_ids:
+                _s2_model_ids.insert(0, OPENROUTER_MODEL)
+                _s2_model_labels[OPENROUTER_MODEL] = f"{OPENROUTER_MODEL} — env'den"
+            if "script_model" not in st.session_state or st.session_state["script_model"] not in _s2_model_ids:
+                st.session_state["script_model"] = OPENROUTER_MODEL
+            st.selectbox(
+                "AI Model (asset extraction için)",
+                options=_s2_model_ids,
+                format_func=lambda mid: _s2_model_labels.get(mid, mid).split(" — ")[0],
+                key="script_model",
+                help="Bir model rate-limited verirse başkasını seç ve tekrar dene. "
+                     "Asset extraction için yeterli — GPT-OSS 120B önerilir.",
+            )
+
             # Step 2 action row: extract + skip + next
             top_cs = st.columns([1.6, 1, 1, 1])
             with top_cs[0]:

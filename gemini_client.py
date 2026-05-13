@@ -131,17 +131,20 @@ def _clean_gemini_context() -> None:
 def _run_gemini(prompt: str, *, model: Optional[str] = None,
                 timeout: int = GEMINI_TIMEOUT_DEFAULT,
                 cwd: Optional[str] = None) -> dict:
-    """gemini -p "<prompt>" -m <model> --output-format json --skip-trust --yolo
+    """gemini -p "" <stdin: prompt> -m <model> --output-format json
+
+    Prompt STDIN üzerinden iletilir (argv length limit'ini bypass eder; uzun
+    Turkish script'ler için kritik). Empty `-p ""` non-interactive mode'u
+    tetikler, gemini-cli stdin'i prompt olarak okur.
 
     Returns parsed JSON dict: {"session_id", "response"?, "error"?, "stats"?}.
-    NotebookLM workspace dosyalarını context'e dahil etmemek için cwd /tmp.
     """
     cmd = [
         GEMINI_BIN,
-        "-p", prompt,
+        "-p", "",          # stdin'i tetikle (gemini-cli help: "appended to input on stdin")
         "--output-format", "json",
         "--skip-trust",
-        "--yolo",  # tool/edit approval auto — text-only kullanıyoruz, etki yok
+        "--yolo",          # tool/edit approval auto — text-only, etki yok
     ]
     if model:
         cmd += ["-m", model]
@@ -158,9 +161,11 @@ def _run_gemini(prompt: str, *, model: Optional[str] = None,
 
     # subprocess.run timeout fırlattığında child process killlemez; Popen +
     # manuel timeout daha güvenilir, orphan node process bırakmıyor.
+    # stdin=PIPE → prompt argv yerine stdin'den iletilir (argv limit bypass).
     try:
         proc = subprocess.Popen(
             cmd,
+            stdin=subprocess.PIPE,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             text=True,
@@ -175,7 +180,9 @@ def _run_gemini(prompt: str, *, model: Optional[str] = None,
         )
 
     try:
-        stdout, stderr = proc.communicate(timeout=timeout)
+        # Prompt'u stdin'den ver — uzun input'lar için argv limit'i (~256KB Mac,
+        # ~128KB Linux) güvenle aşılır.
+        stdout, stderr = proc.communicate(input=prompt, timeout=timeout)
     except subprocess.TimeoutExpired:
         # Tüm process group'u öldür (gemini → node child'ları dahil)
         try:

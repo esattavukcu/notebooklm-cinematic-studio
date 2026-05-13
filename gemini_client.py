@@ -86,6 +86,48 @@ def _build_env() -> dict[str, str]:
     return env
 
 
+def _clean_gemini_context() -> None:
+    """gemini-cli'in context-contamination kaynaklarını temizle.
+
+    Gemini-CLI her çağrıda `~/.gemini/projects.json` (cwd registry) ve
+    `~/.gemini/history/` (conversation cache) yazar. Bunlar TEKRARLI çağrılarda
+    LLM'in context'ine sızabilir — bizim örneğimizde: Türkçe çevre script'i
+    verdik, geriden gelen yanıt 'AI/coding workspace' temalı oldu (eski
+    project cache'inden). Her çağrıdan önce sil → temiz session.
+
+    Idempotent, side-effect free; oauth_creds.json + settings.json dokunulmaz.
+    """
+    try:
+        import shutil
+        gemini_dir = Path.home() / ".gemini"
+        if not gemini_dir.exists():
+            return
+        # History (conversation transcripts cache)
+        history_dir = gemini_dir / "history"
+        if history_dir.exists():
+            shutil.rmtree(history_dir, ignore_errors=True)
+        # Projects registry (cwd → project_name mapping, contaminates context)
+        for p in gemini_dir.glob("projects.json*"):
+            try:
+                p.unlink()
+            except OSError:
+                pass
+        # Tmp / scratch dosyaları
+        tmp_dir = gemini_dir / "tmp"
+        if tmp_dir.exists():
+            shutil.rmtree(tmp_dir, ignore_errors=True)
+        # Google account cache (server-side oauth state, bizim için irrelevant)
+        ga = gemini_dir / "google_accounts.json"
+        if ga.exists():
+            try:
+                ga.unlink()
+            except OSError:
+                pass
+    except Exception:
+        # Sessizce yut — temizlik fail olsa bile gemini çalışabilir
+        pass
+
+
 def _run_gemini(prompt: str, *, model: Optional[str] = None,
                 timeout: int = GEMINI_TIMEOUT_DEFAULT,
                 cwd: Optional[str] = None) -> dict:
@@ -105,11 +147,14 @@ def _run_gemini(prompt: str, *, model: Optional[str] = None,
         cmd += ["-m", model]
 
     # Context-isolation cwd — gemini-cli current dir'i bootstrap context'e
-    # ekliyor (GEMINI.md, mevcut dosyalar). Temiz /tmp dizini kullanırsak
-    # token overhead azalır.
+    # ekliyor (GEMINI.md, mevcut dosyalar). Temiz tmp dizini kullanırsak
+    # token overhead azalır + cross-call contamination olmaz.
     if cwd is None:
-        # Boş bir tmp dizin oluştur (cleanup yok — /tmp zaten cleanup'ı OS yapar)
         cwd = tempfile.mkdtemp(prefix="gemini_cwd_")
+
+    # ~/.gemini/projects.json + history/ cleanup — context contamination önler.
+    # Bunlar olmadığında gemini her çağrıyı temiz session olarak işler.
+    _clean_gemini_context()
 
     # subprocess.run timeout fırlattığında child process killlemez; Popen +
     # manuel timeout daha güvenilir, orphan node process bırakmıyor.

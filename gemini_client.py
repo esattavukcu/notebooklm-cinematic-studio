@@ -86,6 +86,80 @@ def _build_env() -> dict[str, str]:
     return env
 
 
+def _ensure_gemini_settings() -> None:
+    """settings.json'da maxOutputTokens override'ı garanti et (idempotent).
+
+    Gemini-CLI default `maxOutputTokens` ~2-4K (kesin değer doc'ta yok), bizim
+    Weird Facts asset listesi gibi uzun çıktılarda response kesiliyor. Buraya
+    16K-32K aralığı yazıyoruz. settings.json'da başka modelConfig override'ları
+    varsa korunur (sadece bizim global maxOutputTokens'i ekler/günceller).
+    """
+    try:
+        gemini_dir = Path.home() / ".gemini"
+        gemini_dir.mkdir(parents=True, exist_ok=True)
+        settings_path = gemini_dir / "settings.json"
+
+        # Mevcut settings'i oku
+        if settings_path.exists():
+            try:
+                data = json.loads(settings_path.read_text(encoding="utf-8"))
+            except (json.JSONDecodeError, OSError):
+                data = {}
+        else:
+            data = {}
+        if not isinstance(data, dict):
+            data = {}
+
+        # OAuth method'u garanti et (rsync sırasında bozulmuş olabilir)
+        if data.get("selectedAuthType") != "oauth-personal":
+            data["selectedAuthType"] = "oauth-personal"
+
+        # modelConfigs.overrides yapısını oluştur
+        mc = data.setdefault("modelConfigs", {})
+        if not isinstance(mc, dict):
+            mc = {}
+            data["modelConfigs"] = mc
+        overrides = mc.setdefault("overrides", [])
+        if not isinstance(overrides, list):
+            overrides = []
+            mc["overrides"] = overrides
+
+        # Global match (match={}) → her modele uygulanır
+        # Eğer varsa güncelle, yoksa ekle
+        target_idx = None
+        for i, ov in enumerate(overrides):
+            if isinstance(ov, dict) and ov.get("match", None) == {}:
+                target_idx = i
+                break
+        new_override = {
+            "match": {},
+            "modelConfig": {
+                "generateContentConfig": {
+                    "maxOutputTokens": 32768,
+                }
+            },
+        }
+        if target_idx is None:
+            overrides.append(new_override)
+        else:
+            # Mevcut global override → maxOutputTokens'i güncelle (min 16K garanti)
+            try:
+                cur = overrides[target_idx]["modelConfig"]["generateContentConfig"]
+                cur_max = cur.get("maxOutputTokens", 0) or 0
+                if not isinstance(cur_max, int) or cur_max < 16384:
+                    cur["maxOutputTokens"] = 32768
+            except (KeyError, TypeError):
+                overrides[target_idx] = new_override
+
+        settings_path.write_text(
+            json.dumps(data, indent=2, ensure_ascii=False),
+            encoding="utf-8",
+        )
+    except Exception:
+        # Sessizce yut — ayar fail olsa bile gemini çalışabilir (sadece kısa cevap olabilir)
+        pass
+
+
 def _clean_gemini_context() -> None:
     """gemini-cli'in context-contamination kaynaklarını temizle.
 
@@ -156,8 +230,9 @@ def _run_gemini(prompt: str, *, model: Optional[str] = None,
         cwd = tempfile.mkdtemp(prefix="gemini_cwd_")
 
     # ~/.gemini/projects.json + history/ cleanup — context contamination önler.
-    # Bunlar olmadığında gemini her çağrıyı temiz session olarak işler.
     _clean_gemini_context()
+    # settings.json'da maxOutputTokens=32K override garanti et (kısa cevap önler).
+    _ensure_gemini_settings()
 
     # subprocess.run timeout fırlattığında child process killlemez; Popen +
     # manuel timeout daha güvenilir, orphan node process bırakmıyor.

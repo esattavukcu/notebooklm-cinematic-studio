@@ -5,6 +5,7 @@ python-dotenv>=1.0,<2
 # AZURE_STORAGE_CONNECTION_STRING env var set edilmediyse import edilmez.
 # Disk yeri tasarrufu için kaldırmak istersen yorum yapabilirsin.
 azure-storage-blob>=12.19,<13
-# OpenRouter (LLM API) — script iteration, asset extraction
-# OPENROUTER_API_KEY env var set edilmediyse AI özellikler gizlenir.
-openai>=1.0,<2
+# Text gen artık Google'ın gemini-cli (Node.js) üzerinden çalışıyor —
+# OAuth sign-in, API key gerekmez. Python tarafı sadece subprocess wrapper
+# (gemini_client.py), ek Python dependency yok.
+# (Eski 'openai>=1.0,<2' kaldırıldı — OpenRouter desteği removed.)

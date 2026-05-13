@@ -65,6 +65,21 @@ except ImportError as _nlm_imp_err:
     _NLM_AVAILABLE = False
     _nlm_imp_err_msg = str(_nlm_imp_err)
 
+# Gemini CLI wrapper — text gen için kullanılır (OpenRouter yerine).
+# Image gen halen Pollinations (OAuth tier'da nano-banana 404 dönüyor).
+try:
+    from gemini_client import (
+        GeminiError,
+        gemini_chat,
+        gemini_smoke_test,
+        GEMINI_MODELS,
+        GEMINI_DEFAULT_MODEL,
+    )
+    _GEMINI_AVAILABLE = True
+except ImportError as _gemini_imp_err:
+    _GEMINI_AVAILABLE = False
+    _gemini_imp_err_msg = str(_gemini_imp_err)
+
 # ---------------------------------------------------------------------------
 # Sabitler ve yollar
 # ---------------------------------------------------------------------------
@@ -118,51 +133,17 @@ AZURE_ENABLED = bool(AZURE_CONN)
 HEADLESS_INIT_DISPLAY = os.environ.get("HEADLESS_INIT_DISPLAY", "").strip()
 VNC_ENABLED = bool(HEADLESS_INIT_DISPLAY)
 
-# OpenRouter (LLM API). Set edilmediyse AI özellikleri (script iteration, asset
-# extraction) UI'da gizlenir.
-OPENROUTER_API_KEY = os.environ.get("OPENROUTER_API_KEY", "").strip()
-OPENROUTER_MODEL = os.environ.get(
-    "OPENROUTER_MODEL", "openai/gpt-oss-120b:free"
-).strip()
-LLM_ENABLED = bool(OPENROUTER_API_KEY)
-
-# Kullanıcının UI'dan seçebileceği top free modeller (Mayıs 2026 itibarıyla
-# OpenRouter ücretsiz katmanından el ile seçildi). Hepsi instruct + multilingual.
-# Liste eskirse https://openrouter.ai/models?max_price=0 üzerinden güncelle.
-# NOT: Free tier endpoint'leri sık sık unavailable olabiliyor (404, rate limit).
-# Bir model çalışmazsa diğerine geç.
-# --- Image search: opsiyonel free-tier API keyleri ---
+# Image search: opsiyonel free-tier API keyleri.
 # Wikimedia + Openverse key gerektirmez. Pixabay + Pexels free tier ama
 # kayıt + key alımı gerekir. Set edilmezse o kaynak skip edilir.
 PIXABAY_API_KEY = os.environ.get("PIXABAY_API_KEY", "").strip()
 PEXELS_API_KEY = os.environ.get("PEXELS_API_KEY", "").strip()
 
-
-OPENROUTER_FREE_MODELS: list[tuple[str, str]] = [
-    # (id, label) — sıra: probe ile doğrulanmış çalışanlar önce
-    ("openai/gpt-oss-120b:free",
-     "GPT-OSS 120B — OpenAI açık-ağırlık (varsayılan)"),
-    ("openai/gpt-oss-20b:free",
-     "GPT-OSS 20B — OpenAI, daha hızlı"),
-    ("nvidia/nemotron-3-super-120b-a12b:free",
-     "Nemotron 3 Super 120B — NVIDIA"),
-    ("minimax/minimax-m2.5:free",
-     "MiniMax M2.5 — yaratıcı, multilingual"),
-    # Aşağıdakiler zaman zaman rate-limit yiyor; rate-limit mesajı çıkarsa
-    # yukarıdakilerden birine geç.
-    ("meta-llama/llama-3.3-70b-instruct:free",
-     "Llama 3.3 70B — Meta (sık rate-limit)"),
-    ("nousresearch/hermes-3-llama-3.1-405b:free",
-     "Hermes 3 405B — Nous Research, devasa (sık rate-limit)"),
-    ("z-ai/glm-4.5-air:free",
-     "GLM 4.5 Air — Çince/multilingual (sık rate-limit)"),
-    ("qwen/qwen3-next-80b-a3b-instruct:free",
-     "Qwen3 Next 80B — multilingual (sık rate-limit)"),
-    ("google/gemma-4-31b-it:free",
-     "Gemma 4 31B — Google (sık rate-limit)"),
-    ("cognitivecomputations/dolphin-mistral-24b-venice-edition:free",
-     "Dolphin Mistral 24B — uncensored (sık rate-limit)"),
-]
+# Text gen: Gemini CLI üzerinden (Sign-in with Google OAuth).
+# UI'da AI özellikleri (script iteration, asset extraction) sadece
+# _GEMINI_AVAILABLE True ise gösterilir. Smoke test: admin sidebar widget.
+# Eski OpenRouter free-tier listesi kaldırıldı — GEMINI_MODELS gemini_client'te.
+LLM_ENABLED = _GEMINI_AVAILABLE  # backward-compat alias (eski koddaki check'ler bozulmasın)
 
 PYTHON_BIN = sys.executable  # venv'in içindeki python
 
@@ -735,49 +716,9 @@ def upload_to_azure(local_path: Path, job_id: str) -> tuple[bool, str, str]:
 # ---------------------------------------------------------------------------
 # OpenRouter LLM client — script iteration, asset extraction
 # ---------------------------------------------------------------------------
-def _openrouter_chat(messages: list[dict], model: Optional[str] = None,
-                     temperature: float = 0.7, max_tokens: int = 2000) -> tuple[bool, str]:
-    """Returns (success, content_or_error)."""
-    if not LLM_ENABLED:
-        return False, "OPENROUTER_API_KEY .env'de set edilmemiş."
-    try:
-        from openai import OpenAI
-    except ImportError:
-        return False, "openai package kurulu değil (pip install openai)."
-
-    try:
-        client = OpenAI(
-            base_url="https://openrouter.ai/api/v1",
-            api_key=OPENROUTER_API_KEY,
-            default_headers={
-                "HTTP-Referer": "https://llm.yga.tr",
-                "X-Title": "Cinematic Studio",
-            },
-        )
-        response = client.chat.completions.create(
-            model=model or OPENROUTER_MODEL,
-            messages=messages,
-            temperature=temperature,
-            max_tokens=max_tokens,
-        )
-        return True, response.choices[0].message.content or ""
-    except Exception as e:
-        # OpenRouter free tier hatalarını okunaklı hale getir.
-        msg = str(e)
-        used_model = model or OPENROUTER_MODEL
-        if "429" in msg or "rate-limited" in msg.lower():
-            return False, (
-                f"⏳ '{used_model}' şu an provider tarafında rate-limited. "
-                f"Listeden başka bir model seç (örn. GPT-OSS 120B) ve tekrar dene."
-            )
-        if "404" in msg or "No endpoints found" in msg:
-            return False, (
-                f"❌ '{used_model}' artık ücretsiz değil ya da provider'ı yok. "
-                f"Listeden başka bir model seç."
-            )
-        if "401" in msg or "invalid api key" in msg.lower():
-            return False, "🔑 OPENROUTER_API_KEY geçersiz. Sunucudaki .env'i kontrol et."
-        return False, f"LLM hatası: {msg[:300]}"
+# NOTE: _openrouter_chat() kaldırıldı. Text gen artık gemini_client.gemini_chat()
+# üzerinden, OAuth (Sign-in with Google) ile yapılıyor. 3 caller (regenerate_script,
+# generate_script_from_prompt, extract_assets) direkt gemini_chat() çağırıyor.
 
 
 # Sistem prompt'u (her script regenerate'de prepend edilir).
@@ -796,7 +737,10 @@ Output ONLY the revised script text. No preamble, no explanation, no markdown he
 
 def regenerate_script(current_script: str, feedback: str,
                       model: Optional[str] = None) -> tuple[bool, str]:
-    """Mevcut scripti feedback'e göre yeniden üretir. (success, new_script_or_error) döner."""
+    """Mevcut scripti feedback'e göre yeniden üretir. (success, new_script_or_error) döner.
+
+    Gemini CLI üzerinden çalışır (oauth). Eski OpenRouter yolu kaldırıldı.
+    """
     if not feedback.strip():
         return False, "Feedback boş olamaz."
     user_prompt = f"""CURRENT SCRIPT:
@@ -806,14 +750,13 @@ USER FEEDBACK (apply these changes):
 {feedback.strip()}
 
 Generate the revised script."""
-    return _openrouter_chat(
-        [
-            {"role": "system", "content": SCRIPT_EDITOR_SYSTEM},
-            {"role": "user", "content": user_prompt},
-        ],
+    return gemini_chat(
+        user_prompt,
         model=model,
+        system_prompt=SCRIPT_EDITOR_SYSTEM,
         temperature=0.8,
         max_tokens=3000,
+        timeout=180,  # uzun script + thinking olabilir
     )
 
 
@@ -910,16 +853,15 @@ def render_weird_facts_prompt(topic: str, grade_level: str,
 
 def generate_script_from_prompt(prompt: str,
                                  model: Optional[str] = None) -> tuple[bool, str]:
-    """Verilen prompt'u LLM'e gönder, script çıktısı al. (success, script_or_error)."""
+    """Verilen prompt'u Gemini'ye gönder, script çıktısı al. (success, script_or_error)."""
     if not prompt.strip():
         return False, "Prompt boş olamaz."
-    return _openrouter_chat(
-        [
-            {"role": "user", "content": prompt.strip()},
-        ],
+    return gemini_chat(
+        prompt.strip(),
         model=model,
         temperature=0.8,
         max_tokens=2000,
+        timeout=180,  # uzun bir Weird Facts prompt'tan tam script üretmek 30-60s
     )
 
 
@@ -968,14 +910,14 @@ def extract_assets(script: str, model: Optional[str] = None,
 
     sys_prompt = (system_prompt_override or "").strip() or ASSET_EXTRACTOR_SYSTEM
 
-    ok, raw = _openrouter_chat(
-        [
-            {"role": "system", "content": sys_prompt},
-            {"role": "user", "content": f"SCRIPT:\n{script.strip()}\n\nExtract assets as JSON array."},
-        ],
+    ok, raw = gemini_chat(
+        f"SCRIPT:\n{script.strip()}\n\nExtract assets as JSON array.",
         model=model,
-        temperature=0.4,  # daha deterministik — JSON parse hatası az olsun
+        system_prompt=sys_prompt,
+        temperature=0.4,
         max_tokens=4000,
+        json_mode=True,  # downstream parser markdown fence + array slicing yapıyor zaten
+        timeout=180,
     )
     if not ok:
         return False, [], raw  # raw = error mesajı
@@ -3209,7 +3151,7 @@ def render_user_view() -> None:
     def _cb_regenerate() -> None:
         current = st.session_state.get("script_draft", "").strip()
         feedback = st.session_state.get("script_feedback", "").strip()
-        model = st.session_state.get("script_model") or OPENROUTER_MODEL
+        model = st.session_state.get("script_model") or GEMINI_DEFAULT_MODEL
         if not current:
             st.session_state["_script_msg"] = ("err", "Önce bir senaryo yapıştır.")
             return
@@ -3270,7 +3212,7 @@ def render_user_view() -> None:
         kalır, üretileni görüp düzenleyebilir). 'Çıktıyı kullan' → Step 2.
         """
         prompt = st.session_state.get("script_draft", "").strip()
-        model = st.session_state.get("script_model") or OPENROUTER_MODEL
+        model = st.session_state.get("script_model") or GEMINI_DEFAULT_MODEL
         if not prompt:
             st.session_state["_script_msg"] = (
                 "err", "Text area boş — önce prompt yapıştır ya da template doldur."
@@ -3336,7 +3278,7 @@ def render_user_view() -> None:
     # --- Phase B (asset extraction) callbacks ---
     def _cb_extract_assets() -> None:
         script = st.session_state.get("script_draft", "").strip()
-        model = st.session_state.get("script_model") or OPENROUTER_MODEL
+        model = st.session_state.get("script_model") or GEMINI_DEFAULT_MODEL
         override = (
             st.session_state.get("asset_extractor_prompt_override", "") or ""
         ).strip()
@@ -3601,14 +3543,11 @@ def render_user_view() -> None:
 
         # --- Step 1 action buttons ---
         if LLM_ENABLED:
-            # Model selector — sadece "Çıktı oluştur" için kullanılır
-            model_ids = [m[0] for m in OPENROUTER_FREE_MODELS]
-            model_labels = {m[0]: m[1] for m in OPENROUTER_FREE_MODELS}
-            if OPENROUTER_MODEL not in model_ids:
-                model_ids.insert(0, OPENROUTER_MODEL)
-                model_labels[OPENROUTER_MODEL] = f"{OPENROUTER_MODEL} — env'den"
+            # Gemini model selector — sadece "Çıktı oluştur" için kullanılır
+            model_ids = [m[0] for m in GEMINI_MODELS]
+            model_labels = {m[0]: m[1] for m in GEMINI_MODELS}
             if "script_model" not in st.session_state or st.session_state["script_model"] not in model_ids:
-                st.session_state["script_model"] = OPENROUTER_MODEL
+                st.session_state["script_model"] = GEMINI_DEFAULT_MODEL
 
             cs_s1 = st.columns([1.2, 1.4, 1.4])
             with cs_s1[0]:
@@ -3758,23 +3697,17 @@ def render_user_view() -> None:
                 unsafe_allow_html=True,
             )
 
-            # Model selector — bu Step 2 LLM çağrılarında (asset extract) kullanılır.
-            # Step 1'le aynı key ('script_model'), ama Step 1 collapsed olduğu için
-            # widget burada görünür, session state'i paylaşır.
-            _s2_model_ids = [m[0] for m in OPENROUTER_FREE_MODELS]
-            _s2_model_labels = {m[0]: m[1] for m in OPENROUTER_FREE_MODELS}
-            if OPENROUTER_MODEL not in _s2_model_ids:
-                _s2_model_ids.insert(0, OPENROUTER_MODEL)
-                _s2_model_labels[OPENROUTER_MODEL] = f"{OPENROUTER_MODEL} — env'den"
+            # Gemini model selector — asset extraction için, Step 1'le ortak key
+            _s2_model_ids = [m[0] for m in GEMINI_MODELS]
+            _s2_model_labels = {m[0]: m[1] for m in GEMINI_MODELS}
             if "script_model" not in st.session_state or st.session_state["script_model"] not in _s2_model_ids:
-                st.session_state["script_model"] = OPENROUTER_MODEL
+                st.session_state["script_model"] = GEMINI_DEFAULT_MODEL
             st.selectbox(
                 "AI Model (asset extraction için)",
                 options=_s2_model_ids,
                 format_func=lambda mid: _s2_model_labels.get(mid, mid).split(" — ")[0],
                 key="script_model",
-                help="Bir model rate-limited verirse başkasını seç ve tekrar dene. "
-                     "Asset extraction için yeterli — GPT-OSS 120B önerilir.",
+                help="Gemini OAuth ile çalışır. Quota dolu olursa diğer modeli dene.",
             )
 
             # Step 2 action row: extract + skip + next

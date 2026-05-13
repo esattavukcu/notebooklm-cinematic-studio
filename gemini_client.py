@@ -41,14 +41,16 @@ from typing import Optional
 # Config
 # ---------------------------------------------------------------------------
 GEMINI_BIN: str = os.environ.get("GEMINI_BIN_PATH", "").strip() or "gemini"
-GEMINI_TIMEOUT_DEFAULT: int = 120  # text gen genelde 5-30s ama buffer
-GEMINI_DEFAULT_MODEL: str = "flash"  # alias for gemini-2.5-flash
+GEMINI_TIMEOUT_DEFAULT: int = 300  # text gen: pro + uzun input 2-3 dk olabilir
+GEMINI_DEFAULT_MODEL: str = "flash"  # alias for gemini-2.5-flash (default, fast)
 
 # UI selectbox için — kısa labellar (en yaygın 3 model)
+# NOT: 'pro' modeli "thinking" yapıyor, uzun input için 2-5 dk sürer.
+# Default ve önerilen 'flash' — 5-30 sn arası, kalite genelde yeterli.
 GEMINI_MODELS: list[tuple[str, str]] = [
-    ("flash", "Gemini Flash (varsayılan, hızlı + kaliteli)"),
-    ("pro", "Gemini Pro (en yüksek kalite, biraz yavaş)"),
-    ("flash-lite", "Gemini Flash Lite (en hızlı, basit görevler)"),
+    ("flash", "Gemini Flash (varsayılan — hızlı, 5-30sn)"),
+    ("flash-lite", "Gemini Flash Lite (en hızlı, basit görevler için)"),
+    ("pro", "Gemini Pro (en kaliteli ama YAVAŞ — uzun script'lerde 2-5dk)"),
 ]
 
 
@@ -109,25 +111,48 @@ def _run_gemini(prompt: str, *, model: Optional[str] = None,
         # Boş bir tmp dizin oluştur (cleanup yok — /tmp zaten cleanup'ı OS yapar)
         cwd = tempfile.mkdtemp(prefix="gemini_cwd_")
 
+    # subprocess.run timeout fırlattığında child process killlemez; Popen +
+    # manuel timeout daha güvenilir, orphan node process bırakmıyor.
     try:
-        proc = subprocess.run(
+        proc = subprocess.Popen(
             cmd,
-            capture_output=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
             text=True,
-            timeout=timeout,
             env=_build_env(),
             cwd=cwd,
-            check=False,
+            start_new_session=True,  # child'ı kendi proc group'una koy → tüm tree kill edilebilir
         )
     except FileNotFoundError:
         raise GeminiError(
             f"gemini binary bulunamadı (PATH veya GEMINI_BIN_PATH): {GEMINI_BIN}. "
             f"Server'a 'npm install -g @google/gemini-cli' yapılmalı."
         )
+
+    try:
+        stdout, stderr = proc.communicate(timeout=timeout)
     except subprocess.TimeoutExpired:
+        # Tüm process group'u öldür (gemini → node child'ları dahil)
+        try:
+            import signal as _signal
+            os.killpg(os.getpgid(proc.pid), _signal.SIGKILL)
+        except Exception:
+            try:
+                proc.kill()
+            except Exception:
+                pass
+        try:
+            proc.wait(timeout=5)
+        except Exception:
+            pass
         raise GeminiError(f"gemini timeout ({timeout}s)")
     finally:
-        # cwd tmp'i temizle (best-effort, hata olursa OS halleder)
+        # Safety: hâlâ çalışıyorsa kapat + tmp cwd temizle (OS'a bırakmaktansa)
+        if proc.poll() is None:
+            try:
+                proc.kill()
+            except Exception:
+                pass
         try:
             import shutil
             if cwd and "gemini_cwd_" in cwd:
@@ -135,8 +160,9 @@ def _run_gemini(prompt: str, *, model: Optional[str] = None,
         except Exception:
             pass
 
-    stdout = proc.stdout or ""
-    stderr = proc.stderr or ""
+    # stdout/stderr communicate()'den lokal variable olarak geldi
+    stdout = stdout or ""
+    stderr = stderr or ""
 
     # gemini-cli bazen stdout başında log/warning satırları basıyor:
     # "Warning: 256-color..." "Ripgrep is not available..."

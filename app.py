@@ -756,7 +756,7 @@ Generate the revised script."""
         system_prompt=SCRIPT_EDITOR_SYSTEM,
         temperature=0.8,
         max_tokens=3000,
-        timeout=180,  # uzun script + thinking olabilir
+        timeout=300,  # pro + uzun script 2-3dk olabilir
     )
 
 
@@ -3557,6 +3557,7 @@ def render_user_view() -> None:
                     format_func=lambda mid: model_labels.get(mid, mid).split(" — ")[0],
                     key="script_model",
                     label_visibility="collapsed",
+                    help="Flash önerilir. Pro uzun script'lerde 2-5dk sürebilir.",
                 )
             with cs_s1[1]:
                 st.button(
@@ -3565,7 +3566,8 @@ def render_user_view() -> None:
                     use_container_width=True,
                     on_click=_cb_generate_output,
                     key="btn_generate_output",
-                    help="Text alandaki PROMPT'u LLM'e gönder, script üret. 5-15 sn sürer.",
+                    help="Text alandaki PROMPT'u Gemini'ye gönder, script üret. "
+                         "Flash ~5-30sn, Pro 2-5dk olabilir.",
                 )
             with cs_s1[2]:
                 st.button(
@@ -3707,8 +3709,15 @@ def render_user_view() -> None:
                 options=_s2_model_ids,
                 format_func=lambda mid: _s2_model_labels.get(mid, mid).split(" — ")[0],
                 key="script_model",
-                help="Gemini OAuth ile çalışır. Quota dolu olursa diğer modeli dene.",
+                help="Flash önerilir (5-30sn). Pro daha kaliteli ama uzun script'lerde "
+                     "2-5dk sürebilir — gerçekten gerekirse seç.",
             )
+            # Pro seçildiyse uyar
+            if st.session_state.get("script_model") == "pro":
+                st.caption(
+                    "⏳ **Pro model uzun input'larda yavaştır** — bu Step için "
+                    "Flash genelde yeterli, sadece çok kaliteli çıktı gerekiyorsa Pro tut."
+                )
 
             # Step 2 action row: extract + skip + next
             top_cs = st.columns([1.6, 1, 1, 1])

@@ -143,14 +143,15 @@ def download_drive_folder(folder_id_or_url: str,
         )
     out_dir.mkdir(parents=True, exist_ok=True)
     url = f"https://drive.google.com/drive/folders/{folder_id}"
-    # gdown.download_folder None döner ya da indirilen path listesi
+    # gdown 6.x: download_folder(url, output, quiet, use_cookies, ...) — no
+    # remaining_ok kwarg, eski 4.x'te 50-file limit'i için gerekiyordu, 6.x'te
+    # default davranış değişti. use_cookies=False = public klasör için yeterli.
     try:
         downloaded = gdown.download_folder(
             url=url,
             output=str(out_dir),
             quiet=quiet,
-            use_cookies=False,  # public folder için cookie istemez
-            remaining_ok=True,  # 50+ dosya limit'i için
+            use_cookies=False,
         )
     except Exception as e:
         raise RuntimeError(

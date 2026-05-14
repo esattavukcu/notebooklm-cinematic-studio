@@ -642,6 +642,51 @@ def render_custom_prompt(template: str, script_title: str,
 
 
 # ---------------------------------------------------------------------------
+# Sabit (her zaman eklenen) execution guide. Her job submit'inde
+# kullanıcının custom_prompt'unun ÜSTÜNE prepend edilir → NotebookLM
+# Cinematic generation'a böyle geçer. jobs.json'da audit trail temiz kalır
+# (sadece user'ın yazdığı kısım saklanır); guide her gen'de re-injected.
+# ---------------------------------------------------------------------------
+EXECUTION_GUIDE_PROMPT = """Narrative & Text-Free Execution Guide
+Narration: The audio must go with similar examples to the original script or video, but must also be unique in it's own visuals design.
+Zero-Text Policy: Absolutely no letters, numbers, labels, or titles are permitted in the frame.
+Symbolic Replacement: Use color-coded icons, focal shifts, or zooms to highlight specific parts of a subject instead of using text labels.
+Language Barrier: Do not generate any text overlays to ensure the video is ready for immediate localization.
+
+The 80/20 Animation-Heavy Model
+Style: 80% minimalist "sketch" style and "paper cut-out" animation styles, with 20% realistic visuals.
+No Hybrid Clutter: Do not mix a photo and an illustration in the same frame; keep them as distinct scenes.
+Dynamic Flow: Every scene must have motion (e.g., wide pans or macro photography) to avoid "static" talking heads.
+
+Student Safety & Visual Harmony Guide
+Soft Geometry: Prioritize rounded forms and curvilinear geometry; avoid jagged edges, or needle-like structures.
+High-Key Lighting: Use bright lighting with lifted shadows to ensure no "dark voids" or threatening atmospheres exist.
+Texture Control: Surfaces must be clean and continuous; avoid "high-frequency" details like scales, tiny bumps, or branching fractal patterns.
+Anti-Clutter (Non-Tangle): Do not allow crossing lines, or chaotic textures to appear on screen.
+Compositional Safety: Maintain a medium focal length and ensure a clear "exit point" in the background to prevent a feeling of claustrophobia.
+
+Historical Accuracy & Identity Protocol
+Authentic Representation Visual Fidelity: When the script identifies a specific historical or real-world figure, all visual depictions—regardless of artistic style—must accurately reflect that individual's documented ethnicity, age, and identity.
+Contextual Accuracy: Any specific locations, tools, or environments mentioned must be represented in a way that respects the historical or geographical reality of the narrative.
+Primary Source Integration Real-Image Mandate: For any specific real-world subject (person or place) featured in the script, the video must include at least 1-2 appearances of an actual primary source image (e.g., an authentic photograph, a verified portrait, or a contemporary document).
+Strategic Placement: These authentic images should be timed to coincide with the introduction or a significant point of the subject within the narration.
+Stylistic Continuity Visual Bridge: The "Illustrated/Animated" versions of a subject must maintain recognizable visual features consistent with real-life person.
+Safety-Adjusted History Visual Correction: Primary source images that are naturally dark, high-contrast, or grainy must be adjusted to align with High-Key lighting standards. Lift shadows to ensure the image is clear and non-threatening for a student audience."""
+
+
+def apply_execution_guide(user_custom_prompt: str) -> str:
+    """Submit zamanında: sabit execution guide'ı user prompt'un üstüne prepend.
+
+    User boş bıraktıysa sadece guide gider. User text yazdıysa guide
+    önce, "---" separator, sonra user'ın text'i.
+    """
+    user = (user_custom_prompt or "").strip()
+    if not user:
+        return EXECUTION_GUIDE_PROMPT
+    return f"{EXECUTION_GUIDE_PROMPT}\n\n---\n\n{user}"
+
+
+# ---------------------------------------------------------------------------
 # Stale-state cleanup: streamlit crash sonrası "running" kalan job'lar
 # ---------------------------------------------------------------------------
 def _pid_alive(pid: int) -> bool:
@@ -1963,12 +2008,22 @@ class Worker:
             jobs_all = load_jobs()
             target = next((j for j in jobs_all if j.id == job_id), None)
             title = (target.title if target else "Untitled")[:80]
+            # Sabit execution guide her job'a otomatik prepend edilir.
+            # jobs.json'da audit user'ın yazdığı şekilde kalır, NotebookLM'e
+            # giden prompt full (guide + user) olur.
+            final_prompt = apply_execution_guide(custom_prompt)
+            log_fp.write(
+                f"## execution guide applied "
+                f"(user_chars={len(custom_prompt or '')}, "
+                f"full_chars={len(final_prompt)})\n"
+            )
+            log_fp.flush()
             try:
                 result = notebooklm_submit_job(
                     profile_id=profile.id,
                     title=title,
                     source_paths=source_paths,
-                    custom_prompt=custom_prompt,
+                    custom_prompt=final_prompt,
                     on_event=on_event,
                     language="tr",  # script Türkçe ağırlıklı
                     video_timeout_sec=3600.0,  # 1h Cinematic Veo 3
@@ -3270,6 +3325,15 @@ def render_bulk_drive_section(*, key_prefix: str = "blk") -> None:
         height=140,
         label_visibility="collapsed",
     )
+
+    st.info(
+        "🔒 Sabit talimatlar (Text-Free / 80-20 Animation / Student Safety / "
+        "Historical Accuracy) her job'a otomatik eklenir — sen yazdığın template "
+        "buna eklenir.",
+        icon="ℹ️",
+    )
+    with st.expander("👁 Sabit talimatları gör (read-only)"):
+        st.code(EXECUTION_GUIDE_PROMPT, language=None)
 
     cols = st.columns([1, 1, 2])
     with cols[0]:
@@ -4884,6 +4948,16 @@ def render_user_view() -> None:
                 "when narration says: \"...\"' kısımları görsel-anlatım eşlemesini "
                 "yönlendirir."
             )
+            st.info(
+                "🔒 **Sabit talimatlar her gönderime otomatik eklenir** "
+                "(Narrative & Text-Free + 80/20 Animation + Student Safety + "
+                "Historical Accuracy protokolleri). Aşağıdaki kutu sadece **senin** "
+                "edit edebileceğin ek talimatlar — sabit kısım üstte invisible olarak "
+                "her zaman dahil edilir.",
+                icon="ℹ️",
+            )
+            with st.expander("👁 Sabit talimatları gör (read-only)"):
+                st.code(EXECUTION_GUIDE_PROMPT, language=None)
 
             cs_p = st.columns([1.2, 4])
             with cs_p[0]:

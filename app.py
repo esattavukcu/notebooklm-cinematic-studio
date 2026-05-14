@@ -3664,31 +3664,85 @@ def render_user_view() -> None:
     def _cb_use_manual_url(asset_id: str, widget_key: str) -> None:
         """Kullanıcının yapıştırdığı URL'i selected_image olarak set et.
 
-        Tolerant: protocol eksikse https:// prepend, tüm whitespace (newline +
-        tab + space) temizlenir. Hata mesajında ne paste edildiği görünür ki
-        kullanıcı sorunu kendi görebilsin.
+        Tolerant: protocol eksikse https:// prepend, tüm whitespace temizlenir.
+        Wikipedia article URL'leri (#/media/File:Foo.jpg) otomatik Commons
+        FilePath endpoint'ine yönlendirilir → direct image. HEAD request ile
+        content-type doğrulanır — image olmadığı kesinse reddedilir.
+        Hata mesajında ne paste edildiği görünür.
         """
         raw = st.session_state.get(widget_key) or ""
-        # Tüm whitespace + non-printable temizle (kopyalamada newline yutuluyor)
         url = "".join(raw.split()).strip()
         if not url:
             st.session_state["_script_msg"] = ("err", "URL kutusu boş.")
             return
-        # Protocol yoksa https:// prepend (örn. example.com/img.jpg)
         low = url.lower()
         if not (low.startswith("http://") or low.startswith("https://")
                 or low.startswith("data:image/")):
-            # data:image değilse, normal http URL kabul et — auto-fix https
             if "://" in url:
-                # Bilinmeyen scheme (ftp:// vs.) — reddet
                 st.session_state["_script_msg"] = (
                     "err",
                     f"Sadece http://, https:// veya data:image/ desteklenir "
                     f"(paste: {url[:60]}…)",
                 )
                 return
-            # Scheme yok → https:// prepend dene
             url = "https://" + url
+            low = url.lower()
+
+        # --- Wikipedia article URL → direct image URL ---
+        # 'https://en.wikipedia.org/wiki/Foo#/media/File:Bar.jpg' kalıbı
+        # Commons Special:FilePath ile resolve edilir (302 → actual upload URL).
+        wiki_marker = "/wiki/"
+        media_marker = "#/media/file:"
+        if wiki_marker in low and media_marker in low:
+            try:
+                # File:... kısmını ayır
+                idx = low.index(media_marker)
+                filename = url[idx + len(media_marker):]
+                # URL decode ki space/Türkçe karakter düzgün geçsin
+                filename = urllib.parse.unquote(filename)
+                # Special:FilePath direct image redirect endpoint
+                resolved = (
+                    "https://commons.wikimedia.org/wiki/Special:FilePath/"
+                    + urllib.parse.quote(filename)
+                )
+                st.session_state["_script_msg"] = (
+                    "ok",
+                    f"Wikipedia URL'i → Commons FilePath'e çevrildi: {filename[:60]}",
+                )
+                url = resolved
+                low = url.lower()
+            except Exception:
+                pass  # heuristic fail → orijinali kullan, HEAD validate yapsın
+
+        # --- HEAD request ile content-type doğrulama (data: hariç) ---
+        # Hızlı sanity check — image değilse paste anında uyar (submit'e bırakma).
+        if not low.startswith("data:"):
+            try:
+                req = urllib.request.Request(
+                    url, method="HEAD", headers=_DOWNLOAD_HEADERS,
+                )
+                with urllib.request.urlopen(req, timeout=8) as r:
+                    ctype = r.headers.get("Content-Type", "").lower()
+                if ctype and not ctype.startswith("image/"):
+                    # Yine de izin ver ama uyar — bazı CDN'ler HEAD'i yanlış cevaplar
+                    st.session_state["_script_msg"] = (
+                        "warn",
+                        f"⚠ URL bir görsel değil gibi (Content-Type: {ctype.split(';')[0]}). "
+                        f"Eğer doğru URL ise sağ tıkla → 'Resim adresini kopyala' deneyebilirsin.",
+                    )
+            except urllib.error.HTTPError as he:
+                # 404, 403, 405 (HEAD not allowed) — soft warn, izin ver
+                if he.code in (404, 410):
+                    st.session_state["_script_msg"] = (
+                        "err",
+                        f"URL erişilemez ({he.code} {he.reason}). "
+                        f"URL: {url[:80]}",
+                    )
+                    return
+            except Exception:
+                # Timeout, DNS, vs — paste'e izin ver, submit'te yine de denenir
+                pass
+
         for a in st.session_state.get("script_assets", []):
             if a.get("id") != asset_id:
                 continue
@@ -3703,9 +3757,10 @@ def render_user_view() -> None:
                 "width": 0,
                 "height": 0,
             }
-            # Widget'ı temizle (bir sonraki run'da)
             st.session_state[widget_key] = ""
-            st.session_state["_script_msg"] = ("ok", f"URL seçildi: {url[:80]}")
+            # Eğer önceden warn/err mesajı set edilmediyse OK mesajı koy
+            if "_script_msg" not in st.session_state or st.session_state.get("_script_msg") is None:
+                st.session_state["_script_msg"] = ("ok", f"URL seçildi: {url[:80]}")
             _persist_draft()
             break
 
@@ -4472,6 +4527,8 @@ def render_user_view() -> None:
         kind, text_msg = _msg
         if kind == "ok":
             st.toast(text_msg, icon="✨")
+        elif kind == "warn":
+            st.warning(text_msg)
         else:
             st.error(text_msg)
 

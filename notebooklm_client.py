@@ -374,11 +374,13 @@ async def _resume_download_async(
         target = videos[0]
         artifact_id = target.id
 
-        # Hazır mı?
-        is_ready = bool(
-            getattr(target, "is_complete", False)
-            or getattr(target, "status", "").lower() in ("ready", "complete", "done")
-        )
+        # Hazır mı? status field int veya str olabilir (library enum).
+        is_ready = bool(getattr(target, "is_complete", False))
+        if not is_ready:
+            _st = getattr(target, "status", "")
+            _st_str = str(_st).lower() if _st is not None else ""
+            if _st_str in ("ready", "complete", "done", "completed", "success"):
+                is_ready = True
         if not is_ready and wait_if_processing:
             try:
                 final = await c.artifacts.wait_for_completion(

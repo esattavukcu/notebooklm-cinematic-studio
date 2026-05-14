@@ -1909,6 +1909,31 @@ class Worker:
             except NotebookLMClientError as e:
                 log_fp.write(f"## NotebookLMClientError [{e.stage}]: {e}\n")
                 log_fp.flush()
+                # --- Quota detection: NotebookLM "daily Cinematic limit"
+                # mesajı varsa job'u failed yapma → quota_exceeded event tetikle
+                # (mevcut _apply_event flow: failed marker oluşturur ki dispatcher
+                # bu profili pas geçsin, ASIL job'u queued'a geri alır → yarın
+                # otomatik retry edilir veya başka profile dispatch olur).
+                err_msg = str(e).lower()
+                is_quota = (
+                    e.stage in ("video_gen", "video_wait", "video_download")
+                    and any(k in err_msg for k in (
+                        "quota", "rate limit", "rate-limit", "rate_limit",
+                        "daily limit", "limit reached", "exceeded",
+                        "too many requests", "429",
+                    ))
+                )
+                if is_quota:
+                    log_fp.write(
+                        f"## quota_exceeded detected (stage={e.stage}) → "
+                        f"requeue job + mark profile blocked today\n"
+                    )
+                    log_fp.flush()
+                    self._apply_event(job_id, {
+                        "type": "quota_exceeded",
+                        "raw": str(e)[:500],
+                    })
+                    return
                 # Hata: job status=failed + auth ise profile init=False
                 jobs_all = load_jobs()
                 for j in jobs_all:

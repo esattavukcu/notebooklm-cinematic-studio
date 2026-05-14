@@ -1045,10 +1045,31 @@ def _http_get_json(url: str, headers: Optional[dict] = None) -> Optional[dict]:
         return None
 
 
-def _search_wikimedia(query: str, limit: int = 4) -> list[dict]:
+# Style keyword boosts — Wikimedia/Openverse/Pexels text query'sine eklenir
+# (bu API'lerin native image_type filter'ı yok). Tek kelime: search engine'ler
+# multi-keyword'ü genelde AND ile match'liyor, fazla keyword sonuçları 0'a indiriyor.
+_STYLE_QUERY_BOOST = {
+    "photo": "",                # default zaten photo ağırlıklı, boost gereksiz
+    "illustration": " illustration",
+    "diagram": " diagram",
+    "archive": " historical",
+}
+
+
+def _style_boost_query(query: str, style: str) -> str:
+    """Query'yi style keyword'leriyle genişlet (search relevance için)."""
+    boost = _STYLE_QUERY_BOOST.get(style, "")
+    if not boost:
+        return query
+    return f"{query}{boost}"
+
+
+def _search_wikimedia(query: str, limit: int = 4,
+                      style: str = "photo") -> list[dict]:
     """Wikimedia Commons'ta görsel ara. CC-BY-SA / public domain genelde."""
     if not query.strip():
         return []
+    query = _style_boost_query(query, style)
     # generator=search → search results
     # prop=imageinfo + iiurlwidth=400 → 400px thumbnail URL döner
     # iiprop: url (full), size, extmetadata (license info için)
@@ -1101,8 +1122,12 @@ def _search_wikimedia(query: str, limit: int = 4) -> list[dict]:
     return results
 
 
-def _search_openverse(query: str, limit: int = 4) -> list[dict]:
+def _search_openverse(query: str, limit: int = 4,
+                      style: str = "photo") -> list[dict]:
     """Openverse aggregator (Flickr/CC kaynakları). API key gerekmez.
+
+    Openverse 'category' parametresi destekler: photograph | illustration |
+    digitized_artwork. Style buna map'lenir; ek olarak query keyword boost.
 
     Not: license_type filtresi koymuyoruz — Openverse zaten sadece CC içerik
     indeksliyor, ama strict "commercial" filtresi sonuçları çok daraltıyor.
@@ -1110,9 +1135,17 @@ def _search_openverse(query: str, limit: int = 4) -> list[dict]:
     """
     if not query.strip():
         return []
+    # Openverse native category filter
+    _OV_CATEGORY = {
+        "photo": "photograph",
+        "illustration": "illustration",
+        "diagram": "illustration",       # diagram için yakın eşleşme
+        "archive": "digitized_artwork",  # archival material
+    }
     params = {
-        "q": query,
+        "q": _style_boost_query(query, style),
         "page_size": str(limit),
+        "category": _OV_CATEGORY.get(style, "photograph"),
     }
     # Yeni domain api.openverse.org — eski .engineering hala çalışıyor ama yeni daha stabil
     url = "https://api.openverse.org/v1/images/?" + urllib.parse.urlencode(params)
@@ -1135,18 +1168,27 @@ def _search_openverse(query: str, limit: int = 4) -> list[dict]:
     return results
 
 
-def _search_pixabay(query: str, limit: int = 4) -> list[dict]:
+def _search_pixabay(query: str, limit: int = 4,
+                    style: str = "photo") -> list[dict]:
     """Pixabay — free tier (key gerek). https://pixabay.com/api/docs/
 
+    image_type style'a map'lenir: photo|illustration|vector|all.
     Lisans: Pixabay License (commercial-friendly, atıf opsiyonel).
     """
     if not PIXABAY_API_KEY or not query.strip():
         return []
+    # Style → Pixabay image_type
+    _PIXABAY_TYPE = {
+        "photo": "photo",
+        "illustration": "illustration",
+        "diagram": "vector",   # vector graphics ≈ diagram/infographic
+        "archive": "photo",    # archive = old photo
+    }
     params = {
         "key": PIXABAY_API_KEY,
-        "q": query,
+        "q": _style_boost_query(query, style),
         "per_page": str(max(3, limit)),  # min 3
-        "image_type": "photo",
+        "image_type": _PIXABAY_TYPE.get(style, "photo"),
         "safesearch": "true",
     }
     url = "https://pixabay.com/api/?" + urllib.parse.urlencode(params)
@@ -1169,14 +1211,22 @@ def _search_pixabay(query: str, limit: int = 4) -> list[dict]:
     return results
 
 
-def _search_pexels(query: str, limit: int = 4) -> list[dict]:
+def _search_pexels(query: str, limit: int = 4,
+                   style: str = "photo") -> list[dict]:
     """Pexels — free tier (key gerek). https://www.pexels.com/api/documentation/
 
+    Pexels'te native style filter yok (sadece fotoğraf), style sadece
+    query'ye keyword olarak eklenir. illustration/diagram için sonuçlar
+    zayıf çıkar — Pixabay ve Wikimedia daha iyi alternatif.
     Lisans: Pexels License (commercial-friendly, atıf opsiyonel).
     """
     if not PEXELS_API_KEY or not query.strip():
         return []
-    params = {"query": query, "per_page": str(limit)}
+    # Pexels sadece foto, style query-boost
+    if style != "photo":
+        # illustration / diagram için Pexels skip (kalitesiz match)
+        return []
+    params = {"query": _style_boost_query(query, style), "per_page": str(limit)}
     url = "https://api.pexels.com/v1/search?" + urllib.parse.urlencode(params)
     data = _http_get_json(url, headers={"Authorization": PEXELS_API_KEY})
     if not data:
@@ -1388,14 +1438,21 @@ def generate_images(prompt: str, count: int = 4, model: str = "flux",
     return out
 
 
-def search_images(query: str, limit: int = 12) -> list[dict]:
+def search_images(query: str, limit: int = 12,
+                  style: str = "photo") -> list[dict]:
     """Aynı query'yi tüm aktif kaynaklarda ara, sonuçları interleave et.
+
+    style: 'photo' | 'illustration' | 'diagram' | 'archive'
+      - Pixabay: native image_type filter (photo/illustration/vector)
+      - Openverse: native category filter (photograph/illustration/digitized_artwork)
+      - Wikimedia: query keyword boost
+      - Pexels: sadece photo (illustration/diagram için skip — kalitesiz match)
 
     Aktif kaynaklar:
     - Wikimedia (her zaman, key gerekmez)
     - Openverse (her zaman, key gerekmez)
     - Pixabay (PIXABAY_API_KEY env set ise)
-    - Pexels (PEXELS_API_KEY env set ise)
+    - Pexels (PEXELS_API_KEY env set ise — sadece photo style)
 
     Interleave: kaynak çeşitliliği için round-robin.
     """
@@ -1403,12 +1460,12 @@ def search_images(query: str, limit: int = 12) -> list[dict]:
         return []
     per_source = max(2, limit // 4)
     sources: list[list[dict]] = []
-    sources.append(_search_wikimedia(query, limit=per_source + 2))
-    sources.append(_search_openverse(query, limit=per_source + 2))
+    sources.append(_search_wikimedia(query, limit=per_source + 2, style=style))
+    sources.append(_search_openverse(query, limit=per_source + 2, style=style))
     if PIXABAY_API_KEY:
-        sources.append(_search_pixabay(query, limit=per_source + 2))
+        sources.append(_search_pixabay(query, limit=per_source + 2, style=style))
     if PEXELS_API_KEY:
-        sources.append(_search_pexels(query, limit=per_source + 2))
+        sources.append(_search_pexels(query, limit=per_source + 2, style=style))
 
     # Round-robin interleave
     out = []
@@ -3940,7 +3997,8 @@ def render_user_view() -> None:
                     "err", "Search query boş — önce query alanını doldur."
                 )
                 return
-            results = search_images(q, limit=8)
+            style = (a.get("style") or "photo").lower()
+            results = search_images(q, limit=8, style=style)
             a["candidates"] = results
             a["search_done_at"] = time.time()
             if not results:

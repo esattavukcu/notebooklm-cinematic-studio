@@ -96,6 +96,18 @@ except ImportError as _gemini_imp_err:
     _GEMINI_AVAILABLE = False
     _gemini_imp_err_msg = str(_gemini_imp_err)
 
+# Bulk import: Drive klasöründen toplu docx → Job (gdown + python-docx).
+try:
+    from bulk_import import (
+        bulk_import_from_drive,
+        is_available as bulk_is_available,
+        extract_folder_id as bulk_extract_folder_id,
+    )
+    _BULK_AVAILABLE = True
+except ImportError as _bulk_imp_err:
+    _BULK_AVAILABLE = False
+    _bulk_imp_err_msg = str(_bulk_imp_err)
+
 # ---------------------------------------------------------------------------
 # Sabitler ve yollar
 # ---------------------------------------------------------------------------
@@ -5023,8 +5035,9 @@ st.markdown(
 
 
 # ===== ANA PANEL — TAB'LAR =====
-tab_prep, tab_status, tab_videos, tab_log, tab_users = st.tabs(
-    ["📝  Hazırla", "📊  Durum", "🎬  Videolar", "📜  Log", "👥  Kullanıcılar"]
+tab_prep, tab_bulk, tab_status, tab_videos, tab_log, tab_users = st.tabs(
+    ["📝  Hazırla", "🗂️  Drive Toplu", "📊  Durum",
+     "🎬  Videolar", "📜  Log", "👥  Kullanıcılar"]
 )
 
 
@@ -5167,6 +5180,196 @@ with tab_prep:
             st.session_state.selected_draft_ids = set()
             st.toast(f"{n} job kuyruğa eklendi.", icon="✅")
             st.rerun()
+
+
+# -------------------- TAB: DRIVE TOPLU --------------------
+with tab_bulk:
+    section_header(
+        "🗂️ Drive'dan toplu docx import",
+        "Bir Drive klasöründeki tüm .docx dosyalarını otomatik script yap, queue'ya at"
+    )
+
+    if not _BULK_AVAILABLE:
+        st.error(
+            f"bulk_import modülü yüklü değil: {_bulk_imp_err_msg}. "
+            "Server'da `pip install gdown python-docx` çalıştır."
+        )
+    else:
+        _bulk_ok, _bulk_msg = bulk_is_available()
+        if not _bulk_ok:
+            st.error(f"Bulk import bağımlılıkları eksik: {_bulk_msg}")
+        else:
+            st.caption(f"✓ {_bulk_msg}")
+
+            # ---- Input ----
+            st.markdown(
+                '**Drive klasörü URL veya ID** — klasör <b>"Anyone with the link"</b> '
+                'olmalı (sağ tık → Share → Genel link). Aksi halde erişim hatası alır.',
+                unsafe_allow_html=True,
+            )
+            drive_url = st.text_input(
+                "Drive klasör URL/ID",
+                key="bulk_drive_url",
+                placeholder="https://drive.google.com/drive/folders/1AbCdEf...",
+            )
+
+            # ---- Custom prompt template ----
+            _default_template = (
+                "Role: Educational video producer.\n\n"
+                "Task: Generate a cinematic video overview using the provided "
+                "script source.\n\n"
+                "Style: Documentary, 30-40 seconds, Turkish narration, "
+                "engaging pace, scientific accuracy.\n\n"
+                "Audience: Curious general public, ages 12+."
+            )
+            st.markdown("**Custom prompt template** (tüm jobs'lar bunu kullanır):")
+            prompt_template = st.text_area(
+                "Template",
+                value=st.session_state.get("bulk_prompt_template", _default_template),
+                key="bulk_prompt_template",
+                height=140,
+                label_visibility="collapsed",
+            )
+
+            # ---- Önizleme ----
+            cols = st.columns([1, 1, 2])
+            with cols[0]:
+                preview_btn = st.button("👁 Önizle", use_container_width=True)
+            with cols[1]:
+                submit_btn = st.button(
+                    "🚀 Hepsini queue'ya at",
+                    use_container_width=True, type="primary",
+                )
+
+            # State holder for preview results
+            if "bulk_preview" not in st.session_state:
+                st.session_state["bulk_preview"] = None
+
+            # ---- Önizleme handler ----
+            if preview_btn:
+                folder_id = bulk_extract_folder_id(drive_url) if drive_url else None
+                if not folder_id:
+                    st.error("Geçerli Drive klasör URL/ID değil.")
+                else:
+                    with st.spinner(f"Drive klasörü taranıyor (folder_id={folder_id[:12]}…)…"):
+                        try:
+                            from bulk_import import list_drive_folder_docx
+                            import tempfile
+                            _tmp = Path(tempfile.mkdtemp(prefix="bulk_preview_"))
+                            docx_paths = list_drive_folder_docx(drive_url, _tmp)
+                            st.session_state["bulk_preview"] = {
+                                "folder_id": folder_id,
+                                "count": len(docx_paths),
+                                "names": [p.name for p in docx_paths],
+                                "tmp_dir": str(_tmp),
+                            }
+                        except Exception as e:
+                            st.error(f"Drive okuma hatası: {type(e).__name__}: {e}")
+                            st.session_state["bulk_preview"] = None
+
+            # ---- Önizleme görüntüsü ----
+            preview = st.session_state.get("bulk_preview")
+            if preview:
+                st.success(
+                    f"✓ **{preview['count']}** adet .docx bulundu klasörde "
+                    f"(folder_id={preview['folder_id'][:14]}…)"
+                )
+                with st.expander(f"Dosya listesi ({preview['count']})"):
+                    for nm in preview["names"][:60]:
+                        st.markdown(f"• {nm}")
+                    if len(preview["names"]) > 60:
+                        st.caption(f"+{len(preview['names']) - 60} daha…")
+
+                # Kapasite info
+                _profs_init = [p for p in load_profiles() if p.initialized]
+                _daily_cap = sum(max(p.daily_limit or 0, 0) for p in _profs_init) or 9
+                _days = max(1, -(-preview["count"] // _daily_cap))
+                st.caption(
+                    f"📅 Toplam kapasite: {len(_profs_init)} profil × {_daily_cap // len(_profs_init) if _profs_init else 0}/gün "
+                    f"= **{_daily_cap} job/gün** → **~{_days} gün**'de biter (kuyruktan otomatik)"
+                )
+
+            # ---- Submit handler ----
+            if submit_btn:
+                folder_id = bulk_extract_folder_id(drive_url) if drive_url else None
+                if not folder_id:
+                    st.error("Geçerli Drive klasör URL/ID değil.")
+                elif not prompt_template.strip():
+                    st.error("Custom prompt boş olamaz.")
+                else:
+                    submitter = _user_name() or "bulk_admin"
+
+                    def _job_factory(title, text, custom_prompt, submitted_by):
+                        """bulk_import callback — Job dict üret."""
+                        return {
+                            "id": uuid.uuid4().hex[:12],
+                            "title": title,
+                            "text": text,
+                            "custom_prompt": custom_prompt,
+                            "submitted_by": submitted_by,
+                            "status": "queued",
+                            "assets": [],  # bulk: image yok
+                            "created_at": time.time(),
+                        }
+
+                    progress_box = st.empty()
+
+                    def _progress(msg: str) -> None:
+                        try:
+                            progress_box.info(msg)
+                        except Exception:
+                            pass
+
+                    try:
+                        result = bulk_import_from_drive(
+                            drive_url_or_id=drive_url,
+                            custom_prompt_template=prompt_template,
+                            submitted_by=submitter,
+                            job_factory=_job_factory,
+                            on_progress=_progress,
+                        )
+                    except Exception as e:
+                        st.error(f"Bulk import hatası: {type(e).__name__}: {e}")
+                        result = None
+
+                    if result:
+                        # Created job dicts → Job dataclass'e dönüştür + persist
+                        existing = load_jobs()
+                        created_jobs: list = []
+                        for jd in result["created"]:
+                            try:
+                                j = Job(
+                                    id=jd["id"],
+                                    title=jd["title"],
+                                    text=jd["text"],
+                                    profile_id="",
+                                    profile_name="",
+                                    status=jd["status"],
+                                    submitted_by=jd["submitted_by"],
+                                    created_at=jd["created_at"],
+                                    custom_prompt=jd["custom_prompt"],
+                                )
+                                # assets boş kalır (bulk image yok)
+                                j.assets = []
+                                created_jobs.append(j)
+                            except Exception as e:
+                                result["errors"].append((jd.get("title","?"),
+                                                          f"Job dataclass error: {e}"))
+                        existing.extend(created_jobs)
+                        save_jobs(existing)
+                        progress_box.empty()
+                        st.success(
+                            f"✅ {len(created_jobs)} job kuyruğa eklendi "
+                            f"(toplam {result['total_files']} dosya, "
+                            f"{len(result['errors'])} hatalı)."
+                        )
+                        if result["errors"]:
+                            with st.expander(f"⚠ Hatalı dosyalar ({len(result['errors'])})"):
+                                for fname, err in result["errors"]:
+                                    st.markdown(f"• **{fname}** — {err}")
+                        st.caption("📊 'Durum' sekmesinden queued jobs'ları takip edebilirsin.")
+                        # Preview cache temizle
+                        st.session_state["bulk_preview"] = None
 
 
 # -------------------- TAB 2: DURUM --------------------

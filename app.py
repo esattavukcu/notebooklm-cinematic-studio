@@ -674,16 +674,23 @@ Stylistic Continuity Visual Bridge: The "Illustrated/Animated" versions of a sub
 Safety-Adjusted History Visual Correction: Primary source images that are naturally dark, high-contrast, or grainy must be adjusted to align with High-Key lighting standards. Lift shadows to ensure the image is clear and non-threatening for a student audience."""
 
 
-def apply_execution_guide(user_custom_prompt: str) -> str:
-    """Submit zamanında: sabit execution guide'ı user prompt'un üstüne prepend.
+def write_execution_guide_source(out_dir: Path) -> Optional[Path]:
+    """Sabit execution guide'ı bir .txt dosyasına yaz ki NotebookLM'e
+    **source** olarak (script.txt + image'ler gibi) upload edilebilsin.
 
-    User boş bıraktıysa sadece guide gider. User text yazdıysa guide
-    önce, "---" separator, sonra user'ın text'i.
+    Custom prompt'un içine prepend etmek yerine source olarak eklemek daha
+    etkili — NotebookLM source'lardan beslenir, Cinematic gen sırasında
+    guide'daki kurallar her sahnede primer olarak kullanılır.
+
+    out_dir: job_pack_dir veya benzer. Filename "_execution_guide.txt" sabit.
     """
-    user = (user_custom_prompt or "").strip()
-    if not user:
-        return EXECUTION_GUIDE_PROMPT
-    return f"{EXECUTION_GUIDE_PROMPT}\n\n---\n\n{user}"
+    try:
+        out_dir.mkdir(parents=True, exist_ok=True)
+        p = out_dir / "_execution_guide.txt"
+        p.write_text(EXECUTION_GUIDE_PROMPT, encoding="utf-8")
+        return p
+    except OSError:
+        return None
 
 
 # ---------------------------------------------------------------------------
@@ -1756,6 +1763,13 @@ class Worker:
             launcher_log(f"Job {job.id}: script.txt yazma hatası: {e}")
             script_path = None
 
+        # 1.b) Sabit execution guide'ı source olarak ekle (her job'a otomatik)
+        # NotebookLM source listesinin ilk öğesi olur — Cinematic gen sırasında
+        # kuralları primer olarak kullanır. Custom prompt'tan ayrı bir source.
+        guide_path = write_execution_guide_source(job_pack_dir)
+        if guide_path:
+            launcher_log(f"Job {job.id}: execution guide source eklendi ({guide_path.name})")
+
         # 2) Image'leri indir
         image_paths: list[Path] = []
         if job.assets:
@@ -1900,7 +1914,7 @@ class Worker:
                 t = threading.Thread(
                     target=self._run_job_via_notebooklm,
                     args=(job.id, profile, script_path, image_paths,
-                          job.custom_prompt or "", log_fp),
+                          job.custom_prompt or "", log_fp, guide_path),
                     name=f"nbpy-{job.id}",
                     daemon=True,
                 )
@@ -1935,7 +1949,8 @@ class Worker:
                                  script_path: Optional[Path],
                                  image_paths: list[Path],
                                  custom_prompt: str,
-                                 log_fp) -> None:
+                                 log_fp,
+                                 guide_path: Optional[Path] = None) -> None:
         """teng-lin/notebooklm-py ile end-to-end pipeline. Worker thread'inde.
 
         Tek async chain: notebook create → sources add → cinematic generate →
@@ -1985,8 +2000,18 @@ class Worker:
                     pass
 
         try:
-            # 1. Source paket: script + images
+            # 1. Source paket sırası:
+            #    [0] Execution guide (sabit talimatlar — _execution_guide.txt)
+            #    [1] Script (kullanıcının senaryosu)
+            #    [2..N] Image'ler
+            # Guide source olarak en başta — NotebookLM önce kuralları okur,
+            # sonra script'i, sonra görselleri. Custom prompt'a prepend etmek
+            # yerine source olarak eklemek daha güçlü prime (NotebookLM
+            # source'lardan beslenir, Cinematic gen sırasında kuralları her
+            # sahnede uygular).
             source_paths: list[Path] = []
+            if guide_path and guide_path.exists():
+                source_paths.append(guide_path)
             if script_path and script_path.exists():
                 source_paths.append(script_path)
             for p in (image_paths or []):
@@ -1994,12 +2019,15 @@ class Worker:
                     source_paths.append(p)
             if not source_paths:
                 raise NotebookLMClientError(
-                    "Hiç source dosyası yok (script + images boş)",
+                    "Hiç source dosyası yok (guide + script + images boş)",
                     stage="prep",
                 )
 
             log_fp.write(
-                f"## starting notebooklm-py pipeline: {len(source_paths)} sources, "
+                f"## starting notebooklm-py pipeline: {len(source_paths)} sources "
+                f"(guide={'yes' if guide_path else 'no'}, "
+                f"script={'yes' if script_path else 'no'}, "
+                f"images={len(image_paths or [])}), "
                 f"prompt {len(custom_prompt)} chars\n"
             )
             log_fp.flush()
@@ -2008,22 +2036,12 @@ class Worker:
             jobs_all = load_jobs()
             target = next((j for j in jobs_all if j.id == job_id), None)
             title = (target.title if target else "Untitled")[:80]
-            # Sabit execution guide her job'a otomatik prepend edilir.
-            # jobs.json'da audit user'ın yazdığı şekilde kalır, NotebookLM'e
-            # giden prompt full (guide + user) olur.
-            final_prompt = apply_execution_guide(custom_prompt)
-            log_fp.write(
-                f"## execution guide applied "
-                f"(user_chars={len(custom_prompt or '')}, "
-                f"full_chars={len(final_prompt)})\n"
-            )
-            log_fp.flush()
             try:
                 result = notebooklm_submit_job(
                     profile_id=profile.id,
                     title=title,
                     source_paths=source_paths,
-                    custom_prompt=final_prompt,
+                    custom_prompt=custom_prompt,  # User'ın yazdığı, guide yok
                     on_event=on_event,
                     language="tr",  # script Türkçe ağırlıklı
                     video_timeout_sec=3600.0,  # 1h Cinematic Veo 3
@@ -3328,8 +3346,10 @@ def render_bulk_drive_section(*, key_prefix: str = "blk") -> None:
 
     st.info(
         "🔒 Sabit talimatlar (Text-Free / 80-20 Animation / Student Safety / "
-        "Historical Accuracy) her job'a otomatik eklenir — sen yazdığın template "
-        "buna eklenir.",
+        "Historical Accuracy) her job'a **ekstra source** olarak otomatik "
+        "yüklenir (`_execution_guide.txt`). Custom prompt template'ine ekleme "
+        "değil — NotebookLM kuralları source'tan okur, her sahnede primer "
+        "olarak uygular.",
         icon="ℹ️",
     )
     with st.expander("👁 Sabit talimatları gör (read-only)"):
@@ -4949,11 +4969,12 @@ def render_user_view() -> None:
                 "yönlendirir."
             )
             st.info(
-                "🔒 **Sabit talimatlar her gönderime otomatik eklenir** "
-                "(Narrative & Text-Free + 80/20 Animation + Student Safety + "
-                "Historical Accuracy protokolleri). Aşağıdaki kutu sadece **senin** "
-                "edit edebileceğin ek talimatlar — sabit kısım üstte invisible olarak "
-                "her zaman dahil edilir.",
+                "🔒 **Sabit talimatlar her job'a ekstra source olarak otomatik "
+                "yüklenir** (script + image'lerin yanına `_execution_guide.txt` "
+                "olarak eklenir). Narrative & Text-Free + 80/20 Animation + "
+                "Student Safety + Historical Accuracy protokolleri. Custom prompt'a "
+                "değil, **source listesine** gider — NotebookLM kuralları her "
+                "sahnede primer olarak kullanır.",
                 icon="ℹ️",
             )
             with st.expander("👁 Sabit talimatları gör (read-only)"):

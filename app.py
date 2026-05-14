@@ -3662,13 +3662,33 @@ def render_user_view() -> None:
         _persist_draft()
 
     def _cb_use_manual_url(asset_id: str, widget_key: str) -> None:
-        """Kullanıcının yapıştırdığı URL'i selected_image olarak set et."""
-        url = (st.session_state.get(widget_key) or "").strip()
-        if not url or not (url.startswith("http://") or url.startswith("https://")):
-            st.session_state["_script_msg"] = (
-                "err", "Geçerli bir https:// URL'si yapıştır."
-            )
+        """Kullanıcının yapıştırdığı URL'i selected_image olarak set et.
+
+        Tolerant: protocol eksikse https:// prepend, tüm whitespace (newline +
+        tab + space) temizlenir. Hata mesajında ne paste edildiği görünür ki
+        kullanıcı sorunu kendi görebilsin.
+        """
+        raw = st.session_state.get(widget_key) or ""
+        # Tüm whitespace + non-printable temizle (kopyalamada newline yutuluyor)
+        url = "".join(raw.split()).strip()
+        if not url:
+            st.session_state["_script_msg"] = ("err", "URL kutusu boş.")
             return
+        # Protocol yoksa https:// prepend (örn. example.com/img.jpg)
+        low = url.lower()
+        if not (low.startswith("http://") or low.startswith("https://")
+                or low.startswith("data:image/")):
+            # data:image değilse, normal http URL kabul et — auto-fix https
+            if "://" in url:
+                # Bilinmeyen scheme (ftp:// vs.) — reddet
+                st.session_state["_script_msg"] = (
+                    "err",
+                    f"Sadece http://, https:// veya data:image/ desteklenir "
+                    f"(paste: {url[:60]}…)",
+                )
+                return
+            # Scheme yok → https:// prepend dene
+            url = "https://" + url
         for a in st.session_state.get("script_assets", []):
             if a.get("id") != asset_id:
                 continue
@@ -3685,7 +3705,7 @@ def render_user_view() -> None:
             }
             # Widget'ı temizle (bir sonraki run'da)
             st.session_state[widget_key] = ""
-            st.session_state["_script_msg"] = ("ok", "URL seçildi.")
+            st.session_state["_script_msg"] = ("ok", f"URL seçildi: {url[:80]}")
             _persist_draft()
             break
 

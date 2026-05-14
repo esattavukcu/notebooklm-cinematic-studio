@@ -562,19 +562,16 @@ def delete_style_guide(filename: str) -> bool:
 # ---------------------------------------------------------------------------
 DEFAULT_CUSTOM_PROMPT_TEMPLATE = """Role: You are a specialized Educational Video Producer.
 
-Task: Generate a cinematic video overview using the provided sources:
-- Source 1 is the SCRIPT — use its content as VERBATIM narration.
-- Sources 2+ are REFERENCE IMAGES — match each one to its corresponding narration moment as listed below.
+Task: Generate a cinematic video overview based on the provided Script and the Execution Guide.
 
 Core Constraints (STRICT ADHERENCE REQUIRED):
-1. Verbatim Narration: Use the script (Source 1) exactly. No improvisation, intros, or outros.
-2. Image-Narration Sync: For each reference image (Source 2+), display it in the video at the narration moment specified next to its name. Do not use an image at a moment it isn't mapped to.
-3. Zero-Text Visuals: Absolutely no text, labels, watermarks, or logos in the frame. Use visual metaphors or color-coding only.
-4. Visual Harmony: High-key lighting, soft geometry, lifted shadows. Avoid "AI slop" or fractal-like textures.
-5. Spatial Simplicity: One central subject per scene with significant white space.
-6. Style Coherence: ~80% photorealistic, ~20% illustration. Do not mix photo and illustration within a single frame.
+1. Zero-Text Visuals: Absolutely no text, labels, or logos in the frame. Use visual metaphors or color-coding only.
+2. Historical & Identity Fidelity: Use the Historical Accuracy & Identity Protocol (in Execution Guide) to ensure correct ethnicity, age, and real-world image integration.
+3. Visual Harmony & Safety: Apply the Student Safety Guide (in Execution Guide) — high-key lighting, soft geometry, and lifted shadows. Avoid "AI slop" or fractal-like textures.
+4. Compositional Logic: Follow the Spatial Simplicity Rule. Isolate one central subject per scene with significant white space to maintain clarity.
+5. Style Ratio: 80/20 Animation-Heavy Model — 80% minimalist sketch / paper-cut-out, 20% realistic visuals. Do not mix photos and illustrations in a single frame.
 
-Provided Sources (with narration mapping):
+Required Sources for this Task:
 {{SOURCES_LIST}}"""
 
 
@@ -607,6 +604,11 @@ def _safe_filename_from_query(query: str, fallback: str = "image") -> str:
 def build_source_listing(script_title: str, assets: list) -> tuple[str, list[str]]:
     """Custom prompt'ta listelenecek source isimleri + numaralandırma.
 
+    Sıra NotebookLM upload sırasıyla bire bir aynıdır:
+      [1] _execution_guide.txt  (sabit, her job)
+      [2] <Title>_Script.txt
+      [3..N] Selected images
+
     Image'lar için description (TR) + position (script anı) eklenir → NotebookLM
     her görseli script'in hangi anında göstereceğini bilir.
 
@@ -615,19 +617,27 @@ def build_source_listing(script_title: str, assets: list) -> tuple[str, list[str
     lines: list[str] = []
     names: list[str] = []
 
-    # Source 1: Script
+    # Source 1: Execution Guide (sabit, her job'a otomatik eklenen)
+    lines.append(
+        "Source 1: Execution Guide — STRICT visual rules "
+        "(Text-Free / 80-20 Animation / Student Safety / Historical Accuracy). "
+        "Apply these rules to EVERY scene."
+    )
+    names.append("_execution_guide")
+
+    # Source 2: Script
     script_name = f"{script_title}_Script" if script_title else "Script"
-    lines.append(f"Source 1: {script_name} — verbatim narration content")
+    lines.append(f"Source 2: {script_name} — verbatim narration content")
     names.append(script_name)
 
-    # Source 2+: Selected images with description + position mapping
+    # Source 3+: Selected images with description + position mapping
     for i, a in enumerate(assets):
         sel = a.get("selected_image") or {}
         if not sel.get("full_url") and not sel.get("thumb_url"):
             continue
         base = _safe_filename_from_query(a.get("query", ""), fallback=f"image_{i+1}")
         full_name = f"{base}_{i+1:02d}"
-        idx = len(names) + 1  # Source numarası (script + önceki image'lar sonrası)
+        idx = len(names) + 1  # Source numarası (guide + script + önceki image'lar sonrası)
         lines.append(_format_source_image_line(idx, a, full_name))
         names.append(full_name)
 
@@ -3327,13 +3337,19 @@ def render_bulk_drive_section(*, key_prefix: str = "blk") -> None:
         placeholder="https://drive.google.com/drive/folders/1AbCdEf...",
     )
 
+    # Drive Toplu default: tek bir script + guide kullanıldığında {{SOURCES_LIST}}
+    # bulk submit anında render edilemiyor (asset listesi yok). Statik versiyon —
+    # NotebookLM template'i yine kuralları source'tan okur, sadece prompt'ta
+    # source numaralandırması generic kalır.
     _default_template = (
-        "Role: Educational video producer.\n\n"
-        "Task: Generate a cinematic video overview using the provided "
-        "script source.\n\n"
-        "Style: Documentary, 30-40 seconds, Turkish narration, "
-        "engaging pace, scientific accuracy.\n\n"
-        "Audience: Curious general public, ages 12+."
+        DEFAULT_CUSTOM_PROMPT_TEMPLATE
+        .replace(
+            "{{SOURCES_LIST}}",
+            "Source 1: Execution Guide — STRICT visual rules "
+            "(Text-Free / 80-20 Animation / Student Safety / Historical Accuracy). "
+            "Apply these rules to EVERY scene.\n"
+            "Source 2: <Script filename> — verbatim narration content.",
+        )
     )
     st.markdown("**Custom prompt template** (tüm jobs'lar bunu kullanır):")
     prompt_template = st.text_area(

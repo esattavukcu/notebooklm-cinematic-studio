@@ -5267,7 +5267,16 @@ with st.sidebar:
                     "Günlük max video",
                     min_value=0, max_value=100, value=p.daily_limit, step=1,
                     key=f"lim_{p.id}",
-                    help="0 = sınırsız. NotebookLM ücretsiz: 3/gün",
+                    help=(
+                        "Bu profilin günlük Cinematic kotası. 0 = sınırsız "
+                        "(otomatik tespit yok). NotebookLM tier'ları:\n"
+                        "• Ücretsiz: ~3/gün\n"
+                        "• Google One AI Pro: ~10/gün\n"
+                        "• Google One AI Ultra: ~20/gün\n"
+                        "Yanlış set edersen dispatcher 'quota_exceeded' hatası "
+                        "alıp profili o gün için otomatik pause eder — "
+                        "self-correct."
+                    ),
                 )
                 new_max_c = st.number_input(
                     "Paralel slot",

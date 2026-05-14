@@ -320,10 +320,143 @@ def smoke_test(profile_id: str,
         return False, f"smoke loop error: {type(e).__name__}: {e}"
 
 
+# ---------------------------------------------------------------------------
+# Resume harvest — stuck "generating" job'lar için.
+# notebook_url biliniyor ama thread öldü (server restart vs.) → notebook'a
+# yeniden bağlan, var olan video artifact'ı bul, indir.
+# ---------------------------------------------------------------------------
+async def _resume_download_async(
+    auth_path: Path,
+    notebook_id: str,
+    out_path: Path,
+    *,
+    wait_if_processing: bool = True,
+    wait_timeout_sec: float = 1800.0,
+) -> dict[str, Any]:
+    """Var olan notebook'tan video artifact'ı bul, indir.
+
+    Senaryo: thread öldü (restart vs.), notebook NotebookLM'de hâlâ duruyor,
+    video gen tamamlanmış veya devam ediyor. Yeniden bağlan, listele, indir.
+    """
+    if not _AVAILABLE:
+        raise NotebookLMClientError(
+            "notebooklm-py kütüphanesi yok.", stage="import",
+        )
+    if not auth_path.exists():
+        raise NotebookLMClientError(f"auth.json yok: {auth_path}", stage="auth")
+
+    try:
+        client_ctx = await NotebookLMClient.from_storage(
+            path=str(auth_path), keepalive=300, keepalive_min_interval=60,
+        )
+    except Exception as e:
+        raise NotebookLMClientError(
+            f"client: {type(e).__name__}: {e}", stage="auth", cause=e,
+        )
+
+    async with client_ctx as c:
+        # Video artifact listesi
+        try:
+            videos = await c.artifacts.list_video(notebook_id)
+        except Exception as e:
+            raise NotebookLMClientError(
+                f"list_video: {type(e).__name__}: {e}",
+                stage="resume_list", cause=e,
+            )
+        videos = list(videos) if videos else []
+        if not videos:
+            raise NotebookLMClientError(
+                f"Notebook'ta video artifact yok ({notebook_id}). "
+                f"Gen başlamadı veya silinmiş.",
+                stage="resume_list",
+            )
+        # En son artifact (newest first kabul)
+        target = videos[0]
+        artifact_id = target.id
+
+        # Hazır mı?
+        is_ready = bool(
+            getattr(target, "is_complete", False)
+            or getattr(target, "status", "").lower() in ("ready", "complete", "done")
+        )
+        if not is_ready and wait_if_processing:
+            try:
+                final = await c.artifacts.wait_for_completion(
+                    notebook_id, artifact_id,
+                    initial_interval=15.0, max_interval=60.0,
+                    timeout=wait_timeout_sec,
+                )
+                if not getattr(final, "is_complete", False):
+                    err = getattr(final, "error", "?")
+                    raise NotebookLMClientError(
+                        f"video gen failed: {err}", stage="resume_wait",
+                    )
+            except NotebookLMClientError:
+                raise
+            except Exception as e:
+                raise NotebookLMClientError(
+                    f"wait: {type(e).__name__}: {e}",
+                    stage="resume_wait", cause=e,
+                )
+
+        # Download
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            await c.artifacts.download_video(
+                notebook_id, str(out_path), artifact_id=artifact_id,
+            )
+        except Exception as e:
+            raise NotebookLMClientError(
+                f"download: {type(e).__name__}: {e}",
+                stage="resume_download", cause=e,
+            )
+        if not out_path.exists() or out_path.stat().st_size < 10_000:
+            raise NotebookLMClientError(
+                f"download produced empty/missing file: {out_path}",
+                stage="resume_download",
+            )
+
+        return {
+            "notebook_id": notebook_id,
+            "artifact_id": artifact_id,
+            "local_mp4": str(out_path),
+            "size_mb": out_path.stat().st_size // (1024 * 1024),
+        }
+
+
+def resume_download(
+    profile_id: str,
+    notebook_id: str,
+    out_path: Path,
+    *,
+    profiles_dir: Optional[Path] = None,
+    wait_if_processing: bool = True,
+    wait_timeout_sec: float = 1800.0,
+) -> dict[str, Any]:
+    """Sync wrapper — stuck job kurtarmak için."""
+    auth_path = auth_path_for(profile_id, profiles_dir)
+    return asyncio.run(_resume_download_async(
+        auth_path=auth_path,
+        notebook_id=notebook_id,
+        out_path=out_path,
+        wait_if_processing=wait_if_processing,
+        wait_timeout_sec=wait_timeout_sec,
+    ))
+
+
+def notebook_id_from_url(url: str) -> Optional[str]:
+    """https://notebooklm.google.com/notebook/<UUID> → UUID."""
+    import re as _re
+    m = _re.search(r"/notebook/([a-f0-9-]{16,})", url or "")
+    return m.group(1) if m else None
+
+
 __all__ = [
     "NotebookLMClientError",
     "auth_path_for",
     "is_available",
     "submit_job",
     "smoke_test",
+    "resume_download",
+    "notebook_id_from_url",
 ]

@@ -605,9 +605,10 @@ def build_source_listing(script_title: str, assets: list) -> tuple[str, list[str
     """Custom prompt'ta listelenecek source isimleri + numaralandırma.
 
     Sıra NotebookLM upload sırasıyla bire bir aynıdır:
-      [1] _execution_guide.txt  (sabit, her job)
-      [2] <Title>_Script.txt
-      [3..N] Selected images
+      [1] _execution_guide.txt  (sabit kurallar — Text-Free + 80/20 + Safety + History)
+      [2] _custom_prompt.txt    (Task brief — Role/Task/Constraints/Required Sources)
+      [3] <Title>_Script.txt
+      [4..N] Selected images
 
     Image'lar için description (TR) + position (script anı) eklenir → NotebookLM
     her görseli script'in hangi anında göstereceğini bilir.
@@ -625,19 +626,27 @@ def build_source_listing(script_title: str, assets: list) -> tuple[str, list[str
     )
     names.append("_execution_guide")
 
-    # Source 2: Script
+    # Source 2: Task Brief (this prompt — Role/Task/Constraints; uploaded as source
+    # so NotebookLM can reference it directly, redundancy with Customize field)
+    lines.append(
+        "Source 2: Task Brief (this document) — "
+        "Role/Task/Constraints + this Required Sources list."
+    )
+    names.append("_custom_prompt")
+
+    # Source 3: Script
     script_name = f"{script_title}_Script" if script_title else "Script"
-    lines.append(f"Source 2: {script_name} — verbatim narration content")
+    lines.append(f"Source 3: {script_name} — verbatim narration content")
     names.append(script_name)
 
-    # Source 3+: Selected images with description + position mapping
+    # Source 4+: Selected images with description + position mapping
     for i, a in enumerate(assets):
         sel = a.get("selected_image") or {}
         if not sel.get("full_url") and not sel.get("thumb_url"):
             continue
         base = _safe_filename_from_query(a.get("query", ""), fallback=f"image_{i+1}")
         full_name = f"{base}_{i+1:02d}"
-        idx = len(names) + 1  # Source numarası (guide + script + önceki image'lar sonrası)
+        idx = len(names) + 1  # Source numarası (guide + brief + script + önceki image'lar sonrası)
         lines.append(_format_source_image_line(idx, a, full_name))
         names.append(full_name)
 
@@ -1791,12 +1800,28 @@ class Worker:
             except Exception as e:
                 launcher_log(f"Job {job.id}: image download hata, devam: {e}")
 
-        # 3) Custom prompt'u disk'e yaz (CLI escape sorunu yaşamamak için)
+        # 3) Custom prompt'u disk'e yaz.
+        # - Kullanıcı edit ettiyse onu kullan
+        # - Boş bıraktıysa default template + dinamik source listesi
+        # Bu dosya hem NotebookLM-py path'inde source olarak yüklenir, hem
+        # legacy nlm path'inde CLI escape sorunu yaşamamak için kullanılır.
         prompt_path: Optional[Path] = None
-        if (job.custom_prompt or "").strip():
+        _prompt_text = (job.custom_prompt or "").strip()
+        if not _prompt_text:
+            # User edit etmedi → default template'i şimdi render et
+            try:
+                _prompt_text = render_custom_prompt(
+                    DEFAULT_CUSTOM_PROMPT_TEMPLATE,
+                    job.title or "",
+                    job.assets or [],
+                )
+            except Exception as _e:
+                launcher_log(f"Job {job.id}: default prompt render hatası: {_e}")
+                _prompt_text = ""
+        if _prompt_text:
             prompt_path = job_pack_dir / "_custom_prompt.txt"
             try:
-                prompt_path.write_text(job.custom_prompt, encoding="utf-8")
+                prompt_path.write_text(_prompt_text, encoding="utf-8")
             except OSError as e:
                 launcher_log(f"Job {job.id}: custom prompt yazma hatası: {e}")
                 prompt_path = None
@@ -1924,7 +1949,8 @@ class Worker:
                 t = threading.Thread(
                     target=self._run_job_via_notebooklm,
                     args=(job.id, profile, script_path, image_paths,
-                          job.custom_prompt or "", log_fp, guide_path),
+                          job.custom_prompt or "", log_fp, guide_path,
+                          prompt_path),
                     name=f"nbpy-{job.id}",
                     daemon=True,
                 )
@@ -1960,7 +1986,8 @@ class Worker:
                                  image_paths: list[Path],
                                  custom_prompt: str,
                                  log_fp,
-                                 guide_path: Optional[Path] = None) -> None:
+                                 guide_path: Optional[Path] = None,
+                                 prompt_path: Optional[Path] = None) -> None:
         """teng-lin/notebooklm-py ile end-to-end pipeline. Worker thread'inde.
 
         Tek async chain: notebook create → sources add → cinematic generate →
@@ -2012,16 +2039,18 @@ class Worker:
         try:
             # 1. Source paket sırası:
             #    [0] Execution guide (sabit talimatlar — _execution_guide.txt)
-            #    [1] Script (kullanıcının senaryosu)
-            #    [2..N] Image'ler
-            # Guide source olarak en başta — NotebookLM önce kuralları okur,
-            # sonra script'i, sonra görselleri. Custom prompt'a prepend etmek
-            # yerine source olarak eklemek daha güçlü prime (NotebookLM
-            # source'lardan beslenir, Cinematic gen sırasında kuralları her
-            # sahnede uygular).
+            #    [1] Custom prompt brief (Role/Task/Constraints — _custom_prompt.txt)
+            #    [2] Script (kullanıcının senaryosu)
+            #    [3..N] Image'ler
+            # Guide + custom prompt ikisi de source olarak en başta —
+            # NotebookLM önce kuralları + task brief'i okur, sonra script'i,
+            # sonra görselleri. Custom prompt ayrıca Cinematic Customize'a da
+            # gider (redundancy → daha güçlü prime).
             source_paths: list[Path] = []
             if guide_path and guide_path.exists():
                 source_paths.append(guide_path)
+            if prompt_path and prompt_path.exists():
+                source_paths.append(prompt_path)
             if script_path and script_path.exists():
                 source_paths.append(script_path)
             for p in (image_paths or []):
@@ -2029,13 +2058,14 @@ class Worker:
                     source_paths.append(p)
             if not source_paths:
                 raise NotebookLMClientError(
-                    "Hiç source dosyası yok (guide + script + images boş)",
+                    "Hiç source dosyası yok (guide + prompt + script + images boş)",
                     stage="prep",
                 )
 
             log_fp.write(
                 f"## starting notebooklm-py pipeline: {len(source_paths)} sources "
                 f"(guide={'yes' if guide_path else 'no'}, "
+                f"prompt_brief={'yes' if prompt_path else 'no'}, "
                 f"script={'yes' if script_path else 'no'}, "
                 f"images={len(image_paths or [])}), "
                 f"prompt {len(custom_prompt)} chars\n"
@@ -4985,15 +5015,17 @@ def render_user_view() -> None:
                 "yönlendirir."
             )
             st.info(
-                "🔒 **Sabit talimatlar her job'a ekstra source olarak otomatik "
-                "yüklenir** (script + image'lerin yanına `_execution_guide.txt` "
-                "olarak eklenir). Narrative & Text-Free + 80/20 Animation + "
-                "Student Safety + Historical Accuracy protokolleri. Custom prompt'a "
-                "değil, **source listesine** gider — NotebookLM kuralları her "
-                "sahnede primer olarak kullanır.",
+                "🔒 NotebookLM source listesi:\n"
+                "1. `_execution_guide.txt` — Sabit kurallar "
+                "(Text-Free / 80-20 Animation / Student Safety / History)\n"
+                "2. `_custom_prompt.txt` — Bu doküman (Role/Task/Constraints)\n"
+                "3. `<Title>_Script.txt` — Senaryon\n"
+                "4..N. Görseller\n\n"
+                "Custom prompt **hem source olarak hem Cinematic Customize alanına** "
+                "gider — daha güçlü prime.",
                 icon="ℹ️",
             )
-            with st.expander("👁 Sabit talimatları gör (read-only)"):
+            with st.expander("👁 Sabit talimatları (Execution Guide) gör"):
                 st.code(EXECUTION_GUIDE_PROMPT, language=None)
 
             cs_p = st.columns([1.2, 4])

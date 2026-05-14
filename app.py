@@ -1814,21 +1814,25 @@ class Worker:
         """
         import traceback as _tb
 
-        def on_event(name: str, **payload) -> None:
-            """notebooklm_client callback → log + state update."""
+        def on_event(event: str, **payload) -> None:
+            """notebooklm_client callback → log + state update.
+
+            Not: parametre adı `name` değil `event` — çünkü payload'da source
+            file için `name=...` kwarg'ı geliyor, çakışırsa TypeError verir.
+            """
             try:
                 items = " ".join(f"{k}={v!r}" for k, v in payload.items() if k != "auth")
-                log_fp.write(f"## [{name}] {items[:300]}\n")
+                log_fp.write(f"## [{event}] {items[:300]}\n")
                 log_fp.flush()
             except Exception:
                 pass
             # Önemli event'lerde job state'i güncelle (admin UI ve harvest skip için)
-            if name == "notebook_created":
+            if event == "notebook_created":
                 self._apply_event(job_id, {
                     "type": "notebook_created",
                     "notebook_url": payload.get("url", ""),
                 })
-            elif name == "video_gen_started":
+            elif event == "video_gen_started":
                 self._apply_event(job_id, {
                     "type": "automation_complete",
                     "exit_code": 0,

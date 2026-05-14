@@ -13,7 +13,10 @@ generate → wait → download) tek bir coroutine'de.
 
 API:
 - submit_job(profile_id, title, source_paths, custom_prompt, on_event)
-    Full pipeline. on_event(name, **payload) callback ile her aşama bildirilir.
+    Full pipeline. on_event(event, **payload) callback ile her aşama bildirilir.
+    NOT: callback'in ilk positional parametresi `event` olmalı — `name`
+    kullanma, çünkü payload'da `name=<source filename>` gibi kwarg geliyor
+    ve TypeError ("multiple values for 'name'") verir.
 - smoke_test(profile_id) → (ok, info_string)
 - NotebookLMClientError — wrapper error class
 
@@ -23,7 +26,7 @@ Kullanım (app.py worker thread):
         title="Bush Passion Fruit",
         source_paths=[Path("script.txt"), Path("img1.jpg"), ...],
         custom_prompt="Role: ... Sources: ...",
-        on_event=lambda name, **kw: log_fp.write(f"{name}: {kw}\\n"),
+        on_event=lambda event, **kw: log_fp.write(f"{event}: {kw}\\n"),
     )
     # result: {"notebook_id", "notebook_url", "task_id",
     #          "local_mp4", "duration_sec"}

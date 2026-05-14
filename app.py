@@ -3201,39 +3201,123 @@ def render_bulk_drive_section(*, key_prefix: str = "blk") -> None:
         else:
             with st.spinner(f"Drive klasörü taranıyor (folder_id={folder_id[:12]}…)…"):
                 try:
-                    from bulk_import import list_drive_folder_docx
+                    from bulk_import import list_drive_folder_docx, get_docx_metadata
                     import tempfile
                     _tmp = Path(tempfile.mkdtemp(prefix="bulk_preview_"))
                     docx_paths = list_drive_folder_docx(drive_url, _tmp)
+                    items = []
+                    for p in docx_paths:
+                        md = get_docx_metadata(p)
+                        items.append({
+                            "path": str(p),
+                            "name": p.name,
+                            "size": p.stat().st_size,
+                            "modified": md.get("modified"),
+                            "created": md.get("created"),
+                            "author": md.get("author", ""),
+                            "n_paragraphs": md.get("n_paragraphs", 0),
+                        })
+                    # Son değiştirilme tarihine göre sırala (yeni en üstte)
+                    items.sort(
+                        key=lambda x: x.get("modified") or x.get("created") or "",
+                        reverse=True,
+                    )
                     st.session_state[preview_key] = {
                         "folder_id": folder_id,
-                        "count": len(docx_paths),
-                        "names": [p.name for p in docx_paths],
+                        "count": len(items),
+                        "items": items,
                         "tmp_dir": str(_tmp),
                     }
+                    # Tüm dosyaları default olarak seçili tut (checkbox state'ler)
+                    for it in items:
+                        sel_key = f"{key_prefix}_bulk_sel_{it['name']}"
+                        if sel_key not in st.session_state:
+                            st.session_state[sel_key] = True
                 except Exception as e:
                     st.error(f"Drive okuma hatası: {type(e).__name__}: {e}")
                     st.session_state[preview_key] = None
 
     preview = st.session_state.get(preview_key)
     if preview:
-        st.success(
-            f"✓ **{preview['count']}** adet .docx bulundu klasörde "
-            f"(folder_id={preview['folder_id'][:14]}…)"
+        # Modified time formatter
+        def _fmt_dt(iso_str: Optional[str]) -> str:
+            if not iso_str:
+                return "—"
+            try:
+                dt = datetime.fromisoformat(iso_str.replace("Z", "+00:00"))
+                # UTC ise yerel saate çevirme yapmadan göster (kullanıcı +03 farkı görüyor)
+                return dt.strftime("%Y-%m-%d %H:%M")
+            except Exception:
+                return iso_str[:16]
+
+        # Şu an seçili olanları say
+        n_selected = sum(
+            1 for it in preview["items"]
+            if st.session_state.get(f"{key_prefix}_bulk_sel_{it['name']}", True)
         )
-        with st.expander(f"Dosya listesi ({preview['count']})"):
-            for nm in preview["names"][:60]:
-                st.markdown(f"• {nm}")
-            if len(preview["names"]) > 60:
-                st.caption(f"+{len(preview['names']) - 60} daha…")
+
+        # Header + toggle-all
+        hd = st.columns([3, 1, 1])
+        with hd[0]:
+            st.success(
+                f"✓ **{preview['count']}** adet .docx · "
+                f"**{n_selected}** seçili"
+            )
+        with hd[1]:
+            if st.button("☑ Hepsi", key=f"{key_prefix}_bulk_sel_all",
+                         use_container_width=True):
+                for it in preview["items"]:
+                    st.session_state[f"{key_prefix}_bulk_sel_{it['name']}"] = True
+                st.rerun()
+        with hd[2]:
+            if st.button("☐ Hiçbiri", key=f"{key_prefix}_bulk_sel_none",
+                         use_container_width=True):
+                for it in preview["items"]:
+                    st.session_state[f"{key_prefix}_bulk_sel_{it['name']}"] = False
+                st.rerun()
+
+        # Per-file checkbox + metadata table
+        with st.expander(f"Dosya listesi ({preview['count']})", expanded=True):
+            for it in preview["items"]:
+                sel_key = f"{key_prefix}_bulk_sel_{it['name']}"
+                cs = st.columns([0.5, 4, 3, 1.5])
+                with cs[0]:
+                    st.checkbox(
+                        "",
+                        key=sel_key,
+                        label_visibility="collapsed",
+                    )
+                with cs[1]:
+                    st.markdown(
+                        f"<div style='font-size:0.88rem; font-weight:500;'>"
+                        f"📄 {it['name']}</div>",
+                        unsafe_allow_html=True,
+                    )
+                with cs[2]:
+                    mod = _fmt_dt(it.get("modified"))
+                    author = it.get("author") or "—"
+                    st.markdown(
+                        f"<div style='font-size:0.78rem; opacity:0.75;'>"
+                        f"📅 {mod} &nbsp;·&nbsp; ✍️ {author[:30]}</div>",
+                        unsafe_allow_html=True,
+                    )
+                with cs[3]:
+                    sz_kb = it["size"] // 1024
+                    n_p = it.get("n_paragraphs", 0)
+                    st.markdown(
+                        f"<div style='font-size:0.74rem; opacity:0.65; "
+                        f"text-align:right;'>{sz_kb}KB · {n_p} para</div>",
+                        unsafe_allow_html=True,
+                    )
 
         _profs_init = [p for p in load_profiles() if p.initialized]
         _daily_cap = sum(max(p.daily_limit or 0, 0) for p in _profs_init) or 9
-        _days = max(1, -(-preview["count"] // _daily_cap))
+        _days = max(1, -(-n_selected // _daily_cap))
         st.caption(
             f"📅 Kapasite: {len(_profs_init)} profil × "
             f"{(_daily_cap // len(_profs_init)) if _profs_init else 0}/gün "
-            f"= **{_daily_cap} job/gün** → **~{_days} gün**'de biter (kuyruktan otomatik)"
+            f"= **{_daily_cap} job/gün** → **~{_days} gün**'de biter "
+            f"({n_selected} seçili dosya için)"
         )
 
     # ---- Submit handler ----
@@ -3266,14 +3350,45 @@ def render_bulk_drive_section(*, key_prefix: str = "blk") -> None:
                 except Exception:
                     pass
 
+            # Cached preview varsa onu kullan (re-download'a gerek yok) +
+            # checkbox filter uygula. Preview yoksa direkt download.
+            cached = st.session_state.get(preview_key)
             try:
-                result = bulk_import_from_drive(
-                    drive_url_or_id=drive_url,
-                    custom_prompt_template=prompt_template,
-                    submitted_by=submitter,
-                    job_factory=_job_factory,
-                    on_progress=_progress,
-                )
+                if cached and cached.get("items"):
+                    # Checkbox'tan seçili olanları al
+                    sel_paths = []
+                    for it in cached["items"]:
+                        sel_key = f"{key_prefix}_bulk_sel_{it['name']}"
+                        if st.session_state.get(sel_key, True):
+                            p = Path(it["path"])
+                            if p.exists():
+                                sel_paths.append(p)
+                    if not sel_paths:
+                        st.error("Hiçbir dosya seçili değil.")
+                        result = None
+                    else:
+                        _progress(
+                            f"{len(sel_paths)} seçili dosya işleniyor "
+                            f"(cached, yeniden indirilmiyor)…"
+                        )
+                        from bulk_import import bulk_create_jobs_from_docx_paths
+                        result = bulk_create_jobs_from_docx_paths(
+                            sel_paths,
+                            custom_prompt_template=prompt_template,
+                            submitted_by=submitter,
+                            job_factory=_job_factory,
+                            on_progress=_progress,
+                        )
+                        result["total_files"] = len(sel_paths)
+                else:
+                    # Preview yapılmadıysa direkt download + tümünü işle
+                    result = bulk_import_from_drive(
+                        drive_url_or_id=drive_url,
+                        custom_prompt_template=prompt_template,
+                        submitted_by=submitter,
+                        job_factory=_job_factory,
+                        on_progress=_progress,
+                    )
             except Exception as e:
                 st.error(f"Bulk import hatası: {type(e).__name__}: {e}")
                 result = None

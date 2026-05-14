@@ -105,6 +105,31 @@ def parse_docx(path: Path) -> str:
     return text
 
 
+def get_docx_metadata(path: Path) -> dict:
+    """docx core_properties → metadata dict.
+
+    Döner: {created, modified, author, last_modified_by, n_paragraphs}
+    'created' ve 'modified' ISO format string (UI'da formatlanır).
+    Drive 'added to Drive' time'ı doğrudan alınamaz (API key gerek);
+    docx modified time genelde yakın bir proxy (Google Docs → docx export'ta
+    export anının timestamp'i, Word'de save anının timestamp'i).
+    """
+    if not _DOCX_AVAILABLE:
+        return {}
+    try:
+        doc = _DocxDocument(str(path))
+        props = doc.core_properties
+        return {
+            "created": props.created.isoformat() if props.created else None,
+            "modified": props.modified.isoformat() if props.modified else None,
+            "author": (props.author or "").strip(),
+            "last_modified_by": (props.last_modified_by or "").strip(),
+            "n_paragraphs": len(doc.paragraphs),
+        }
+    except Exception:
+        return {}
+
+
 def docx_to_title(filename: str, fallback_text: str = "") -> str:
     """Filename'den anlamlı title üret. '01_passion_fruit.docx' → 'Passion Fruit'."""
     stem = Path(filename).stem
@@ -297,6 +322,7 @@ __all__ = [
     "extract_folder_id",
     "is_available",
     "parse_docx",
+    "get_docx_metadata",
     "docx_to_title",
     "download_drive_folder",
     "list_drive_folder_docx",

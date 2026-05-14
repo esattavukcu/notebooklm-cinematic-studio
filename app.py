@@ -149,6 +149,16 @@ AZURE_ENABLED = bool(AZURE_CONN)
 HEADLESS_INIT_DISPLAY = os.environ.get("HEADLESS_INIT_DISPLAY", "").strip()
 VNC_ENABLED = bool(HEADLESS_INIT_DISPLAY)
 
+# Lokal init flow için SSH bilgileri (admin panelde "Lokal komut göster" widget'ı
+# bu bilgileri kullanarak hazır rsync komutu üretir). Boş bırakırsan rsync
+# satırı UI'da gösterilmez, sadece Playwright init komutu çıkar.
+LOCAL_INIT_SSH_HOST = os.environ.get("LOCAL_INIT_SSH_HOST", "").strip()
+LOCAL_INIT_SSH_KEY = os.environ.get("LOCAL_INIT_SSH_KEY", "~/.ssh/dev-internal-00.pem").strip()
+LOCAL_INIT_REMOTE_PATH = os.environ.get(
+    "LOCAL_INIT_REMOTE_PATH",
+    "/home/ubuntu/notebooklm-cinematic-studio",
+).strip()
+
 # Image search: opsiyonel free-tier API keyleri.
 # Wikimedia + Openverse key gerektirmez. Pixabay + Pexels free tier ama
 # kayıt + key alımı gerekir. Set edilmezse o kaynak skip edilir.
@@ -4786,6 +4796,59 @@ with st.sidebar:
                     f'{msg}</div>',
                     unsafe_allow_html=True,
                 )
+
+            # --- Lokal init (Mac/PC üstünde Playwright native window) ---
+            # VNC açmadan, kendi makinende Chromium aç. Hazır komutları + rsync
+            # önerisini göster, kullanıcı kopyalar çalıştırır, sonra 'Kontrol et'.
+            with st.expander("💻 Lokal makineden yenile (VNC gerekmez)"):
+                init_cmd = (
+                    f".venv/bin/python notebooklm_automator.py --init "
+                    f"--profile-dir chrome_profiles/{p.id} --authuser {p.authuser}"
+                )
+                st.markdown(
+                    "**1.** Repo dizinine git ve Chromium'u native aç:",
+                    unsafe_allow_html=True,
+                )
+                st.code(f"cd /path/to/notebooklm-cinematic-studio\n{init_cmd}", language="bash")
+                st.markdown(
+                    f"`{p.name}` hesabıyla giriş yap → NotebookLM ana sayfası → "
+                    "auth.json otomatik kaydedilir (Chromium'u kapatabilirsin).",
+                    unsafe_allow_html=True,
+                )
+                if LOCAL_INIT_SSH_HOST:
+                    rsync_cmd = (
+                        f"rsync -avz -e \"ssh -i {LOCAL_INIT_SSH_KEY}\" "
+                        f"chrome_profiles/{p.id}/auth.json "
+                        f"{LOCAL_INIT_SSH_HOST}:{LOCAL_INIT_REMOTE_PATH}/"
+                        f"chrome_profiles/{p.id}/auth.json"
+                    )
+                    st.markdown("**2.** Auth.json'u server'a yolla:", unsafe_allow_html=True)
+                    st.code(rsync_cmd, language="bash")
+                else:
+                    st.caption(
+                        "ℹ️ `.env`'de `LOCAL_INIT_SSH_HOST=ubuntu@...` set edersen "
+                        "rsync komutu da hazır şekilde gösterilir."
+                    )
+                st.markdown("**3.** Server'a ulaşınca aşağı bas — smoke test yapıp aktive eder:")
+                if st.button("✅ Auth.json'um hazır, kontrol et",
+                             key=f"verify_local_{p.id}", use_container_width=True):
+                    # Server-side smoke test
+                    try:
+                        from notebooklm_client import smoke_test as _nlm_smoke
+                        ok, msg = _nlm_smoke(p.id)
+                    except Exception as e:
+                        ok, msg = False, f"smoke import/run error: {e}"
+                    if ok:
+                        ps = load_profiles()
+                        for x in ps:
+                            if x.id == p.id:
+                                x.initialized = True
+                                break
+                        save_profiles(ps)
+                        st.success(f"✅ Aktive edildi — {msg}")
+                        st.rerun()
+                    else:
+                        st.error(f"❌ Auth.json doğrulanamadı: {msg}")
 
             with st.expander("⚙️ Gelişmiş ayarlar"):
                 new_name = st.text_input("İsim", value=p.name, key=f"nm_{p.id}")

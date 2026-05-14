@@ -278,6 +278,7 @@ class Job:
     # Phase E: Custom Prompt + style guide source listesi (audit ve admin display için)
     custom_prompt: str = ""          # NotebookLM Cinematic Customize → Custom Prompt'a yapışan metin
     style_guides_used: list = field(default_factory=list)  # [filename, ...] — submit anında attach edilenler
+    learning_objectives: str = ""    # _lo.docx companion content (bulk Drive import'tan), opsiyonel
     # Phase 4: Video Edit / Revize — bu job başka bir job'ı revize ediyorsa
     parent_job_id: str = ""              # Hangi job'ı revize ediyor (boş = orijinal)
     revision_instructions: str = ""      # "Ne değişsin?" (user'ın yazdığı revize prompt'u)
@@ -601,52 +602,68 @@ def _safe_filename_from_query(query: str, fallback: str = "image") -> str:
     return (cleaned[:48] or fallback)
 
 
-def build_source_listing(script_title: str, assets: list) -> tuple[str, list[str]]:
+def build_source_listing(script_title: str, assets: list,
+                          has_learning_objectives: bool = False) -> tuple[str, list[str]]:
     """Custom prompt'ta listelenecek source isimleri + numaralandırma.
 
-    Sıra NotebookLM upload sırasıyla bire bir aynıdır:
-      [1] _execution_guide.txt  (sabit kurallar — Text-Free + 80/20 + Safety + History)
-      [2] _custom_prompt.txt    (Task brief — Role/Task/Constraints/Required Sources)
-      [3] <Title>_Script.txt
-      [4..N] Selected images
+    Sıra NotebookLM upload sırasıyla bire bir uyumlu:
+      [1] <Title>_Script.txt
+      [2] <Title>_LearningObjectives.txt (opsiyonel — _lo.docx companion)
+      [3] Narrative & Text-Free Execution Guide
+      [4] Historical Accuracy & Identity Protocol
+      [5] Student Safety & Visual Harmony Guide
+      [6] The 80/20 Animation-Heavy Model
+      [7] _custom_prompt.txt (this Task Brief)
+      [8..N] Selected images
 
-    Image'lar için description (TR) + position (script anı) eklenir → NotebookLM
-    her görseli script'in hangi anında göstereceğini bilir.
+    Image'lar için description + position eklenir → NotebookLM her görseli
+    script'in hangi anında göstereceğini bilir.
 
     Returns (formatted_listing_text, ordered_source_names).
     """
     lines: list[str] = []
     names: list[str] = []
 
-    # Source 1: Execution Guide (sabit, her job'a otomatik eklenen)
-    lines.append(
-        "Source 1: Execution Guide — STRICT visual rules "
-        "(Text-Free / 80-20 Animation / Student Safety / Historical Accuracy). "
-        "Apply these rules to EVERY scene."
-    )
-    names.append("_execution_guide")
+    # Source 1: Script
+    script_name = f"{script_title}_Script" if script_title else "Script"
+    lines.append(f"Source 1: {script_name} — verbatim narration content")
+    names.append(script_name)
 
-    # Source 2: Task Brief (this prompt — Role/Task/Constraints; uploaded as source
+    # Source 2: Learning Objectives (opsiyonel companion)
+    if has_learning_objectives:
+        lo_name = f"{script_title}_LearningObjectives" if script_title else "LearningObjectives"
+        lines.append(
+            f"Source 2: {lo_name} — pedagogical aims and learning outcomes "
+            "for this video."
+        )
+        names.append(lo_name)
+
+    # Sources 3-6: 4 ayrı execution guide protokolü (sabit, her job'a)
+    lines.append("Source 3: Narrative & Text-Free Execution Guide")
+    names.append("_Narrative_TextFree_Guide")
+    lines.append("Source 4: Historical Accuracy & Identity Protocol")
+    names.append("_HistoricalAccuracy_Identity")
+    lines.append("Source 5: Student Safety & Visual Harmony Guide")
+    names.append("_StudentSafety_VisualHarmony")
+    lines.append("Source 6: The 80/20 Animation-Heavy Model")
+    names.append("_AnimationHeavy_80_20")
+
+    # Source 7: Task Brief (this prompt — Role/Task/Constraints; uploaded as source
     # so NotebookLM can reference it directly, redundancy with Customize field)
     lines.append(
-        "Source 2: Task Brief (this document) — "
-        "Role/Task/Constraints + this Required Sources list."
+        "Source 7: Task Brief (this document) — "
+        "Role/Task/Constraints/Required Sources."
     )
     names.append("_custom_prompt")
 
-    # Source 3: Script
-    script_name = f"{script_title}_Script" if script_title else "Script"
-    lines.append(f"Source 3: {script_name} — verbatim narration content")
-    names.append(script_name)
-
-    # Source 4+: Selected images with description + position mapping
+    # Source 8+: Selected images with description + position mapping
     for i, a in enumerate(assets):
         sel = a.get("selected_image") or {}
         if not sel.get("full_url") and not sel.get("thumb_url"):
             continue
         base = _safe_filename_from_query(a.get("query", ""), fallback=f"image_{i+1}")
         full_name = f"{base}_{i+1:02d}"
-        idx = len(names) + 1  # Source numarası (guide + brief + script + önceki image'lar sonrası)
+        idx = len(names) + 1
         lines.append(_format_source_image_line(idx, a, full_name))
         names.append(full_name)
 
@@ -654,37 +671,31 @@ def build_source_listing(script_title: str, assets: list) -> tuple[str, list[str
 
 
 def render_custom_prompt(template: str, script_title: str,
-                          assets: list) -> str:
+                          assets: list,
+                          has_learning_objectives: bool = False) -> str:
     """Template'teki {{SOURCES_LIST}} placeholder'ını doldur."""
-    listing, _ = build_source_listing(script_title, assets)
+    listing, _ = build_source_listing(
+        script_title, assets,
+        has_learning_objectives=has_learning_objectives,
+    )
     return template.replace("{{SOURCES_LIST}}", listing)
 
 
 # ---------------------------------------------------------------------------
-# Sabit (her zaman eklenen) execution guide. Her job submit'inde
-# kullanıcının custom_prompt'unun ÜSTÜNE prepend edilir → NotebookLM
-# Cinematic generation'a böyle geçer. jobs.json'da audit trail temiz kalır
-# (sadece user'ın yazdığı kısım saklanır); guide her gen'de re-injected.
+# Sabit execution guide — 4 ayrı protokol olarak NotebookLM'e source upload
+# edilir. Her job'a otomatik. Tek dosya yerine 4 ayrı dosya: NotebookLM source
+# panelinde her protokol ayrı görünür, Cinematic gen her sahnede 4 ayrı kuralı
+# referans alır (daha güçlü prime).
 # ---------------------------------------------------------------------------
-EXECUTION_GUIDE_PROMPT = """Narrative & Text-Free Execution Guide
+EXEC_GUIDE_NARRATIVE_TEXT_FREE = """Narrative & Text-Free Execution Guide
+
 Narration: The audio must go with similar examples to the original script or video, but must also be unique in it's own visuals design.
 Zero-Text Policy: Absolutely no letters, numbers, labels, or titles are permitted in the frame.
 Symbolic Replacement: Use color-coded icons, focal shifts, or zooms to highlight specific parts of a subject instead of using text labels.
-Language Barrier: Do not generate any text overlays to ensure the video is ready for immediate localization.
+Language Barrier: Do not generate any text overlays to ensure the video is ready for immediate localization."""
 
-The 80/20 Animation-Heavy Model
-Style: 80% minimalist "sketch" style and "paper cut-out" animation styles, with 20% realistic visuals.
-No Hybrid Clutter: Do not mix a photo and an illustration in the same frame; keep them as distinct scenes.
-Dynamic Flow: Every scene must have motion (e.g., wide pans or macro photography) to avoid "static" talking heads.
+EXEC_GUIDE_HISTORICAL_ACCURACY = """Historical Accuracy & Identity Protocol
 
-Student Safety & Visual Harmony Guide
-Soft Geometry: Prioritize rounded forms and curvilinear geometry; avoid jagged edges, or needle-like structures.
-High-Key Lighting: Use bright lighting with lifted shadows to ensure no "dark voids" or threatening atmospheres exist.
-Texture Control: Surfaces must be clean and continuous; avoid "high-frequency" details like scales, tiny bumps, or branching fractal patterns.
-Anti-Clutter (Non-Tangle): Do not allow crossing lines, or chaotic textures to appear on screen.
-Compositional Safety: Maintain a medium focal length and ensure a clear "exit point" in the background to prevent a feeling of claustrophobia.
-
-Historical Accuracy & Identity Protocol
 Authentic Representation Visual Fidelity: When the script identifies a specific historical or real-world figure, all visual depictions—regardless of artistic style—must accurately reflect that individual's documented ethnicity, age, and identity.
 Contextual Accuracy: Any specific locations, tools, or environments mentioned must be represented in a way that respects the historical or geographical reality of the narrative.
 Primary Source Integration Real-Image Mandate: For any specific real-world subject (person or place) featured in the script, the video must include at least 1-2 appearances of an actual primary source image (e.g., an authentic photograph, a verified portrait, or a contemporary document).
@@ -692,24 +703,52 @@ Strategic Placement: These authentic images should be timed to coincide with the
 Stylistic Continuity Visual Bridge: The "Illustrated/Animated" versions of a subject must maintain recognizable visual features consistent with real-life person.
 Safety-Adjusted History Visual Correction: Primary source images that are naturally dark, high-contrast, or grainy must be adjusted to align with High-Key lighting standards. Lift shadows to ensure the image is clear and non-threatening for a student audience."""
 
+EXEC_GUIDE_STUDENT_SAFETY = """Student Safety & Visual Harmony Guide
 
-def write_execution_guide_source(out_dir: Path) -> Optional[Path]:
-    """Sabit execution guide'ı bir .txt dosyasına yaz ki NotebookLM'e
-    **source** olarak (script.txt + image'ler gibi) upload edilebilsin.
+Soft Geometry: Prioritize rounded forms and curvilinear geometry; avoid jagged edges, or needle-like structures.
+High-Key Lighting: Use bright lighting with lifted shadows to ensure no "dark voids" or threatening atmospheres exist.
+Texture Control: Surfaces must be clean and continuous; avoid "high-frequency" details like scales, tiny bumps, or branching fractal patterns.
+Anti-Clutter (Non-Tangle): Do not allow crossing lines, or chaotic textures to appear on screen.
+Compositional Safety: Maintain a medium focal length and ensure a clear "exit point" in the background to prevent a feeling of claustrophobia."""
 
-    Custom prompt'un içine prepend etmek yerine source olarak eklemek daha
-    etkili — NotebookLM source'lardan beslenir, Cinematic gen sırasında
-    guide'daki kurallar her sahnede primer olarak kullanılır.
+EXEC_GUIDE_ANIMATION_80_20 = """The 80/20 Animation-Heavy Model
 
-    out_dir: job_pack_dir veya benzer. Filename "_execution_guide.txt" sabit.
+Style: 80% minimalist "sketch" style and "paper cut-out" animation styles, with 20% realistic visuals.
+No Hybrid Clutter: Do not mix a photo and an illustration in the same frame; keep them as distinct scenes.
+Dynamic Flow: Every scene must have motion (e.g., wide pans or macro photography) to avoid "static" talking heads."""
+
+# Source numaralandırması user'ın template'ine uygun:
+# Source 3: Narrative & Text-Free Execution Guide
+# Source 4: Historical Accuracy & Identity Protocol
+# Source 5: Student Safety & Visual Harmony Guide
+# Source 6: The 80/20 Animation-Heavy Model
+EXECUTION_GUIDE_FILES: list[tuple[str, str]] = [
+    ("_03_Narrative_TextFree_Guide.txt", EXEC_GUIDE_NARRATIVE_TEXT_FREE),
+    ("_04_HistoricalAccuracy_Identity.txt", EXEC_GUIDE_HISTORICAL_ACCURACY),
+    ("_05_StudentSafety_VisualHarmony.txt", EXEC_GUIDE_STUDENT_SAFETY),
+    ("_06_AnimationHeavy_80_20.txt", EXEC_GUIDE_ANIMATION_80_20),
+]
+
+# Backward-compat: bazı yerler hâlâ EXECUTION_GUIDE_PROMPT'a refer ediyor olabilir
+EXECUTION_GUIDE_PROMPT = "\n\n".join(text for _, text in EXECUTION_GUIDE_FILES)
+
+
+def write_execution_guide_sources(out_dir: Path) -> list[Path]:
+    """4 ayrı protokol dosyasını yaz, path listesi dön.
+
+    Her dosya NotebookLM'e ayrı source olarak yüklenir. Sıra user'ın
+    template'iyle uyumlu (Narrative → Historical → Safety → Animation).
     """
-    try:
-        out_dir.mkdir(parents=True, exist_ok=True)
-        p = out_dir / "_execution_guide.txt"
-        p.write_text(EXECUTION_GUIDE_PROMPT, encoding="utf-8")
-        return p
-    except OSError:
-        return None
+    out_dir.mkdir(parents=True, exist_ok=True)
+    written: list[Path] = []
+    for filename, text in EXECUTION_GUIDE_FILES:
+        p = out_dir / filename
+        try:
+            p.write_text(text, encoding="utf-8")
+            written.append(p)
+        except OSError:
+            pass
+    return written
 
 
 # ---------------------------------------------------------------------------
@@ -1782,12 +1821,26 @@ class Worker:
             launcher_log(f"Job {job.id}: script.txt yazma hatası: {e}")
             script_path = None
 
-        # 1.b) Sabit execution guide'ı source olarak ekle (her job'a otomatik)
-        # NotebookLM source listesinin ilk öğesi olur — Cinematic gen sırasında
-        # kuralları primer olarak kullanır. Custom prompt'tan ayrı bir source.
-        guide_path = write_execution_guide_source(job_pack_dir)
-        if guide_path:
-            launcher_log(f"Job {job.id}: execution guide source eklendi ({guide_path.name})")
+        # 1.b) Learning Objectives companion (bulk Drive _lo.docx)
+        lo_path: Optional[Path] = None
+        if (job.learning_objectives or "").strip():
+            try:
+                lo_path = job_pack_dir / f"{safe_title}_LearningObjectives.txt"
+                lo_path.write_text(job.learning_objectives, encoding="utf-8")
+                launcher_log(f"Job {job.id}: learning objectives source eklendi ({lo_path.name})")
+            except OSError as e:
+                launcher_log(f"Job {job.id}: LO write hatası: {e}")
+                lo_path = None
+
+        # 1.c) Sabit execution guide — 4 ayrı protokol dosyası (her job'a otomatik)
+        # NotebookLM source panelinde her protokol ayrı görünür, Cinematic gen
+        # her sahnede 4 ayrı kuralı referans alır.
+        guide_paths = write_execution_guide_sources(job_pack_dir)
+        if guide_paths:
+            launcher_log(
+                f"Job {job.id}: {len(guide_paths)} execution guide source eklendi "
+                f"({', '.join(p.name for p in guide_paths)})"
+            )
 
         # 2) Image'leri indir
         image_paths: list[Path] = []
@@ -1814,6 +1867,7 @@ class Worker:
                     DEFAULT_CUSTOM_PROMPT_TEMPLATE,
                     job.title or "",
                     job.assets or [],
+                    has_learning_objectives=bool((job.learning_objectives or "").strip()),
                 )
             except Exception as _e:
                 launcher_log(f"Job {job.id}: default prompt render hatası: {_e}")
@@ -1949,8 +2003,8 @@ class Worker:
                 t = threading.Thread(
                     target=self._run_job_via_notebooklm,
                     args=(job.id, profile, script_path, image_paths,
-                          job.custom_prompt or "", log_fp, guide_path,
-                          prompt_path),
+                          job.custom_prompt or "", log_fp, guide_paths,
+                          prompt_path, lo_path),
                     name=f"nbpy-{job.id}",
                     daemon=True,
                 )
@@ -1986,8 +2040,9 @@ class Worker:
                                  image_paths: list[Path],
                                  custom_prompt: str,
                                  log_fp,
-                                 guide_path: Optional[Path] = None,
-                                 prompt_path: Optional[Path] = None) -> None:
+                                 guide_paths: Optional[list[Path]] = None,
+                                 prompt_path: Optional[Path] = None,
+                                 lo_path: Optional[Path] = None) -> None:
         """teng-lin/notebooklm-py ile end-to-end pipeline. Worker thread'inde.
 
         Tek async chain: notebook create → sources add → cinematic generate →
@@ -2037,36 +2092,40 @@ class Worker:
                     pass
 
         try:
-            # 1. Source paket sırası:
-            #    [0] Execution guide (sabit talimatlar — _execution_guide.txt)
-            #    [1] Custom prompt brief (Role/Task/Constraints — _custom_prompt.txt)
-            #    [2] Script (kullanıcının senaryosu)
-            #    [3..N] Image'ler
-            # Guide + custom prompt ikisi de source olarak en başta —
-            # NotebookLM önce kuralları + task brief'i okur, sonra script'i,
-            # sonra görselleri. Custom prompt ayrıca Cinematic Customize'a da
-            # gider (redundancy → daha güçlü prime).
+            # 1. Source paket sırası (user'ın template'iyle bire bir uyumlu):
+            #    [1] <Title>_Script.txt
+            #    [2] <Title>_LearningObjectives.txt (varsa, _lo.docx companion)
+            #    [3] Narrative & Text-Free Execution Guide
+            #    [4] Historical Accuracy & Identity Protocol
+            #    [5] Student Safety & Visual Harmony Guide
+            #    [6] The 80/20 Animation-Heavy Model
+            #    [7] _custom_prompt.txt (Role/Task/Constraints)
+            #    [8..N] Image'ler
             source_paths: list[Path] = []
-            if guide_path and guide_path.exists():
-                source_paths.append(guide_path)
-            if prompt_path and prompt_path.exists():
-                source_paths.append(prompt_path)
             if script_path and script_path.exists():
                 source_paths.append(script_path)
+            if lo_path and lo_path.exists():
+                source_paths.append(lo_path)
+            for gp in (guide_paths or []):
+                if isinstance(gp, Path) and gp.exists():
+                    source_paths.append(gp)
+            if prompt_path and prompt_path.exists():
+                source_paths.append(prompt_path)
             for p in (image_paths or []):
                 if isinstance(p, Path) and p.exists():
                     source_paths.append(p)
             if not source_paths:
                 raise NotebookLMClientError(
-                    "Hiç source dosyası yok (guide + prompt + script + images boş)",
+                    "Hiç source dosyası yok",
                     stage="prep",
                 )
 
             log_fp.write(
                 f"## starting notebooklm-py pipeline: {len(source_paths)} sources "
-                f"(guide={'yes' if guide_path else 'no'}, "
+                f"(script={'yes' if script_path else 'no'}, "
+                f"lo={'yes' if lo_path else 'no'}, "
+                f"guides={len(guide_paths or [])}, "
                 f"prompt_brief={'yes' if prompt_path else 'no'}, "
-                f"script={'yes' if script_path else 'no'}, "
                 f"images={len(image_paths or [])}), "
                 f"prompt {len(custom_prompt)} chars\n"
             )
@@ -3391,15 +3450,20 @@ def render_bulk_drive_section(*, key_prefix: str = "blk") -> None:
     )
 
     st.info(
-        "🔒 Sabit talimatlar (Text-Free / 80-20 Animation / Student Safety / "
-        "Historical Accuracy) her job'a **ekstra source** olarak otomatik "
-        "yüklenir (`_execution_guide.txt`). Custom prompt template'ine ekleme "
-        "değil — NotebookLM kuralları source'tan okur, her sahnede primer "
-        "olarak uygular.",
+        "🔒 Her job için NotebookLM'e otomatik yüklenen source'lar:\n"
+        "  • **Script** + **Learning Objectives** (`<name>_lo.docx` companion varsa)\n"
+        "  • **4 ayrı sabit guide** (Narrative & Text-Free / History / "
+        "Student Safety / 80-20 Animation)\n"
+        "  • **Custom Prompt** (Role/Task/Constraints)\n"
+        "  • Görseller\n\n"
+        "Drive klasöründe `senaryo1.docx` + `senaryo1_lo.docx` çiftleri "
+        "otomatik eşleştirilir — LO ayrı bir source olarak yüklenir.",
         icon="ℹ️",
     )
-    with st.expander("👁 Sabit talimatları gör (read-only)"):
-        st.code(EXECUTION_GUIDE_PROMPT, language=None)
+    with st.expander("👁 4 sabit guide'ı gör (read-only)"):
+        for filename, text in EXECUTION_GUIDE_FILES:
+            st.markdown(f"**📄 {filename}**")
+            st.code(text, language=None)
 
     cols = st.columns([1, 1, 2])
     with cols[0]:
@@ -3423,21 +3487,28 @@ def render_bulk_drive_section(*, key_prefix: str = "blk") -> None:
         else:
             with st.spinner(f"Drive klasörü taranıyor (folder_id={folder_id[:12]}…)…"):
                 try:
-                    from bulk_import import list_drive_folder_docx, get_docx_metadata
+                    from bulk_import import (
+                        list_drive_folder_docx, get_docx_metadata, pair_docx_with_lo,
+                    )
                     import tempfile
                     _tmp = Path(tempfile.mkdtemp(prefix="bulk_preview_"))
                     docx_paths = list_drive_folder_docx(drive_url, _tmp)
+                    pairs = pair_docx_with_lo(docx_paths)
+                    # items: sadece ana (main) docx'ler. _lo companion'lar
+                    # eşleştirilenler item gibi tekrar listelenmez.
                     items = []
-                    for p in docx_paths:
-                        md = get_docx_metadata(p)
+                    for main_p, lo_p in pairs:
+                        md = get_docx_metadata(main_p)
                         items.append({
-                            "path": str(p),
-                            "name": p.name,
-                            "size": p.stat().st_size,
+                            "path": str(main_p),
+                            "name": main_p.name,
+                            "size": main_p.stat().st_size,
                             "modified": md.get("modified"),
                             "created": md.get("created"),
                             "author": md.get("author", ""),
                             "n_paragraphs": md.get("n_paragraphs", 0),
+                            "lo_path": str(lo_p) if lo_p else "",
+                            "lo_name": lo_p.name if lo_p else "",
                         })
                     # Son değiştirilme tarihine göre sırala (yeni en üstte)
                     items.sort(
@@ -3510,9 +3581,18 @@ def render_bulk_drive_section(*, key_prefix: str = "blk") -> None:
                         label_visibility="collapsed",
                     )
                 with cs[1]:
+                    lo_badge = ""
+                    if it.get("lo_name"):
+                        lo_badge = (
+                            f" <span style='font-size:0.72rem; "
+                            f"padding:1px 6px; background:rgba(99,102,241,0.15); "
+                            f"border-radius:8px; color:#6366f1;'>+ LO</span>"
+                        )
                     st.markdown(
                         f"<div style='font-size:0.88rem; font-weight:500;'>"
-                        f"📄 {it['name']}</div>",
+                        f"📄 {it['name']}{lo_badge}</div>"
+                        + (f"<div style='font-size:0.72rem; opacity:0.55;'>"
+                           f"↳ {it['lo_name']}</div>" if it.get("lo_name") else ""),
                         unsafe_allow_html=True,
                     )
                 with cs[2]:
@@ -3552,7 +3632,8 @@ def render_bulk_drive_section(*, key_prefix: str = "blk") -> None:
         else:
             submitter = _user_name() or "bulk"
 
-            def _job_factory(title, text, custom_prompt, submitted_by):
+            def _job_factory(title, text, custom_prompt, submitted_by,
+                             learning_objectives: str = ""):
                 return {
                     "id": uuid.uuid4().hex[:12],
                     "title": title,
@@ -3562,6 +3643,7 @@ def render_bulk_drive_section(*, key_prefix: str = "blk") -> None:
                     "status": "queued",
                     "assets": [],
                     "created_at": time.time(),
+                    "learning_objectives": learning_objectives,
                 }
 
             progress_box = st.empty()
@@ -3577,7 +3659,9 @@ def render_bulk_drive_section(*, key_prefix: str = "blk") -> None:
             cached = st.session_state.get(preview_key)
             try:
                 if cached and cached.get("items"):
-                    # Checkbox'tan seçili olanları al
+                    # Checkbox'tan seçili olanları al — her main için _lo
+                    # companion path'i de listeye ekle ki bulk_create_jobs
+                    # içindeki pair_docx_with_lo onu bulup eşleştirsin.
                     sel_paths = []
                     for it in cached["items"]:
                         sel_key = f"{key_prefix}_bulk_sel_{it['name']}"
@@ -3585,6 +3669,11 @@ def render_bulk_drive_section(*, key_prefix: str = "blk") -> None:
                             p = Path(it["path"])
                             if p.exists():
                                 sel_paths.append(p)
+                            lo_str = it.get("lo_path", "")
+                            if lo_str:
+                                lo_p = Path(lo_str)
+                                if lo_p.exists():
+                                    sel_paths.append(lo_p)
                     if not sel_paths:
                         st.error("Hiçbir dosya seçili değil.")
                         result = None
@@ -3630,6 +3719,7 @@ def render_bulk_drive_section(*, key_prefix: str = "blk") -> None:
                             submitted_by=jd["submitted_by"],
                             created_at=jd["created_at"],
                             custom_prompt=jd["custom_prompt"],
+                            learning_objectives=jd.get("learning_objectives", ""),
                         )
                         j.assets = []
                         created_jobs.append(j)
@@ -5015,18 +5105,24 @@ def render_user_view() -> None:
                 "yönlendirir."
             )
             st.info(
-                "🔒 NotebookLM source listesi:\n"
-                "1. `_execution_guide.txt` — Sabit kurallar "
-                "(Text-Free / 80-20 Animation / Student Safety / History)\n"
-                "2. `_custom_prompt.txt` — Bu doküman (Role/Task/Constraints)\n"
-                "3. `<Title>_Script.txt` — Senaryon\n"
-                "4..N. Görseller\n\n"
+                "🔒 NotebookLM source listesi (her job otomatik):\n"
+                "1. `<Title>_Script.txt` — Senaryon\n"
+                "2. `<Title>_LearningObjectives.txt` — _lo.docx companion (varsa)\n"
+                "3. Narrative & Text-Free Execution Guide\n"
+                "4. Historical Accuracy & Identity Protocol\n"
+                "5. Student Safety & Visual Harmony Guide\n"
+                "6. The 80/20 Animation-Heavy Model\n"
+                "7. `_custom_prompt.txt` — Bu doküman (Role/Task/Constraints)\n"
+                "8..N. Görseller\n\n"
                 "Custom prompt **hem source olarak hem Cinematic Customize alanına** "
-                "gider — daha güçlü prime.",
+                "gider — daha güçlü prime. Drive'da `senaryo1.docx` + `senaryo1_lo.docx` "
+                "var ise ikisi de yüklenir.",
                 icon="ℹ️",
             )
-            with st.expander("👁 Sabit talimatları (Execution Guide) gör"):
-                st.code(EXECUTION_GUIDE_PROMPT, language=None)
+            with st.expander("👁 4 sabit guide'ı gör (read-only)"):
+                for filename, text in EXECUTION_GUIDE_FILES:
+                    st.markdown(f"**📄 {filename}**")
+                    st.code(text, language=None)
 
             cs_p = st.columns([1.2, 4])
             with cs_p[0]:

@@ -210,6 +210,45 @@ def list_drive_folder_docx(folder_id_or_url: str,
 # ---------------------------------------------------------------------------
 # Bulk job creation
 # ---------------------------------------------------------------------------
+def pair_docx_with_lo(docx_paths: list[Path]) -> list[tuple[Path, Optional[Path]]]:
+    """Drive'daki docx'leri main + _lo companion olarak grupla.
+
+    Eşleştirme: 'senaryo1.docx' (main) + 'senaryo1_lo.docx' (learning objectives).
+    `_lo` suffix'iyle biten dosyalar companion olarak kabul edilir; ana dosya
+    aynı klasörde bulunmazsa standalone (lo skip).
+
+    Returns: [(main_path, lo_path_or_None), ...]
+    Sıralama: main dosyaların stem'ine göre alfabetik.
+    """
+    by_stem: dict[str, Path] = {}
+    for p in docx_paths:
+        if p.suffix.lower() != ".docx":
+            continue
+        by_stem[p.stem] = p
+
+    pairs: list[tuple[Path, Optional[Path]]] = []
+    seen: set[str] = set()
+    for stem in sorted(by_stem.keys()):
+        if stem in seen:
+            continue
+        if stem.endswith("_lo"):
+            # Bu LO dosyası — ana script aynı klasörde varsa main loop'ta zaten
+            # eşleştirilmiş olur. Burada gelirse main yok demektir, skip.
+            main_stem = stem[:-3]
+            if main_stem in by_stem:
+                continue  # main loop tarafından zaten ele alındı
+            # Standalone _lo, main yok → skip (warn)
+            continue
+        # Ana script
+        lo_stem = stem + "_lo"
+        lo_path = by_stem.get(lo_stem)
+        pairs.append((by_stem[stem], lo_path))
+        seen.add(stem)
+        if lo_path is not None:
+            seen.add(lo_stem)
+    return pairs
+
+
 def bulk_create_jobs_from_docx_paths(
     docx_paths: list[Path],
     *,
@@ -219,7 +258,10 @@ def bulk_create_jobs_from_docx_paths(
     on_progress: Optional[Callable[[str], None]] = None,
 ) -> dict:
     """Her docx için bir Job dict oluşturur. job_factory(title, text, custom_prompt,
-    submitted_by) → dict döner (caller dataclasse maple). save işini caller yapar.
+    submitted_by, learning_objectives) → dict döner (caller dataclass'a maple).
+
+    `<name>_lo.docx` companion'ları otomatik eşleştirilir → ana job'ın
+    `learning_objectives` field'ına geçirilir. Eşleşmeyen `_lo.docx` skip.
 
     Returns: {"created": [...job_dicts...], "errors": [(filename, err), ...]}
     """
@@ -229,24 +271,40 @@ def bulk_create_jobs_from_docx_paths(
     created: list[dict] = []
     errors: list[tuple[str, str]] = []
 
-    for i, p in enumerate(docx_paths):
+    pairs = pair_docx_with_lo(docx_paths)
+    if on_progress:
+        n_paired = sum(1 for _, lo in pairs if lo is not None)
+        on_progress(
+            f"{len(pairs)} ana script → {n_paired} tanesi _lo.docx companion ile eşleşti."
+        )
+
+    for i, (main_path, lo_path) in enumerate(pairs):
         if on_progress:
-            on_progress(f"[{i+1}/{len(docx_paths)}] {p.name} işleniyor…")
+            lo_note = f" + {lo_path.name}" if lo_path else ""
+            on_progress(f"[{i+1}/{len(pairs)}] {main_path.name}{lo_note} işleniyor…")
         try:
-            text = parse_docx(p)
+            text = parse_docx(main_path)
             if not text or len(text.strip()) < 50:
-                errors.append((p.name, f"Çok kısa veya boş ({len(text)} chars)"))
+                errors.append((main_path.name, f"Çok kısa veya boş ({len(text)} chars)"))
                 continue
-            title = docx_to_title(p.name, text)
+            lo_text = ""
+            if lo_path:
+                try:
+                    lo_text = parse_docx(lo_path)
+                except Exception as e:
+                    errors.append((lo_path.name, f"LO parse fail: {e}"))
+                    lo_text = ""
+            title = docx_to_title(main_path.name, text)
             job = job_factory(
                 title=title,
                 text=text,
                 custom_prompt=custom_prompt_template,
                 submitted_by=submitted_by,
+                learning_objectives=lo_text,
             )
             created.append(job)
         except Exception as e:
-            errors.append((p.name, f"{type(e).__name__}: {str(e)[:200]}"))
+            errors.append((main_path.name, f"{type(e).__name__}: {str(e)[:200]}"))
 
     if on_progress:
         on_progress(

@@ -165,7 +165,10 @@ AZURE_STORAGE_CONNECTION_STRING=<sas connection string>
 AZURE_CONTAINER=cinematic-videos
 AZURE_BLOB_PREFIX=videos/
 
-# Gemini CLI binary path (text gen, OAuth Sign-in)
+# Gemini text gen — TWO modes (env'e bağlı otomatik dispatch):
+# Mode 1: API key (AKTİF, önerilen) — google-genai SDK direkt
+GEMINI_API_KEY=AIzaSy...           # https://aistudio.google.com/apikey
+# Mode 2: CLI fallback (key yoksa devreye girer)
 GEMINI_BIN_PATH=/usr/local/bin/gemini
 
 # Playwright sistem Chromium (Ubuntu 26.04 için)
@@ -296,7 +299,9 @@ print(Counter(j[\"status\"] for j in jobs))
 
 ## 11. Son 2 Hafta Yapılan Migration'lar
 
-- **OpenRouter → Gemini CLI** (text gen): OAuth Sign-in with Google, API key gerekmez. Rate limit derdi bitti.
+- **OpenRouter → Gemini CLI (OAuth) → Gemini API key**: Text gen 3 evrim
+  geçirdi. Şu an `google-genai` SDK + API key (AKTİF). CLI yolu fallback
+  olarak duruyor (`GEMINI_API_KEY` yoksa devreye girer).
 - **tmc/nlm Go CLI + Playwright harvest → teng-lin/notebooklm-py**: Python-native, native MP4 download, harvest cycle yok.
 - **Pollinations image gen**: Hâlâ aktif (nano-banana OAuth tier'da yok). User isterse AI Studio API key path'i açılabilir.
 - **Drive Toplu özelliği**: Public Drive klasör → 40 docx → 9/gün job dispatch.

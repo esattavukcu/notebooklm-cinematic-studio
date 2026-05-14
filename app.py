@@ -136,6 +136,11 @@ TERMINAL_STATUSES = {"done", "failed", "submitted", "stopped"}
 HARVEST_PICKUP_STATUSES = {"generating", "done"}  # geriye dönük uyum için "done" da
 
 DISPATCH_INTERVAL_SEC = 2.0
+# Profil NotebookLM kota hatası yedikten sonra kaç saat block kalır?
+# Google'ın gerçek reset zamanı Pacific time (~07-08:00 UTC) — bizim UTC date
+# rollover ile uyumsuz. 8h block + self-correct retry: max 8h overshoot,
+# gerçek reset zamanını otomatik bulur.
+QUOTA_BLOCK_HOURS = float(os.environ.get("QUOTA_BLOCK_HOURS", "8"))
 JOB_LOG_TAIL_LINES = 400
 
 # Harvest module config — env var ile override edilebilir.
@@ -1525,8 +1530,16 @@ class Worker:
         return sum(1 for j in jobs if j.profile_id == profile_id and j.status == "running")
 
     def _quota_blocked_today(self, jobs: list[Job], profile_id: str) -> bool:
-        """Bugün NotebookLM kota dolu mesajı yiyen profil — yeni job dispatch etme."""
-        today = date.today()
+        """NotebookLM kota dolu mesajı son N saat içinde yiyen profil — pas geç.
+
+        Önceden 'bugün UTC date' check'i vardı. Sorun: NotebookLM kota reset'i
+        Pacific time (~07-08:00 UTC) iken bizim UTC date 00:00'da rollover
+        oluyordu → 00:00 UTC'de retry, Google hâlâ kotalı, empirical fail
+        → 1 gün kayıp. Şimdi son 8 saat içinde kota hatası yedikse blokla;
+        8 saatte bir self-correctively retry → Google reset'e otomatik denk
+        gelir, max 8 saat overshoot.
+        """
+        cutoff = time.time() - QUOTA_BLOCK_HOURS * 3600
         for j in jobs:
             if j.profile_id != profile_id:
                 continue
@@ -1536,11 +1549,8 @@ class Worker:
             if "kota" not in err_lower and "limit" not in err_lower:
                 continue
             ts = j.finished_at or j.started_at or j.created_at
-            try:
-                if datetime.fromtimestamp(ts).date() == today:
-                    return True
-            except (OSError, OverflowError, ValueError):
-                continue
+            if ts > cutoff:
+                return True
         return False
 
     def _dispatch_round(self) -> None:
@@ -3476,7 +3486,10 @@ def render_user_view() -> None:
     )
 
     # Kullanılabilir hesap var mı? (Kota dolu olanlar hariç)
+    # Time-based block: son QUOTA_BLOCK_HOURS saat içinde kota hatası yediyse pas
+    # geç (UTC date rollover yerine; Google'ın Pacific reset'iyle uyumlu).
     def _profile_blocked(pid: str) -> bool:
+        cutoff = time.time() - QUOTA_BLOCK_HOURS * 3600
         for j in jobs:
             if j.profile_id != pid or not j.error:
                 continue
@@ -3484,11 +3497,8 @@ def render_user_view() -> None:
             if "kota" not in err and "limit" not in err:
                 continue
             ts = j.finished_at or j.started_at or j.created_at
-            try:
-                if datetime.fromtimestamp(ts).date() == today:
-                    return True
-            except (OSError, OverflowError, ValueError):
-                continue
+            if ts > cutoff:
+                return True
         return False
 
     available_profiles = [p for p in initialized_profiles if not _profile_blocked(p.id)]

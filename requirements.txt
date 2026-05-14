@@ -5,7 +5,11 @@ python-dotenv>=1.0,<2
 # AZURE_STORAGE_CONNECTION_STRING env var set edilmediyse import edilmez.
 # Disk yeri tasarrufu için kaldırmak istersen yorum yapabilirsin.
 azure-storage-blob>=12.19,<13
-# Text gen artık Google'ın gemini-cli (Node.js) üzerinden çalışıyor —
-# OAuth sign-in, API key gerekmez. Python tarafı sadece subprocess wrapper
-# (gemini_client.py), ek Python dependency yok.
+# Text gen: gemini-cli (Node.js) subprocess wrapper (gemini_client.py).
+# OAuth sign-in, API key gerekmez. Ek Python dependency yok.
 # (Eski 'openai>=1.0,<2' kaldırıldı — OpenRouter desteği removed.)
+
+# NotebookLM submit + video download: teng-lin/notebooklm-py.
+# tmc/nlm Go CLI + Playwright harvest cycle'ını değiştirdi.
+# Mevcut chrome_profiles/<id>/auth.json'ı doğrudan kullanır.
+notebooklm-py>=0.4,<1

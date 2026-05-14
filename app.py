@@ -46,9 +46,25 @@ except ImportError:
 
 import streamlit as st
 
-# Phase 3: tmc/nlm wrapper — NotebookLM internal API üzerinden source upload +
-# create-video. Playwright DOM scraping yerine kullanılır. Import erken
-# yapılmalı (worker thread'leri spawn etmeden önce module hazır olsun).
+# Phase 6: teng-lin/notebooklm-py — Python-native NotebookLM API.
+# Notebook create + source upload + Cinematic generate + MP4 download tek
+# kütüphanede. Önceki tmc/nlm (Go subprocess) + Playwright harvest cycle'i
+# tamamen değiştirir. Auth: mevcut chrome_profiles/<id>/auth.json kullanılır.
+try:
+    from notebooklm_client import (
+        NotebookLMClientError,
+        submit_job as notebooklm_submit_job,
+        smoke_test as notebooklm_smoke_test,
+        is_available as notebooklm_is_available,
+        auth_path_for,
+    )
+    _NOTEBOOKLM_AVAILABLE = True
+except ImportError as _nb_imp_err:
+    _NOTEBOOKLM_AVAILABLE = False
+    _nb_imp_err_msg = str(_nb_imp_err)
+
+# Legacy: tmc/nlm Go CLI wrapper. notebooklm-py'a geçiş tamamlandı, fallback
+# için kalır. USE_LEGACY_SUBMIT=1 env ile zorla aktif edilebilir.
 try:
     from nlm_client import (
         NlmError,
@@ -1667,11 +1683,24 @@ class Worker:
         log_path = job_log_path(job.id)
         log_path.parent.mkdir(parents=True, exist_ok=True)
 
-        # Submit path seçimi: USE_PLAYWRIGHT_SUBMIT=1 → eski Playwright path;
-        # default (yokken) → tmc/nlm CLI path (daha hızlı, daha stabil).
+        # Submit path öncelik sırası:
+        #   1) notebooklm-py (default, en yeni) — Python native, MP4 download
+        #   2) tmc/nlm Go CLI (USE_LEGACY_SUBMIT=1 ile aktif) — fallback
+        #   3) Playwright automator (USE_PLAYWRIGHT_SUBMIT=1 ile aktif) — son çare
         use_playwright = os.environ.get("USE_PLAYWRIGHT_SUBMIT", "").strip() == "1"
-        if not _NLM_AVAILABLE:
-            use_playwright = True  # nlm_client import edilemediyse zorunlu fallback
+        use_legacy_nlm = os.environ.get("USE_LEGACY_SUBMIT", "").strip() == "1"
+        # Availability fallback chain
+        if not _NOTEBOOKLM_AVAILABLE and not use_legacy_nlm and not use_playwright:
+            if _NLM_AVAILABLE:
+                use_legacy_nlm = True
+                launcher_log(
+                    f"Job {job.id}: notebooklm-py yok, tmc/nlm fallback'a düşülüyor"
+                )
+            else:
+                use_playwright = True
+                launcher_log(
+                    f"Job {job.id}: notebooklm-py + tmc/nlm yok, Playwright fallback"
+                )
 
         try:
             log_fp = log_path.open("w", encoding="utf-8", buffering=1)
@@ -1704,9 +1733,9 @@ class Worker:
                     f"Job {job.id} launched via Playwright on profile "
                     f"{profile.name} (pid={proc.pid})"
                 )
-            else:
-                # ===== NEW: tmc/nlm CLI submit path =====
-                log_fp.write(f"# Submit path: nlm CLI (tmc/nlm via subprocess)\n")
+            elif use_legacy_nlm:
+                # ===== LEGACY: tmc/nlm Go CLI =====
+                log_fp.write(f"# Submit path: nlm CLI (tmc/nlm, legacy)\n")
                 log_fp.write(
                     f"# Files: script={script_path}, "
                     f"images={len(image_paths)}, "
@@ -1722,7 +1751,28 @@ class Worker:
                 )
                 t.start()
                 launcher_log(
-                    f"Job {job.id} launched via nlm on profile "
+                    f"Job {job.id} launched via tmc/nlm on profile "
+                    f"{profile.name} (legacy)"
+                )
+            else:
+                # ===== NEW: notebooklm-py (Python native) =====
+                log_fp.write(f"# Submit path: notebooklm-py (Python native)\n")
+                log_fp.write(
+                    f"# Files: script={script_path}, "
+                    f"images={len(image_paths)}, "
+                    f"prompt_chars={len(job.custom_prompt or '')}\n\n"
+                )
+                log_fp.flush()
+                t = threading.Thread(
+                    target=self._run_job_via_notebooklm,
+                    args=(job.id, profile, script_path, image_paths,
+                          job.custom_prompt or "", log_fp),
+                    name=f"nbpy-{job.id}",
+                    daemon=True,
+                )
+                t.start()
+                launcher_log(
+                    f"Job {job.id} launched via notebooklm-py on profile "
                     f"{profile.name} (thread)"
                 )
         except Exception as e:
@@ -1746,6 +1796,185 @@ class Worker:
                 profiles_all[i] = p
                 break
         save_profiles(profiles_all)
+
+    def _run_job_via_notebooklm(self, job_id: str, profile: "Profile",
+                                 script_path: Optional[Path],
+                                 image_paths: list[Path],
+                                 custom_prompt: str,
+                                 log_fp) -> None:
+        """teng-lin/notebooklm-py ile end-to-end pipeline. Worker thread'inde.
+
+        Tek async chain: notebook create → sources add → cinematic generate →
+        wait_for_completion (30-40dk) → download MP4. Playwright harvest cycle
+        gerekmez — MP4 native indirilir.
+
+        Job state geçişleri:
+          running → generating (notebook + sources upload OK, gen başladı)
+          generating → done (MP4 indirildi + Azure'a upload sonrası)
+        """
+        import traceback as _tb
+
+        def on_event(name: str, **payload) -> None:
+            """notebooklm_client callback → log + state update."""
+            try:
+                items = " ".join(f"{k}={v!r}" for k, v in payload.items() if k != "auth")
+                log_fp.write(f"## [{name}] {items[:300]}\n")
+                log_fp.flush()
+            except Exception:
+                pass
+            # Önemli event'lerde job state'i güncelle (admin UI ve harvest skip için)
+            if name == "notebook_created":
+                self._apply_event(job_id, {
+                    "type": "notebook_created",
+                    "notebook_url": payload.get("url", ""),
+                })
+            elif name == "video_gen_started":
+                self._apply_event(job_id, {
+                    "type": "automation_complete",
+                    "exit_code": 0,
+                    "notebook_url": "",  # zaten set edildi yukarıda
+                })
+                # notebooklm-py native MP4 download yapacak — harvest dispatcher
+                # bu job'a dokunmasın (paralel cookie-fetch'i önle).
+                try:
+                    jobs_all = load_jobs()
+                    for j in jobs_all:
+                        if j.id == job_id:
+                            j.harvest_status = "skip"
+                            break
+                    save_jobs(jobs_all)
+                except Exception:
+                    pass
+
+        try:
+            # 1. Source paket: script + images
+            source_paths: list[Path] = []
+            if script_path and script_path.exists():
+                source_paths.append(script_path)
+            for p in (image_paths or []):
+                if isinstance(p, Path) and p.exists():
+                    source_paths.append(p)
+            if not source_paths:
+                raise NotebookLMClientError(
+                    "Hiç source dosyası yok (script + images boş)",
+                    stage="prep",
+                )
+
+            log_fp.write(
+                f"## starting notebooklm-py pipeline: {len(source_paths)} sources, "
+                f"prompt {len(custom_prompt)} chars\n"
+            )
+            log_fp.flush()
+
+            # 2. Tek senkron çağrı (içeride asyncio.run → tüm pipeline)
+            jobs_all = load_jobs()
+            target = next((j for j in jobs_all if j.id == job_id), None)
+            title = (target.title if target else "Untitled")[:80]
+            try:
+                result = notebooklm_submit_job(
+                    profile_id=profile.id,
+                    title=title,
+                    source_paths=source_paths,
+                    custom_prompt=custom_prompt,
+                    on_event=on_event,
+                    language="tr",  # script Türkçe ağırlıklı
+                    video_timeout_sec=3600.0,  # 1h Cinematic Veo 3
+                )
+            except NotebookLMClientError as e:
+                log_fp.write(f"## NotebookLMClientError [{e.stage}]: {e}\n")
+                log_fp.flush()
+                # Hata: job status=failed + auth ise profile init=False
+                jobs_all = load_jobs()
+                for j in jobs_all:
+                    if j.id == job_id:
+                        j.status = "failed"
+                        j.error = f"{e.stage}: {str(e)[:280]}"
+                        j.finished_at = time.time()
+                        break
+                save_jobs(jobs_all)
+                if e.stage == "auth":
+                    # Profile re-init gerek
+                    try:
+                        auth_p = auth_path_for(profile.id)
+                        if auth_p.exists():
+                            auth_p.unlink()
+                        ps = load_profiles()
+                        for p in ps:
+                            if p.id == profile.id:
+                                p.initialized = False
+                                break
+                        save_profiles(ps)
+                    except Exception:
+                        pass
+                return
+
+            # 3. Başarı — Job güncelle
+            log_fp.write(
+                f"## PIPELINE DONE: notebook={result['notebook_id']} "
+                f"task={result['task_id']} mp4={result['local_mp4']} "
+                f"duration={result['duration_sec']}s\n"
+            )
+            log_fp.flush()
+
+            # MP4 lokalde, video_local_path doldur + Azure upload (eğer enabled)
+            local_mp4 = Path(result["local_mp4"])
+            jobs_all = load_jobs()
+            for j in jobs_all:
+                if j.id == job_id:
+                    j.notebook_url = result["notebook_url"]
+                    j.video_url = ""  # notebooklm-py local download, CDN URL yok
+                    try:
+                        j.video_local_path = str(
+                            local_mp4.resolve().relative_to(APP_DIR)
+                        )
+                    except (ValueError, OSError):
+                        j.video_local_path = str(local_mp4)
+                    j.harvest_status = "downloaded"
+                    j.status = "done"  # video hazır, harvest gerek yok
+                    j.finished_at = time.time()
+                    break
+            save_jobs(jobs_all)
+
+            # 4. Azure upload (best-effort, fail olursa job done kalır)
+            if AZURE_ENABLED and local_mp4.exists():
+                log_fp.write(f"## Azure upload: {local_mp4.name}\n")
+                log_fp.flush()
+                ok, remote_url, err = upload_to_azure(local_mp4, job_id)
+                jobs2 = load_jobs()
+                for j in jobs2:
+                    if j.id == job_id:
+                        if ok:
+                            j.video_remote_url = remote_url
+                            j.harvest_status = "uploaded"
+                        else:
+                            j.harvest_error = f"Azure upload failed: {err}"
+                        break
+                save_jobs(jobs2)
+                launcher_log(
+                    f"Azure upload for {job_id}: "
+                    f"{'ok' if ok else 'failed'} {err}"
+                )
+                log_fp.write(f"## Azure done: ok={ok}\n")
+            log_fp.flush()
+
+        except Exception as e:
+            log_fp.write(f"## Unexpected error: {type(e).__name__}: {e}\n")
+            log_fp.write(_tb.format_exc() + "\n")
+            log_fp.flush()
+            jobs_all = load_jobs()
+            for j in jobs_all:
+                if j.id == job_id and j.status not in ("queued",):
+                    j.status = "failed"
+                    if not j.error:
+                        j.error = f"{type(e).__name__}: {str(e)[:240]}"
+                    j.finished_at = time.time()
+                    break
+            save_jobs(jobs_all)
+        finally:
+            try:
+                log_fp.close()
+            except Exception:
+                pass
 
     def _run_job_via_nlm(self, job_id: str, profile: "Profile",
                           script_path: Optional[Path],

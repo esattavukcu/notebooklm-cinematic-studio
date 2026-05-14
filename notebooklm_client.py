@@ -1,0 +1,326 @@
+"""
+notebooklm_client.py — teng-lin/notebooklm-py Python wrapper.
+
+tmc/nlm Go CLI + Playwright harvest cycle'ı tek bir Python kütüphanesiyle
+değiştirir. Native MP4 download → cookie-fetch harvest döngüsüne ihtiyaç yok.
+
+Auth: Mevcut chrome_profiles/<id>/auth.json (Playwright storage_state) doğrudan
+kabul ediliyor (NotebookLMClient.from_storage). Init flow değişmiyor.
+
+Sync facade: Streamlit Worker thread'inde asyncio.run() ile async API çağrılır,
+caller sync görünür. Tüm pipeline (notebook create → sources upload → cinematic
+generate → wait → download) tek bir coroutine'de.
+
+API:
+- submit_job(profile_id, title, source_paths, custom_prompt, on_event)
+    Full pipeline. on_event(name, **payload) callback ile her aşama bildirilir.
+- smoke_test(profile_id) → (ok, info_string)
+- NotebookLMClientError — wrapper error class
+
+Kullanım (app.py worker thread):
+    result = submit_job(
+        profile_id="1ee0e5c16713",
+        title="Bush Passion Fruit",
+        source_paths=[Path("script.txt"), Path("img1.jpg"), ...],
+        custom_prompt="Role: ... Sources: ...",
+        on_event=lambda name, **kw: log_fp.write(f"{name}: {kw}\\n"),
+    )
+    # result: {"notebook_id", "notebook_url", "task_id",
+    #          "local_mp4", "duration_sec"}
+"""
+
+from __future__ import annotations
+
+import asyncio
+import time
+from pathlib import Path
+from typing import Any, Callable, Optional
+
+try:
+    from notebooklm import NotebookLMClient
+    from notebooklm.exceptions import NotebookLMError as _UpstreamError
+    _AVAILABLE = True
+except ImportError as _imp_err:
+    NotebookLMClient = None  # type: ignore
+    _UpstreamError = Exception  # type: ignore
+    _AVAILABLE = False
+    _IMPORT_ERR = str(_imp_err)
+
+
+PROFILES_DIR_DEFAULT = Path(__file__).parent / "chrome_profiles"
+
+
+class NotebookLMClientError(Exception):
+    """notebooklm-py kütüphanesi hata wrapper'ı."""
+
+    def __init__(self, message: str, stage: str = "", cause: Optional[Exception] = None):
+        super().__init__(message)
+        self.stage = stage  # 'auth' | 'notebook_create' | 'source_add' | 'video_gen' | 'video_wait' | 'video_download'
+        self.cause = cause
+
+    def __str__(self) -> str:
+        base = super().__str__()
+        if self.stage:
+            base = f"[{self.stage}] {base}"
+        return base
+
+
+def auth_path_for(profile_id: str,
+                  profiles_dir: Optional[Path] = None) -> Path:
+    """chrome_profiles/<id>/auth.json path'ini döner. Kontrol etmez."""
+    base = profiles_dir or PROFILES_DIR_DEFAULT
+    return base / profile_id / "auth.json"
+
+
+def is_available() -> tuple[bool, str]:
+    """notebooklm-py kütüphanesi yüklü mü?"""
+    if _AVAILABLE:
+        try:
+            import notebooklm
+            return True, f"notebooklm-py v{getattr(notebooklm, '__version__', '?')}"
+        except Exception:
+            return True, "notebooklm-py installed"
+    return False, f"notebooklm-py import hatası: {_IMPORT_ERR}"
+
+
+# ---------------------------------------------------------------------------
+# Core async pipeline
+# ---------------------------------------------------------------------------
+async def _submit_job_async(
+    auth_path: Path,
+    title: str,
+    source_paths: list[Path],
+    custom_prompt: str,
+    on_event: Callable[..., None],
+    *,
+    language: str = "tr",
+    video_timeout_sec: float = 3600.0,  # 1h — Cinematic Veo 3 30-40dk
+    source_wait_timeout: float = 180.0,
+) -> dict[str, Any]:
+    """Full pipeline: create notebook + upload sources + generate cinematic
+    + wait + download. on_event callback her aşamada çağrılır."""
+    if not _AVAILABLE:
+        raise NotebookLMClientError(
+            "notebooklm-py kütüphanesi yok. pip install notebooklm-py",
+            stage="import",
+        )
+    if not auth_path.exists():
+        raise NotebookLMClientError(
+            f"auth.json yok: {auth_path}", stage="auth",
+        )
+
+    t_start = time.time()
+    on_event("client_starting", auth=str(auth_path))
+
+    # keepalive=300 → cookie SIDTS rotation otomatik (long-running 30dk+)
+    try:
+        client_ctx = await NotebookLMClient.from_storage(
+            path=str(auth_path), keepalive=300, keepalive_min_interval=60,
+        )
+    except Exception as e:
+        raise NotebookLMClientError(
+            f"client creation: {type(e).__name__}: {e}",
+            stage="auth", cause=e,
+        )
+
+    async with client_ctx as c:
+        on_event("client_connected")
+
+        # 1. Notebook create
+        try:
+            notebook = await c.notebooks.create(title or "Untitled")
+        except Exception as e:
+            raise NotebookLMClientError(
+                f"notebook create: {type(e).__name__}: {e}",
+                stage="notebook_create", cause=e,
+            )
+        nb_id = notebook.id
+        nb_url = f"https://notebooklm.google.com/notebook/{nb_id}"
+        on_event("notebook_created", id=nb_id, url=nb_url, title=title)
+
+        # 2. Sources upload (serial — concurrency limiti Google tarafında düşük)
+        source_ids: list[str] = []
+        for i, sp in enumerate(source_paths):
+            if not sp.exists():
+                on_event("source_skipped_missing", path=str(sp))
+                continue
+            on_event("source_uploading", idx=i + 1, total=len(source_paths),
+                     name=sp.name, size=sp.stat().st_size)
+            try:
+                s = await c.sources.add_file(nb_id, str(sp), wait=False)
+            except Exception as e:
+                on_event("source_failed", name=sp.name, error=str(e)[:200])
+                continue  # partial OK
+            source_ids.append(s.id)
+            on_event("source_added", id=s.id, name=sp.name)
+
+        if not source_ids:
+            raise NotebookLMClientError(
+                "Hiç source yüklenemedi — generation anlamsız.",
+                stage="source_add",
+            )
+
+        # 3. Sources'ın processing'i bitmesini bekle
+        on_event("sources_waiting", count=len(source_ids))
+        try:
+            await c.sources.wait_for_sources(nb_id, timeout=source_wait_timeout)
+        except Exception as e:
+            # Timeout veya bazıları işlenemedi → yine de devam et
+            on_event("sources_wait_partial", error=str(e)[:200])
+        on_event("sources_ready", count=len(source_ids))
+
+        # 4. Cinematic video generate
+        on_event("video_gen_starting", language=language,
+                 prompt_chars=len(custom_prompt or ""))
+        try:
+            gen = await c.artifacts.generate_cinematic_video(
+                nb_id,
+                source_ids=None,  # Tüm sources'ı kullan
+                language=language,
+                instructions=(custom_prompt or None),
+            )
+        except Exception as e:
+            # Bazı hesaplarda 'Cinematic' Ultra subscription gerektirir → fallback
+            err_msg = str(e).lower()
+            if "ultra" in err_msg or "subscription" in err_msg or "403" in err_msg:
+                on_event("cinematic_unavailable_fallback_to_standard")
+                try:
+                    from notebooklm import VideoFormat, VideoStyle
+                    gen = await c.artifacts.generate_video(
+                        nb_id,
+                        video_format=VideoFormat.EXPLAINER,
+                        video_style=VideoStyle.AUTO_SELECT,
+                        language=language,
+                        instructions=(custom_prompt or None),
+                    )
+                except Exception as e2:
+                    raise NotebookLMClientError(
+                        f"video gen (standard fallback): {type(e2).__name__}: {e2}",
+                        stage="video_gen", cause=e2,
+                    )
+            else:
+                raise NotebookLMClientError(
+                    f"video gen: {type(e).__name__}: {e}",
+                    stage="video_gen", cause=e,
+                )
+        task_id = gen.task_id
+        on_event("video_gen_started", task_id=task_id)
+
+        # 5. Wait for completion (Cinematic: 30-40dk)
+        on_event("video_waiting", timeout_sec=video_timeout_sec)
+        try:
+            final = await c.artifacts.wait_for_completion(
+                nb_id, task_id,
+                initial_interval=15.0,
+                max_interval=60.0,
+                timeout=video_timeout_sec,
+            )
+        except Exception as e:
+            raise NotebookLMClientError(
+                f"video wait: {type(e).__name__}: {e}",
+                stage="video_wait", cause=e,
+            )
+        if not getattr(final, "is_complete", False):
+            err = getattr(final, "error", "?")
+            raise NotebookLMClientError(
+                f"video gen failed: {err}", stage="video_wait",
+            )
+        on_event("video_ready", task_id=task_id,
+                 elapsed_sec=int(time.time() - t_start))
+
+        # 6. Download MP4
+        download_dir = Path(__file__).parent / "data" / "downloads"
+        download_dir.mkdir(parents=True, exist_ok=True)
+        out_path = download_dir / f"{nb_id}.mp4"
+        on_event("video_downloading", path=str(out_path))
+        try:
+            saved = await c.artifacts.download_video(
+                nb_id, str(out_path), artifact_id=task_id,
+            )
+        except Exception as e:
+            raise NotebookLMClientError(
+                f"video download: {type(e).__name__}: {e}",
+                stage="video_download", cause=e,
+            )
+        # saved bazen path string, bazen None döner — out_path'i kontrol et
+        if not out_path.exists() or out_path.stat().st_size < 10_000:
+            raise NotebookLMClientError(
+                f"video download: dosya oluşmadı veya boş ({out_path})",
+                stage="video_download",
+            )
+        on_event("video_downloaded", path=str(out_path),
+                 size_mb=out_path.stat().st_size // (1024 * 1024))
+
+        return {
+            "notebook_id": nb_id,
+            "notebook_url": nb_url,
+            "task_id": task_id,
+            "source_ids": source_ids,
+            "local_mp4": str(out_path),
+            "duration_sec": int(time.time() - t_start),
+        }
+
+
+# ---------------------------------------------------------------------------
+# Sync facade (Streamlit Worker thread için)
+# ---------------------------------------------------------------------------
+def submit_job(
+    profile_id: str,
+    title: str,
+    source_paths: list[Path],
+    custom_prompt: str,
+    on_event: Callable[..., None],
+    *,
+    profiles_dir: Optional[Path] = None,
+    language: str = "tr",
+    video_timeout_sec: float = 3600.0,
+) -> dict[str, Any]:
+    """Sync wrapper — Worker thread'inde çağrılır. asyncio.run ile coroutine
+    çalıştırır, tek bir event loop instance kullanılır."""
+    auth_path = auth_path_for(profile_id, profiles_dir)
+    return asyncio.run(_submit_job_async(
+        auth_path=auth_path,
+        title=title,
+        source_paths=source_paths,
+        custom_prompt=custom_prompt,
+        on_event=on_event,
+        language=language,
+        video_timeout_sec=video_timeout_sec,
+    ))
+
+
+# ---------------------------------------------------------------------------
+# Smoke test (admin diagnostic)
+# ---------------------------------------------------------------------------
+async def _smoke_async(auth_path: Path) -> tuple[bool, str]:
+    """Quick connectivity + auth check: notebook list çağırır."""
+    if not _AVAILABLE:
+        return False, f"notebooklm-py yüklü değil: {_IMPORT_ERR}"
+    if not auth_path.exists():
+        return False, f"auth.json yok: {auth_path}"
+    try:
+        async with await NotebookLMClient.from_storage(path=str(auth_path)) as c:
+            notebooks = await c.notebooks.list()
+            nb_list = list(notebooks) if hasattr(notebooks, "__iter__") else notebooks
+            return True, f"OK: {len(nb_list)} notebook görüldü."
+    except Exception as e:
+        return False, f"smoke FAIL: {type(e).__name__}: {str(e)[:200]}"
+
+
+def smoke_test(profile_id: str,
+               profiles_dir: Optional[Path] = None) -> tuple[bool, str]:
+    """Senkron smoke test (admin sidebar widget'ı için)."""
+    auth_path = auth_path_for(profile_id, profiles_dir)
+    try:
+        return asyncio.run(_smoke_async(auth_path))
+    except Exception as e:
+        return False, f"smoke loop error: {type(e).__name__}: {e}"
+
+
+__all__ = [
+    "NotebookLMClientError",
+    "auth_path_for",
+    "is_available",
+    "submit_job",
+    "smoke_test",
+]

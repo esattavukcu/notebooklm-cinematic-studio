@@ -141,6 +141,13 @@ DISPATCH_INTERVAL_SEC = 2.0
 # rollover ile uyumsuz. 8h block + self-correct retry: max 8h overshoot,
 # gerçek reset zamanını otomatik bulur.
 QUOTA_BLOCK_HOURS = float(os.environ.get("QUOTA_BLOCK_HOURS", "8"))
+
+# Stale "generating" job auto-resume parametreleri (notebooklm-py path için).
+# Server restart → thread öldü → MP4 indirilemedi senaryosu için sweeper.
+STALE_RESUME_CHECK_INTERVAL_SEC = 5 * 60   # Sweeper her 5dk'da bir tarar
+STALE_RESUME_MIN_AGE_SEC = 90 * 60         # 90dk+ "generating" → stuck kabul
+STALE_RESUME_MAX_ATTEMPTS = 3              # Job başına max attempt
+STALE_RESUME_BACKOFF_SEC = [10*60, 30*60, 60*60]  # 10dk → 30dk → 60dk
 JOB_LOG_TAIL_LINES = 400
 
 # Harvest module config — env var ile override edilebilir.
@@ -1601,6 +1608,9 @@ class Worker:
         self._thread = threading.Thread(target=self._loop, name="nbworker", daemon=True)
         self._procs: dict[str, subprocess.Popen] = {}  # job_id -> Popen
         self._proc_lock = threading.Lock()
+        # Stale-resume sweeper: aktif resume thread'lerini takip et ki aynı
+        # job için birden fazla resume thread spawn etmeyelim.
+        self._resume_threads: dict[str, threading.Thread] = {}
 
     def start(self) -> None:
         if not self._thread.is_alive():
@@ -1645,6 +1655,7 @@ class Worker:
 
     def _loop(self) -> None:
         last_harvest_check = 0.0
+        last_stale_check = 0.0
         while not self._stop_evt.is_set():
             try:
                 self._auto_init_check()
@@ -1654,9 +1665,111 @@ class Worker:
                 if time.time() - last_harvest_check >= HARVEST_CHECK_INTERVAL_SEC:
                     self._harvest_round()
                     last_harvest_check = time.time()
+                # Stale-resume sweeper: notebooklm-py path'inde stuck olan
+                # 'generating' job'ları otomatik resume et (5dk'da bir tara)
+                if time.time() - last_stale_check >= STALE_RESUME_CHECK_INTERVAL_SEC:
+                    self._stale_resume_round()
+                    last_stale_check = time.time()
             except Exception as e:
                 launcher_log(f"dispatch error: {e!r}")
             self._stop_evt.wait(DISPATCH_INTERVAL_SEC)
+
+    def _stale_resume_round(self) -> None:
+        """notebooklm-py path'inde stuck kalan 'generating' job'ları tarar
+        ve resume_via_notebooklm'i ayrı thread'de tetikler.
+
+        Filtreler:
+          - status='generating' (henüz fail/done değil)
+          - harvest_status='skip' (notebooklm-py işareti)
+          - notebook_url var (gen başlamış)
+          - video_local_path yok (henüz indirilmemiş)
+          - age >= STALE_RESUME_MIN_AGE_SEC (Cinematic gen normalde 30-40dk
+            sürer, 90dk geçtiyse büyük ihtimalle thread öldü)
+          - harvest_attempts < MAX (sonsuz retry'ı önle)
+          - next_harvest_at < now (backoff'a saygı)
+
+        Round başına max 1 job spawn — paralel kurtarma yapmıyoruz.
+        """
+        # Ölü resume thread'lerini sözlükten temizle (bilgi amaçlı)
+        for jid in list(self._resume_threads.keys()):
+            t = self._resume_threads.get(jid)
+            if t and not t.is_alive():
+                self._resume_threads.pop(jid, None)
+
+        jobs = load_jobs()
+        now = time.time()
+        candidates: list[Job] = []
+        for j in jobs:
+            if j.status != "generating":
+                continue
+            if j.harvest_status != "skip":
+                continue
+            if not j.notebook_url:
+                continue
+            if j.video_local_path:
+                continue
+            # Aynı job için zaten resume thread çalışıyorsa pas geç
+            existing = self._resume_threads.get(j.id)
+            if existing and existing.is_alive():
+                continue
+            age = now - (j.started_at or j.created_at)
+            if age < STALE_RESUME_MIN_AGE_SEC:
+                continue
+            if j.harvest_attempts >= STALE_RESUME_MAX_ATTEMPTS:
+                continue
+            if j.next_harvest_at and j.next_harvest_at > now:
+                continue
+            candidates.append(j)
+
+        if not candidates:
+            return
+
+        target = candidates[0]
+        # Attempt sayacını + backoff'u şimdi güncelle (retry hammer'ı önle)
+        attempt_idx = target.harvest_attempts
+        backoff_idx = min(attempt_idx, len(STALE_RESUME_BACKOFF_SEC) - 1)
+        backoff = STALE_RESUME_BACKOFF_SEC[backoff_idx]
+        jobs = load_jobs()
+        for j in jobs:
+            if j.id == target.id:
+                j.harvest_attempts += 1
+                j.next_harvest_at = now + backoff
+                break
+        save_jobs(jobs)
+
+        launcher_log(
+            f"Stale-resume sweeper: spawning thread for job {target.id} "
+            f"(attempt {attempt_idx + 1}/{STALE_RESUME_MAX_ATTEMPTS}, "
+            f"age={int((now - target.started_at) / 60)}min, "
+            f"next backoff after fail: {backoff // 60}min)"
+        )
+        t = threading.Thread(
+            target=self._run_stale_resume,
+            args=(target.id, attempt_idx + 1),
+            name=f"stale-{target.id}",
+            daemon=True,
+        )
+        self._resume_threads[target.id] = t
+        t.start()
+
+    def _run_stale_resume(self, job_id: str, attempt: int) -> None:
+        """resume_via_notebooklm thread wrapper. Log + state cleanup."""
+        try:
+            ok, msg = self.resume_via_notebooklm(job_id)
+            if ok:
+                launcher_log(
+                    f"Stale-resume OK (attempt {attempt}) {job_id}: {msg[:120]}"
+                )
+            else:
+                launcher_log(
+                    f"Stale-resume FAIL (attempt {attempt}/{STALE_RESUME_MAX_ATTEMPTS}) "
+                    f"{job_id}: {msg[:160]}"
+                )
+        except Exception as e:
+            launcher_log(
+                f"Stale-resume CRASH (attempt {attempt}) {job_id}: "
+                f"{type(e).__name__}: {e}"
+            )
 
     def _auto_init_check(self) -> None:
         """auth.json yazılmış profilleri otomatik 'initialized=True' yap.

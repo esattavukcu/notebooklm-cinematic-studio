@@ -2823,6 +2823,81 @@ class Worker:
                     return True
         return False
 
+    def resume_via_notebooklm(self, job_id: str) -> tuple[bool, str]:
+        """notebooklm-py path'inde stuck kalan 'generating' job için manuel kurtarma.
+
+        Senaryo: server restart sırasında pipeline thread öldü, video gen
+        NotebookLM tarafında devam etti veya bitti, ama MP4 indirilemedi.
+        Bu method var olan notebook'a yeniden bağlanır, video artifact'ı bulur,
+        indirir + Azure'a yükler + job state günceller.
+
+        Returns (ok, message). Streamlit thread'inde blocking — bekleme süresi
+        Cinematic gen tamamlanmadıysa 30+ dakika olabilir.
+        """
+        try:
+            from notebooklm_client import (
+                resume_download, notebook_id_from_url, NotebookLMClientError,
+            )
+        except ImportError as e:
+            return False, f"notebooklm-py import: {e}"
+
+        jobs = load_jobs()
+        target = next((j for j in jobs if j.id == job_id), None)
+        if target is None:
+            return False, "Job bulunamadı."
+        if not target.notebook_url:
+            return False, "notebook_url yok — gen henüz başlamamış. Önce dispatcher'ı bekle."
+        if not target.profile_id:
+            return False, "profile_id yok."
+        nb_id = notebook_id_from_url(target.notebook_url)
+        if not nb_id:
+            return False, f"notebook_url parse edilemedi: {target.notebook_url[:60]}"
+
+        out_path = Path(DOWNLOADS_DIR) / f"{nb_id}.mp4"
+        try:
+            result = resume_download(
+                profile_id=target.profile_id,
+                notebook_id=nb_id,
+                out_path=out_path,
+                wait_if_processing=True,
+                wait_timeout_sec=1800.0,  # 30dk — gen devam ediyor olabilir
+            )
+        except NotebookLMClientError as e:
+            return False, f"resume FAIL: {e}"
+        except Exception as e:
+            return False, f"unexpected: {type(e).__name__}: {e}"
+
+        # Job state güncelle
+        jobs = load_jobs()
+        for j in jobs:
+            if j.id == job_id:
+                j.status = "done"
+                j.harvest_status = "downloaded"
+                try:
+                    j.video_local_path = str(out_path.resolve().relative_to(APP_DIR))
+                except (ValueError, OSError):
+                    j.video_local_path = str(out_path)
+                j.finished_at = time.time()
+                break
+        save_jobs(jobs)
+
+        # Azure upload (best-effort)
+        if AZURE_ENABLED and out_path.exists():
+            try:
+                ok, url, err = upload_to_azure(out_path, job_id)
+                if ok:
+                    jobs = load_jobs()
+                    for j in jobs:
+                        if j.id == job_id:
+                            j.video_remote_url = url
+                            j.harvest_status = "uploaded"
+                            break
+                    save_jobs(jobs)
+            except Exception:
+                pass
+
+        return True, f"MP4 ({result.get('size_mb', '?')}MB) indi + state=done."
+
 
 def load_profiles_with_updates(updated: list[Profile]) -> list[Profile]:
     """Diskteki profil listesini güncellenmiş profilelarla merge et — last_used."""
@@ -6153,14 +6228,33 @@ with tab_status:
                 elif j.notebook_url and j.status in TERMINAL_STATUSES:
                     if st.button("🌐 Aç", key=f"open_{j.id}", help="Notebook'u tarayıcıda aç", use_container_width=True):
                         open_in_browser(j.notebook_url)
-                # Harvest now (admin için, automator bitti ama henüz video yoksa)
+                # Manuel topla: notebooklm-py path'i (harvest=skip) → resume_download
+                # legacy path → eski harvest cycle tetikleme
                 if (j.status in ("generating", "done", "submitted")
+                    and not j.video_local_path
                     and not j.video_url
-                    and j.harvest_status not in ("checking",)):
-                    if st.button("🔍 Şimdi tara", key=f"harvest_{j.id}",
-                                 help="Video harvest cycle'ını hemen tetikle", use_container_width=True):
-                        worker.trigger_harvest_now(j.id)
-                        st.toast("Harvest cycle tetiklendi.", icon="🔍")
+                    and j.harvest_status not in ("checking", "uploaded", "downloaded")):
+                    is_nbpy = j.harvest_status == "skip"
+                    btn_label = "🛟 Manuel topla" if is_nbpy else "🔍 Şimdi tara"
+                    btn_help = (
+                        "notebooklm-py path: notebook'a yeniden bağlanır, "
+                        "video artifact bulunur, MP4 indirilir + Azure upload. "
+                        "Cinematic gen hâlâ devam ediyorsa 30dk bekler."
+                        if is_nbpy else
+                        "Legacy Playwright harvest cycle'ını hemen tetikle"
+                    )
+                    if st.button(btn_label, key=f"harvest_{j.id}",
+                                 help=btn_help, use_container_width=True):
+                        if is_nbpy:
+                            with st.spinner("Notebook'a bağlanılıyor, MP4 indiriliyor (30dk'ya kadar)..."):
+                                ok, msg = worker.resume_via_notebooklm(j.id)
+                            if ok:
+                                st.toast(f"✅ {msg}", icon="✅")
+                            else:
+                                st.error(f"❌ {msg}")
+                        else:
+                            worker.trigger_harvest_now(j.id)
+                            st.toast("Harvest cycle tetiklendi.", icon="🔍")
                         st.rerun()
                 if j.status == "running":
                     if st.button("🛑 Durdur", key=f"stop_{j.id}", help="Bu job'ı durdur", use_container_width=True):

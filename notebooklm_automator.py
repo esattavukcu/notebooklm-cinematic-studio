@@ -52,8 +52,13 @@ except ImportError:
 # ---------------------------------------------------------------------------
 # TMPDIR fix — Finder'dan başlatılan macOS context'inde Playwright'ın mkdtemp
 # çağrısı /var/folders/... altında ENOENT veriyor. Stabil bir tmp altına yönlendir.
+# Linux'ta /tmp zaten stabil; ayrıca TMPDIR'i profile_dir/.tmp'a çekersek
+# Chrome'un crashpad/IPC soketleri başarısız olup process spawn'da ölüyor.
+# Bu yüzden override yalnızca macOS'ta (darwin) yapılır.
 # ---------------------------------------------------------------------------
 def _ensure_stable_tmpdir(profile_dir: Optional[Path]) -> None:
+    if sys.platform != "darwin":
+        return
     cur = os.environ.get("TMPDIR", "")
     if cur and not cur.startswith("/var/folders/") and Path(cur).exists():
         return

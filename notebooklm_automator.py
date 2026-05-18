@@ -471,25 +471,22 @@ def run_init(profile_dir: Path, authuser: int, emitter: EventEmitter) -> int:
 
     emitter.emit("init_starting", profile_dir=str(profile_dir), port=port)
 
-    # Chrome'u shell wrapper + & ile başlat. Önemli detaylar:
-    # - shell=True olmadan Chrome SIGTRAP atıyor (PG/TTY setup farkı)
-    # - & olmadan shell foreground'da chrome'u bekleyince yine SIGTRAP
-    # - ANY stdout redirect (Popen file veya bash >) Chrome startup'ı kilitliyor
-    # En sade yol: hiçbir redirect yok, parent'ın stdout/stderr'i inherit.
-    # Standalone'da TTY'ye, systemd context'te journald'a gider.
-    chrome_log_path = profile_dir / "chrome_init.log"  # placeholder, kullanılmıyor
-    import shlex
-    chrome_cmd = " ".join(shlex.quote(a) for a in chrome_args) + " &"
+    # Chrome'u direkt subprocess.Popen ile başlat.
+    # start_new_session=True → Chrome ayrı session/process group'ta başlar,
+    # Python parent'ından bağımsız, sinyaller izole. Eskiden shell=True + "&"
+    # kullanılıyordu ama sh wrapper'ı içinde Chrome backgrounding kararlı
+    # değildi (ps tree: python─sh, Chrome hiç doğmuyor, port'a bind etmiyor).
+    # stdout/stderr inherit (parent TTY veya journald'a gider).
     try:
         chrome_proc = subprocess.Popen(
-            chrome_cmd,
-            shell=True,
+            chrome_args,
+            start_new_session=True,
         )
     except Exception as e:
         emitter.emit("init_error", error=f"Chrome spawn fail: {e}")
         return 1
 
-    # & ile shell hemen çıkar; chrome arkada koşar. shell pid'i chrome'un değil.
+    # chrome_proc.pid = gerçek Chrome PID'i (artık shell pid'i değil).
     emitter.emit("init_chrome_pid", pid=chrome_proc.pid)
 
     # Chrome'un port'ta listenlemesini bekle (max 30 sn)

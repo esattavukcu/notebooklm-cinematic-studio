@@ -473,6 +473,16 @@ def run_init(profile_dir: Path, authuser: int, emitter: EventEmitter) -> int:
     if os.environ.get("DISPLAY", "").startswith(":"):
         chrome_args.insert(1, "--ozone-platform=x11")
         chrome_args.insert(2, "--disable-gpu")
+    # CHROME_PROXY_SERVER → Chromium'u proxy üzerinden başlatır.
+    # Kullanım: yeni bir hesabı sunucu IP'sine bağlı olarak login etmek için
+    # SSH SOCKS tunnel ile birlikte ("ssh -D 1080 ..." sonra
+    # CHROME_PROXY_SERVER=socks5://127.0.0.1:1080 python3 notebooklm_automator.py ...).
+    # Cookie'ler EC2 IP'sinden alınır, sunucudaki notebooklm_client onları
+    # IP eşleşmesi sebebiyle sorunsuz kullanır.
+    proxy = os.environ.get("CHROME_PROXY_SERVER", "").strip()
+    if proxy:
+        chrome_args.insert(-1, f"--proxy-server={proxy}")
+        emitter.emit("init_proxy_set", proxy=proxy)
 
     emitter.emit("init_starting", profile_dir=str(profile_dir), port=port)
 

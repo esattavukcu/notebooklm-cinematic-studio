@@ -5672,6 +5672,11 @@ with st.sidebar:
                             )
                 else:
                     if st.button("🔄 Yeniden giriş", key=f"relogin_{p.id}", use_container_width=True):
+                        # Eski/expire cookie'leri temizle — redirect döngüsünü önler
+                        _pdir = PROFILES_DIR / p.id
+                        if _pdir.exists():
+                            shutil.rmtree(_pdir)
+                        _pdir.mkdir(parents=True, exist_ok=True)
                         launch_profile_init(p)
                         st.session_state[f"init_started_{p.id}"] = time.time()
                         st.toast("Chromium açıldı.", icon="🔓")
@@ -6591,8 +6596,14 @@ with tab_users:
 # Auto-refresh: SADECE running job varsa rerun. queued tek başına refresh'i
 # tetiklemez (worker zaten 2 sn'de bir dispatch ediyor; running'e geçince refresh).
 # Bu sayede Hazırla sekmesinde içerik girerken sayfa boşuna yenilenmez.
+# Init aktifken (VNC üzerinden login bekleniyor) refresh yapma — aksi hâlde
+# admin form doldurmaya çalışırken sayfa sürekli sıfırlanır.
 # ---------------------------------------------------------------------------
+_any_init_active = any(
+    st.session_state.get(f"init_started_{_p.id}", 0) > time.time() - 600
+    for _p in load_profiles()
+)
 jobs_now = load_jobs()
-if any(j.status == "running" for j in jobs_now):
+if not _any_init_active and any(j.status == "running" for j in jobs_now):
     time.sleep(4)
     st.rerun()

@@ -212,8 +212,12 @@ def download_drive_folder(folder_id_or_url: str,
                           quiet: bool = True) -> list[Path]:
     """Public Drive klasöründeki tüm dosyaları out_dir'a indir, path listesi döner.
 
-    gdown.download_folder içeriği parse eder ve teker teker indirir. Sadece
-    direkt linkli dosyalar inilir; nested folder'lar yok sayılır.
+    Birincil yol: gdown.download_folder(). Bu yöntem native Google Docs/Sheets/Slides
+    içeren klasörlerde FileURLRetrievalError fırlatıp tüm indirmeyi iptal eder.
+
+    Fallback: skip_download=True ile dosya listesi alınır, her dosya tek tek indirilir.
+    Native Google Docs (uzantısız isimler) için export URL denenir; yine de başarısız
+    olursa o dosya sessizce atlanır — geri kalan .txt/.docx dosyaları indirilir.
     """
     if not _GDOWN_AVAILABLE:
         raise RuntimeError(f"gdown yüklü değil: {_GDOWN_IMP_ERR}")
@@ -225,9 +229,10 @@ def download_drive_folder(folder_id_or_url: str,
         )
     out_dir.mkdir(parents=True, exist_ok=True)
     url = f"https://drive.google.com/drive/folders/{folder_id}"
-    # gdown 6.x: download_folder(url, output, quiet, use_cookies, ...) — no
-    # remaining_ok kwarg, eski 4.x'te 50-file limit'i için gerekiyordu, 6.x'te
-    # default davranış değişti. use_cookies=False = public klasör için yeterli.
+
+    # --- Birincil yol: gdown.download_folder ---
+    # Klasörde native Google Docs yoksa bu hızlı yol yeterli.
+    first_exc: Optional[Exception] = None
     try:
         downloaded = gdown.download_folder(
             url=url,
@@ -235,19 +240,204 @@ def download_drive_folder(folder_id_or_url: str,
             quiet=quiet,
             use_cookies=False,
         )
+        if downloaded:
+            try:
+                paths = [Path(p) for p in downloaded if p and Path(p).exists()]
+                if paths:
+                    return paths
+            except Exception:
+                pass
+        # gdown hiç dosya döndürmedi → out_dir'daki dosyaları topla
+        all_files = sorted([p for p in out_dir.rglob("*") if p.is_file()])
+        if all_files:
+            return all_files
     except Exception as e:
-        raise RuntimeError(
-            f"Drive klasör indirme hatası: {type(e).__name__}: {e}. "
-            f"Klasör 'Anyone with the link' mi? ID/URL doğru mu?"
+        first_exc = e
+        if not quiet:
+            import sys as _sys
+            print(
+                f"[bulk_import] gdown.download_folder başarısız "
+                f"({type(e).__name__}), dosya-bazlı fallback deneniyor…",
+                file=_sys.stderr,
+            )
+
+    # --- Fallback: her dosyayı ayrı ayrı indir ---
+    return _download_drive_folder_per_file(
+        folder_id=folder_id,
+        out_dir=out_dir,
+        quiet=quiet,
+        first_exc=first_exc,
+    )
+
+
+def _download_drive_folder_per_file(
+    folder_id: str,
+    out_dir: Path,
+    quiet: bool = True,
+    first_exc: Optional[Exception] = None,
+) -> list[Path]:
+    """gdown fallback: dosya listesini al, her dosyayı tek tek indir.
+
+    gdown 6.x'in ``download_folder(skip_download=True)`` özelliği kullanılarak
+    dosya listesi alınır. Her dosya ayrı ``gdown.download()`` çağrısıyla indirilir.
+    Native Google Docs (klasör listesinde uzantısız isimler) için Google'ın
+    export API'si denenir; yine başarısız olursa dosya atlanır.
+    """
+    import sys as _sys
+
+    url = f"https://drive.google.com/drive/folders/{folder_id}"
+
+    # skip_download=True: indirmeden sadece dosya listesini döndür
+    try:
+        file_list = gdown.download_folder(
+            url=url,
+            output=str(out_dir),
+            quiet=quiet,
+            use_cookies=False,
+            skip_download=True,
         )
-    if downloaded:
-        # gdown bazı versiyonlarda string list, bazılarında None döner
+    except Exception as e:
+        orig = (
+            f" (orijinal: {type(first_exc).__name__}: {first_exc})"
+            if first_exc else ""
+        )
+        raise RuntimeError(
+            f"Drive klasör listeleme hatası: {type(e).__name__}: {e}{orig}. "
+            "Klasör 'Anyone with the link' mi? ID/URL doğru mu?"
+        )
+
+    if not file_list:
+        orig = f"Orijinal hata: {type(first_exc).__name__}: {first_exc}. " if first_exc else ""
+        raise RuntimeError(
+            f"{orig}Drive klasöründe indirilebilir dosya bulunamadı. "
+            "Klasör 'Anyone with the link' erişimine açık mı?"
+        )
+
+    downloaded_paths: list[Path] = []
+    skipped: list[str] = []
+
+    # file_list: list[GoogleDriveFileToDownload(id, path, local_path)]
+    for f in file_list:
+        file_id: str = f.id
+        local_path = Path(f.local_path)
+        file_name: str = local_path.name
+
+        # Zaten indirildiyse (birincil yol kısmen başarmış olabilir)
+        if local_path.exists() and local_path.stat().st_size > 0:
+            downloaded_paths.append(local_path)
+            continue
+
+        local_path.parent.mkdir(parents=True, exist_ok=True)
+
+        # Native Google Docs/Sheets/Slides: klasör listesinde uzantısız isimle gelir.
+        # gdown'ın kendi kaynak kodunda da bu not var: "Google-native files have no
+        # extension in the folder listing."
+        has_extension = bool(Path(file_name).suffix)
+        if not has_extension:
+            exported = _try_export_google_doc(file_id, local_path, quiet=quiet)
+            if exported:
+                downloaded_paths.append(exported)
+            else:
+                skipped.append(file_name or file_id)
+                if not quiet:
+                    print(
+                        f"[bulk_import] Atlandı (native Google Doc, export başarısız): "
+                        f"{file_name}",
+                        file=_sys.stderr,
+                    )
+            continue
+
+        # Normal dosya: doğrudan gdown.download ile indir
         try:
-            return [Path(p) for p in downloaded if Path(p).exists()]
+            result = gdown.download(
+                url=f"https://drive.google.com/uc?id={file_id}",
+                output=str(local_path),
+                quiet=quiet,
+                use_cookies=False,
+            )
+            result_path = Path(result) if result else local_path
+            if result_path.exists() and result_path.stat().st_size > 0:
+                downloaded_paths.append(result_path)
+            elif local_path.exists() and local_path.stat().st_size > 0:
+                downloaded_paths.append(local_path)
+            else:
+                skipped.append(file_name)
+                if not quiet:
+                    print(
+                        f"[bulk_import] İndirme başarısız (boş sonuç): {file_name}",
+                        file=_sys.stderr,
+                    )
+        except Exception as e:
+            skipped.append(file_name)
+            if not quiet:
+                print(
+                    f"[bulk_import] İndirme başarısız, atlandı: {file_name} "
+                    f"→ {type(e).__name__}: {e}",
+                    file=_sys.stderr,
+                )
+
+    if not downloaded_paths:
+        orig = (
+            f"Orijinal hata: {type(first_exc).__name__}: {first_exc}. "
+            if first_exc else ""
+        )
+        skip_note = (
+            f" Atlanan {len(skipped)} dosya: {', '.join(skipped[:5])}."
+            if skipped else ""
+        )
+        raise RuntimeError(
+            f"{orig}Drive klasöründen hiç dosya indirilemedi.{skip_note} "
+            "Klasör 'Anyone with the link' erişimine açık mı?"
+        )
+
+    return downloaded_paths
+
+
+def _try_export_google_doc(
+    file_id: str,
+    dest_hint: Path,
+    quiet: bool = True,
+) -> Optional[Path]:
+    """Native Google Doc'u export URL'i ile .docx veya .txt olarak indir.
+
+    dest_hint: uzantısız hedef path. Başarılı exportta uygun uzantı eklenir.
+    requests kütüphanesi yoksa None döner (gdown zaten bağımlılık olarak içeriyor).
+    """
+    try:
+        import requests as _req
+    except ImportError:
+        return None
+
+    import sys as _sys
+
+    # Sırayla dene: önce Google Docs (document), sonra Sheets (spreadsheet)
+    export_attempts = [
+        ("document", "docx"),
+        ("document", "txt"),
+        ("spreadsheets", "csv"),
+    ]
+
+    for doc_type, fmt in export_attempts:
+        export_url = (
+            f"https://docs.google.com/{doc_type}/d/{file_id}/export?format={fmt}"
+        )
+        try:
+            resp = _req.get(export_url, timeout=30, allow_redirects=True)
+            if resp.status_code == 200 and len(resp.content) > 100:
+                export_dest = dest_hint.with_suffix(f".{fmt}")
+                export_dest.parent.mkdir(parents=True, exist_ok=True)
+                export_dest.write_bytes(resp.content)
+                if not quiet:
+                    print(
+                        f"[bulk_import] Native Google Doc export edildi "
+                        f"({doc_type}/{fmt}): {export_dest.name}",
+                        file=_sys.stderr,
+                    )
+                return export_dest
         except Exception:
-            pass
-    # Fallback: out_dir'daki tüm dosyaları topla
-    return sorted([p for p in out_dir.rglob("*") if p.is_file()])
+            continue
+
+    return None
 
 
 def list_drive_folder_docx(folder_id_or_url: str,

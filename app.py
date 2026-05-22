@@ -3521,14 +3521,25 @@ def _is_admin() -> bool:
     return bool(auth and auth.get("role") == "admin")
 
 
-# Environment routing — URL ?env=dev|prod (default prod). Dev/prod fiziksel
-# olarak aynı app ama dispatcher + storage + UI env'e göre bölünür.
+# Environment routing — URL ?env=dev|prod. Dev/prod fiziksel olarak aynı
+# app ama dispatcher + storage + UI env'e göre bölünür.
 ALLOWED_ENVS = ("dev", "prod")
+# Default env: URL param + session yoksa hangi env gösterilsin?
+# Şu an "dev" — mevcut 8 hesabın hepsi dev'de, prod boş. Prod hesapları
+# eklenince DEFAULT_ENV=prod yap ki canlı kullanıcılar default prod görsün.
+# .env'den DEFAULT_ENV=prod override edilebilir (deploy-time switch).
+DEFAULT_ENV = os.environ.get("DEFAULT_ENV", "dev").strip().lower()
+if DEFAULT_ENV not in ALLOWED_ENVS:
+    DEFAULT_ENV = "dev"
 
 
 def current_env() -> str:
     """URL ?env=... param'ı oku. Sonra session_state'e cache (refresh sonrası
-    da kalsın). Default 'prod' — backward compat ve safe-by-default."""
+    da kalsın). Default DEFAULT_ENV (env-config'den).
+
+    Prod canlıya geçince ya .env'e `DEFAULT_ENV=prod` ekle, ya da kodda
+    `DEFAULT_ENV = "dev"` satırını `"prod"` yap → default URL prod'a düşer.
+    """
     try:
         q = st.query_params.get("env", "")
     except Exception:
@@ -3536,11 +3547,11 @@ def current_env() -> str:
     if q in ALLOWED_ENVS:
         st.session_state["_env"] = q
         return q
-    # Param yok → session_state'den oku, o da yoksa prod
+    # Param yok → session_state'den oku, o da yoksa DEFAULT_ENV
     cached = st.session_state.get("_env", "")
     if cached in ALLOWED_ENVS:
         return cached
-    return "prod"
+    return DEFAULT_ENV
 
 
 def _user_name() -> str:

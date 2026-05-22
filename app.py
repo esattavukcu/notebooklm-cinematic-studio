@@ -119,6 +119,7 @@ DOWNLOADS_DIR = DATA_DIR / "downloads"
 PROFILES_DIR = APP_DIR / "chrome_profiles"
 
 JOBS_FILE = DATA_DIR / "jobs.json"
+BATCHES_FILE = DATA_DIR / "batches.json"
 PROFILES_FILE = DATA_DIR / "profiles.json"
 DRAFTS_FILE = DATA_DIR / "drafts.json"
 USERS_FILE = DATA_DIR / "users.json"
@@ -286,6 +287,7 @@ class Job:
     finished_at: float = 0.0
     created_at: float = field(default_factory=time.time)
     submitted_by: str = ""           # Kullanıcının kendi adı (user view session_state'inden)
+    batch_id: str = ""               # Toplu import batch'i (boş = tek job)
     # Audit trail — script iteration geçmişi (Phase A)
     original_script: str = ""        # Kullanıcının ilk yapıştırdığı versiyon (AI iterasyonundan önce)
     iterations: list = field(default_factory=list)  # [{script, feedback, model, ts}, ...]
@@ -312,6 +314,23 @@ class Job:
     harvest_attempts: int = 0
     next_harvest_at: float = 0.0
     harvest_error: str = ""
+
+
+@dataclass
+class Batch:
+    """Aynı anda kuyruğa eklenen job grubunu temsil eder (Drive toplu import vb.).
+    Slack oturum bildirimleri bu veri üzerinden üretilir."""
+    id: str
+    name: str                           # "Drive · 22.05 14:37"
+    source: str                         # Drive URL veya "manuel"
+    total: int                          # kuyruğa eklenen toplam job
+    submitted_by: str
+    created_at: float = field(default_factory=time.time)
+    # Bildirim durum takibi
+    last_notified_terminal: int = 0    # son bildirim anındaki terminal (done+failed) sayısı
+    queued_empty_notified: bool = False # "sırada bekleyen kalmadı" bildirimi gönderildi mi
+    notified_complete: bool = False     # oturum özeti gönderildi mi
+    completed_at: float = 0.0
 
 
 @dataclass
@@ -461,6 +480,36 @@ def load_jobs() -> list[Job]:
 
 def save_jobs(jobs: list[Job]) -> None:
     _atomic_write_json(JOBS_FILE, [asdict(j) for j in jobs])
+
+
+def load_batches() -> list[Batch]:
+    raw = _read_json(BATCHES_FILE, [])
+    out: list[Batch] = []
+    for b in raw:
+        try:
+            out.append(Batch(**{k: v for k, v in b.items() if k in Batch.__dataclass_fields__}))
+        except TypeError:
+            continue
+    return out
+
+
+def save_batches(batches: list[Batch]) -> None:
+    _atomic_write_json(BATCHES_FILE, [asdict(b) for b in batches])
+
+
+def _fmt_duration_batch(sec: float) -> str:
+    """Batch süresi için okunabilir format: '2 gün 14 saat' vb."""
+    sec = max(0, int(sec))
+    if sec < 3600:
+        m = sec // 60
+        return f"{m} dakika"
+    elif sec < 86400:
+        h, m = divmod(sec, 3600)
+        return f"{h} saat {m // 60} dakika"
+    else:
+        d, r = divmod(sec, 86400)
+        h = r // 3600
+        return f"{d} gün {h} saat"
 
 
 # ---------------------------------------------------------------------------
@@ -1688,6 +1737,7 @@ class Worker:
     def _loop(self) -> None:
         last_harvest_check = 0.0
         last_stale_check = 0.0
+        last_batch_check = 0.0
         while not self._stop_evt.is_set():
             try:
                 self._auto_init_check()
@@ -1702,9 +1752,111 @@ class Worker:
                 if time.time() - last_stale_check >= STALE_RESUME_CHECK_INTERVAL_SEC:
                     self._stale_resume_round()
                     last_stale_check = time.time()
+                # Batch / oturum bildirim monitörü — 30 sn'de bir
+                if time.time() - last_batch_check >= 30:
+                    self._batch_monitor_round()
+                    last_batch_check = time.time()
             except Exception as e:
                 launcher_log(f"dispatch error: {e!r}")
             self._stop_evt.wait(DISPATCH_INTERVAL_SEC)
+
+    def _batch_monitor_round(self) -> None:
+        """Batch (toplu import oturumu) yaşam döngüsünü izler, Slack bildirimleri gönderir.
+
+        Bildirim tetikleyicileri:
+          1. Her N tamamlamada ilerleme güncellemesi (threshold: total // 3, min 5)
+          2. Tüm kuyruk boşaldığında: "Son iş işleniyor"
+          3. Tüm işler bittiğinde: Oturum özeti
+        """
+        batches = load_batches()
+        if not batches:
+            return
+        jobs = load_jobs()
+        changed = False
+
+        for batch in batches:
+            if batch.notified_complete:
+                continue
+
+            batch_jobs = [j for j in jobs if j.batch_id == batch.id]
+            if not batch_jobs:
+                continue
+
+            in_progress = [j for j in batch_jobs
+                           if j.status in ("running", "generating", "submitted")]
+            queued_jobs  = [j for j in batch_jobs if j.status == "queued"]
+            done_jobs    = [j for j in batch_jobs if j.status == "done"]
+            # [KOTA] marker'ları hata sayısına katma
+            failed_jobs  = [j for j in batch_jobs
+                            if j.status == "failed" and not j.title.startswith("[KOTA]")]
+            terminal_jobs = done_jobs + failed_jobs
+
+            n_ip      = len(in_progress)
+            n_q       = len(queued_jobs)
+            n_done    = len(done_jobs)
+            n_fail    = len(failed_jobs)
+            n_term    = len(terminal_jobs)
+
+            # -- Tüm kuyruk boşaldı bildirimi (henüz gönderilmemişse) --
+            if n_q == 0 and n_ip > 0 and not batch.queued_empty_notified:
+                send_slack_message(
+                    f"🔄 *Tüm işler başladı — sırada bekleyen kalmadı*\n"
+                    f"📁 {batch.name}\n"
+                    f"⚙️ {n_ip} iş işleniyor · "
+                    f"✅ {n_done} tamamlandı · ❌ {n_fail} hatalı"
+                )
+                batch.queued_empty_notified = True
+                changed = True
+
+            # -- İlerleme bildirimi (her threshold tamamlamada) --
+            threshold = max(5, batch.total // 3)
+            if (n_term >= batch.last_notified_terminal + threshold
+                    and n_q > 0):   # hâlâ bekleyen var → dalga arası güncelleme
+                fail_lines = ""
+                if n_fail > 0:
+                    recent_fails = [j for j in failed_jobs][-3:]
+                    fail_lines = "\n" + "\n".join(
+                        f"  • {j.title[:60]} — {(j.error or '?')[:60]}"
+                        for j in recent_fails
+                    )
+                send_slack_message(
+                    f"📊 *İlerleme: {n_term}/{batch.total}*\n"
+                    f"📁 {batch.name}\n"
+                    f"✅ {n_done} başarılı · ❌ {n_fail} hatalı · "
+                    f"⏳ {n_q} sırada · ⚙️ {n_ip} işleniyor{fail_lines}"
+                )
+                batch.last_notified_terminal = n_term
+                changed = True
+
+            # -- Oturum tamamlandı bildirimi --
+            if n_ip == 0 and n_q == 0 and n_term >= batch.total:
+                batch.completed_at = time.time()
+                batch.notified_complete = True
+                dur_str = _fmt_duration_batch(batch.completed_at - batch.created_at)
+
+                fail_section = ""
+                if n_fail > 0:
+                    fail_lines = "\n".join(
+                        f"  • {j.title[:70]} — {(j.error or '?')[:80]}"
+                        for j in failed_jobs[:10]
+                    )
+                    fail_section = f"\n\n*Hatalı projeler:*\n{fail_lines}"
+
+                source_line = (
+                    f"\n📎 Drive: {batch.source}"
+                    if batch.source.startswith("http") else ""
+                )
+
+                send_slack_message(
+                    f"🏁 *Oturum Tamamlandı*\n"
+                    f"📁 {batch.name} · {batch.total} proje\n"
+                    f"✅ Başarılı: {n_done}   ❌ Hatalı: {n_fail}\n"
+                    f"⏱ Süre: {dur_str}{source_line}{fail_section}"
+                )
+                changed = True
+
+        if changed:
+            save_batches(batches)
 
     def _stale_resume_round(self) -> None:
         """notebooklm-py path'inde stuck kalan 'generating' job'ları tarar
@@ -2684,9 +2836,17 @@ class Worker:
                 submitted_by="system",
             )
             jobs.append(quota_marker)
+            # Kota bildirimine batch bağlamı ekle
+            _qb_extra = ""
+            if target.batch_id:
+                _qb_jobs = [j for j in jobs if j.batch_id == target.batch_id]
+                _qb_q = sum(1 for j in _qb_jobs if j.status == "queued")
+                _qb_done = sum(1 for j in _qb_jobs if j.status == "done")
+                _qb_total = len([j for j in _qb_jobs if not j.title.startswith("[KOTA]")])
+                _qb_extra = f"\n📊 Oturum: {_qb_done}/{_qb_total} tamamlandı · {_qb_q} iş kota açılana kadar bekliyor"
             send_slack_message(
                 f"🚫 *Kota doldu:* `{target.profile_name}`\n"
-                f"Job kuyrukta bekliyor, başka profile aktarıldı: _{target.title[:100]}_"
+                f"Job kuyrukta bekliyor, başka profile aktarıldı: _{target.title[:100]}_{_qb_extra}"
             )
             # Asıl job'u queued'a geri al — Worker başka profile dene
             target.status = "queued"
@@ -4049,6 +4209,11 @@ def render_bulk_drive_section(*, key_prefix: str = "blk") -> None:
             if result:
                 existing = load_jobs()
                 created_jobs: list = []
+                # Batch oluştur — tüm job'lar aynı oturuma bağlı
+                _batch_id = uuid.uuid4().hex[:12]
+                _batch_name = (
+                    f"Drive · {datetime.now().strftime('%d.%m %H:%M')}"
+                )
                 for jd in result["created"]:
                     try:
                         j = Job(
@@ -4062,8 +4227,8 @@ def render_bulk_drive_section(*, key_prefix: str = "blk") -> None:
                             created_at=jd["created_at"],
                             custom_prompt=jd["custom_prompt"],
                             learning_objectives=jd.get("learning_objectives", ""),
-                            # Bulk submit aktif env'e gider (URL ?env=...)
                             environment=jd.get("environment", "prod"),
+                            batch_id=_batch_id,
                         )
                         j.assets = []
                         created_jobs.append(j)
@@ -4073,6 +4238,24 @@ def render_bulk_drive_section(*, key_prefix: str = "blk") -> None:
                         )
                 existing.extend(created_jobs)
                 save_jobs(existing)
+                # Batch kaydet
+                _batch = Batch(
+                    id=_batch_id,
+                    name=_batch_name,
+                    source=drive_url,
+                    total=len(created_jobs),
+                    submitted_by=submitter or "admin",
+                )
+                _existing_batches = load_batches()
+                _existing_batches.append(_batch)
+                save_batches(_existing_batches)
+                # Slack: toplu ekleme bildirimi
+                send_slack_message(
+                    f"📥 *{len(created_jobs)} proje kuyruğa eklendi*\n"
+                    f"📁 {_batch_name}\n"
+                    f"📎 {drive_url}\n"
+                    f"⏳ Tümü sırada — işleme alınmayı bekliyor"
+                )
                 progress_box.empty()
                 st.success(
                     f"✅ {len(created_jobs)} job kuyruğa eklendi "

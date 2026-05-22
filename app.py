@@ -173,6 +173,11 @@ AZURE_ENABLED = bool(AZURE_CONN)
 HEADLESS_INIT_DISPLAY = os.environ.get("HEADLESS_INIT_DISPLAY", "").strip()
 VNC_ENABLED = bool(HEADLESS_INIT_DISPLAY)
 
+# Slack webhook bildirimleri (opsiyonel).
+# .env'e SLACK_WEBHOOK_URL=https://hooks.slack.com/services/... ekle.
+SLACK_WEBHOOK_URL = os.environ.get("SLACK_WEBHOOK_URL", "").strip()
+SLACK_ENABLED = bool(SLACK_WEBHOOK_URL)
+
 # Lokal init flow için SSH bilgileri (admin panelde "Lokal komut göster" widget'ı
 # bu bilgileri kullanarak hazır rsync komutu üretir). Boş bırakırsan rsync
 # satırı UI'da gösterilmez, sadece Playwright init komutu çıkar.
@@ -2344,15 +2349,24 @@ class Worker:
                 log_fp.flush()
                 ok, remote_url, err = upload_to_azure(local_mp4, job_id)
                 jobs2 = load_jobs()
+                _slack_job = None
                 for j in jobs2:
                     if j.id == job_id:
                         if ok:
                             j.video_remote_url = remote_url
                             j.harvest_status = "uploaded"
+                            _slack_job = j
                         else:
                             j.harvest_error = f"Azure upload failed: {err}"
                         break
                 save_jobs(jobs2)
+                if _slack_job:
+                    _submitter = f" · gönderen: {_slack_job.submitted_by}" if _slack_job.submitted_by else ""
+                    send_slack_message(
+                        f"✅ *Video hazır!*\n"
+                        f"📹 {_slack_job.title[:120]}{_submitter}\n"
+                        f"☁️ {remote_url}"
+                    )
                 launcher_log(
                     f"Azure upload for {job_id}: "
                     f"{'ok' if ok else 'failed'} {err}"
@@ -2371,6 +2385,11 @@ class Worker:
                     if not j.error:
                         j.error = f"{type(e).__name__}: {str(e)[:240]}"
                     j.finished_at = time.time()
+                    send_slack_message(
+                        f"❌ *Job başarısız!*\n"
+                        f"📹 {j.title[:120]}\n"
+                        f"⚠️ {j.error[:200]}"
+                    )
                     break
             save_jobs(jobs_all)
         finally:
@@ -2620,6 +2639,10 @@ class Worker:
                 submitted_by="system",
             )
             jobs.append(quota_marker)
+            send_slack_message(
+                f"🚫 *Kota doldu:* `{target.profile_name}`\n"
+                f"Job kuyrukta bekliyor, başka profile aktarıldı: _{target.title[:100]}_"
+            )
             # Asıl job'u queued'a geri al — Worker başka profile dene
             target.status = "queued"
             target.profile_id = ""
@@ -3102,6 +3125,16 @@ def fmt_time(ts: float) -> str:
         return "—"
 
 
+def fmt_datetime(ts: float) -> str:
+    """Tarih + saat: '22.05 14:37' — job tablosu için."""
+    if not ts:
+        return "—"
+    try:
+        return datetime.fromtimestamp(ts).strftime("%d.%m %H:%M")
+    except (OSError, OverflowError, ValueError):
+        return "—"
+
+
 def derive_title(text: str, limit: int = 64) -> str:
     text = (text or "").strip()
     if not text:
@@ -3344,6 +3377,35 @@ def open_in_browser(url: str) -> None:
         webbrowser.open(url)
     except Exception as e:
         st.toast(f"Tarayıcı açılamadı: {e}", icon="⚠️")
+
+
+def send_slack_message(text: str, blocks: list | None = None) -> bool:
+    """Slack incoming webhook ile mesaj gönder. Başarılıysa True döner.
+
+    Bağımlılık gerektirmez — stdlib urllib.request kullanır.
+    SLACK_ENABLED False ise sessizce atlar.
+    """
+    if not SLACK_ENABLED:
+        return False
+    import json as _json
+    import urllib.request as _req
+    import urllib.error as _uerr
+    payload: dict = {"text": text}
+    if blocks:
+        payload["blocks"] = blocks
+    try:
+        data = _json.dumps(payload).encode("utf-8")
+        req = _req.Request(
+            SLACK_WEBHOOK_URL,
+            data=data,
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        with _req.urlopen(req, timeout=8) as resp:
+            return resp.status == 200
+    except (_uerr.URLError, OSError, Exception) as exc:
+        launcher_log(f"Slack webhook hatası: {exc}")
+        return False
 
 
 # ---------------------------------------------------------------------------
@@ -5548,8 +5610,7 @@ def render_user_view() -> None:
                             unsafe_allow_html=True,
                         )
                     elif j.notebook_url and j.status in TERMINAL_STATUSES:
-                        if st.button("🌐 Notebook'u aç", key=f"u_open_{j.id}", use_container_width=True):
-                            open_in_browser(j.notebook_url)
+                        st.link_button("🌐 Notebook'u aç", j.notebook_url, use_container_width=True)
 
                     # Phase 4: Revize butonu — sadece video Azure'da hazırsa
                     if j.video_remote_url and j.status == "done":
@@ -5612,8 +5673,7 @@ with st.sidebar:
 
     cs_top = st.columns([3, 1])
     with cs_top[0]:
-        if st.button("🌐 NotebookLM açar", use_container_width=True):
-            open_in_browser("https://notebooklm.google.com/")
+        st.link_button("🌐 NotebookLM açar", "https://notebooklm.google.com/", use_container_width=True)
     with cs_top[1]:
         if st.button("🚪", key="admin_logout", use_container_width=True, help="Çıkış yap"):
             do_logout()
@@ -6071,18 +6131,47 @@ with tab_status:
     n_video_ready = sum(1 for j in jobs if j.video_url and j.harvest_status in ("ready", "downloaded", "uploaded"))
     n_video_uploaded = sum(1 for j in jobs if j.harvest_status == "uploaded")
 
-    cols = st.columns(6)
-    cols[0].metric("⏳ Kuyrukta", counts.get("queued", 0))
-    cols[1].metric("▶ Çalışan", counts.get("running", 0))
-    cols[2].metric("🎬 Üretiliyor", counts.get("generating", 0) + counts.get("submitted", 0))
-    cols[3].metric("🎬 Video hazır", n_video_ready)
-    cols[4].metric("☁️ Azure'da", n_video_uploaded if AZURE_ENABLED else "-")
-    cols[5].metric("✗ Hatalı", counts.get("failed", 0))
+    # --- Filtreli durum kartları ---
+    # Karta basmak job listesini o statüye göre filtreler.
+    # İkinci basış veya "Tümü" filtreyi temizler.
+    if "job_filter" not in st.session_state:
+        st.session_state.job_filter = None
+
+    def _filter_btn(col, label: str, count, key: str) -> None:
+        active = st.session_state.job_filter == key
+        btn_type = "primary" if active else "secondary"
+        display = f"{label}  **{count}**"
+        if col.button(display, key=f"flt_{key}", use_container_width=True, type=btn_type):
+            st.session_state.job_filter = None if active else key
+            st.rerun()
+
+    fcols = st.columns(7)
+    # "Tümü" butonu
+    _all_active = st.session_state.job_filter is None
+    if fcols[0].button(
+        f"🗂 Tümü  **{len(jobs)}**",
+        key="flt_all",
+        use_container_width=True,
+        type="primary" if _all_active else "secondary",
+    ):
+        st.session_state.job_filter = None
+        st.rerun()
+
+    _filter_btn(fcols[1], "⏳ Kuyrukta", counts.get("queued", 0), "queued")
+    _filter_btn(fcols[2], "▶ Çalışan", counts.get("running", 0), "running")
+    _filter_btn(fcols[3], "🎬 Üretiliyor", counts.get("generating", 0) + counts.get("submitted", 0), "generating")
+    _filter_btn(fcols[4], "🎬 Video hazır", n_video_ready, "video_ready")
+    _filter_btn(fcols[5], "☁️ Azure'da", n_video_uploaded if AZURE_ENABLED else 0, "uploaded")
+    _filter_btn(fcols[6], "✗ Hatalı", counts.get("failed", 0), "failed")
 
     if AZURE_ENABLED:
         st.caption(f"☁️ Azure aktif · container: `{AZURE_CONTAINER}` · prefix: `{AZURE_BLOB_PREFIX}`")
     else:
         st.caption("ℹ️ Azure kapalı (`AZURE_STORAGE_CONNECTION_STRING` env var set edilmedi)")
+    if SLACK_ENABLED:
+        st.caption("🔔 Slack bildirimleri aktif")
+    else:
+        st.caption("🔕 Slack kapalı (`SLACK_WEBHOOK_URL` env var set edilmedi)")
 
     # Tüm Azure URL'leri tek blokta — toplu paylaşım için
     azure_jobs = [j for j in jobs if j.video_remote_url]
@@ -6141,7 +6230,26 @@ with tab_status:
         )
 
     st.markdown("&nbsp;", unsafe_allow_html=True)
-    section_header("📋 Joblar", f"{len(jobs)} kayıt")
+
+    # Filtre uygula
+    _jf = st.session_state.get("job_filter")
+    if _jf == "queued":
+        jobs_display = [j for j in jobs if j.status == "queued"]
+    elif _jf == "running":
+        jobs_display = [j for j in jobs if j.status == "running"]
+    elif _jf == "generating":
+        jobs_display = [j for j in jobs if j.status in ("generating", "submitted")]
+    elif _jf == "video_ready":
+        jobs_display = [j for j in jobs if j.video_url and j.harvest_status in ("ready", "downloaded", "uploaded")]
+    elif _jf == "uploaded":
+        jobs_display = [j for j in jobs if j.harvest_status == "uploaded"]
+    elif _jf == "failed":
+        jobs_display = [j for j in jobs if j.status == "failed"]
+    else:
+        jobs_display = jobs
+
+    _filter_label = f" · filtre: {_jf}" if _jf else ""
+    section_header("📋 Joblar", f"{len(jobs_display)}/{len(jobs)} kayıt{_filter_label}")
 
     if not jobs:
         empty_state(
@@ -6149,8 +6257,10 @@ with tab_status:
             "Henüz job yok",
             "Hazırla sekmesinden bir içeriği kuyruğa at, durumunu burada izle.",
         )
+    elif not jobs_display:
+        st.info(f"Bu filtrede (`{_jf}`) gösterilecek job yok.", icon="🔍")
     else:
-        jobs_sorted = sorted(jobs, key=lambda j: j.created_at, reverse=True)
+        jobs_sorted = sorted(jobs_display, key=lambda j: j.created_at, reverse=True)
 
         st.markdown('<div class="job-row-wrap">', unsafe_allow_html=True)
         # Header (geniş ekranda görünür, dar ekranda CSS gizler)
@@ -6159,7 +6269,7 @@ with tab_status:
         h[0].markdown("<small style='opacity:0.7; font-weight:600;'>DURUM</small>", unsafe_allow_html=True)
         h[1].markdown("<small style='opacity:0.7; font-weight:600;'>BAŞLIK</small>", unsafe_allow_html=True)
         h[2].markdown("<small style='opacity:0.7; font-weight:600;'>PROFİL / GÖNDEREN</small>", unsafe_allow_html=True)
-        h[3].markdown("<small style='opacity:0.7; font-weight:600;'>BAŞLANGIÇ</small>", unsafe_allow_html=True)
+        h[3].markdown("<small style='opacity:0.7; font-weight:600;'>TARİH</small>", unsafe_allow_html=True)
         h[4].markdown("<small style='opacity:0.7; font-weight:600;'>SÜRE</small>", unsafe_allow_html=True)
         h[5].markdown("<small style='opacity:0.7; font-weight:600;'>NOTEBOOK / HATA</small>", unsafe_allow_html=True)
         h[6].markdown("<small style='opacity:0.7; font-weight:600;'>İŞLEM</small>", unsafe_allow_html=True)
@@ -6186,7 +6296,8 @@ with tab_status:
                 f'{submitter_html}',
                 unsafe_allow_html=True,
             )
-            cs[3].markdown(f"<span style='font-size:0.85rem;'>{fmt_time(j.started_at)}</span>", unsafe_allow_html=True)
+            _ts = j.started_at or j.created_at  # queued job'larda started_at = 0
+            cs[3].markdown(f"<span style='font-size:0.85rem;'>{fmt_datetime(_ts)}</span>", unsafe_allow_html=True)
             cs[4].markdown(f"<span style='font-size:0.85rem;'>{fmt_duration(j.started_at, j.finished_at)}</span>", unsafe_allow_html=True)
 
             with cs[5]:
@@ -6344,8 +6455,7 @@ with tab_status:
                         unsafe_allow_html=True,
                     )
                 elif j.notebook_url and j.status in TERMINAL_STATUSES:
-                    if st.button("🌐 Aç", key=f"open_{j.id}", help="Notebook'u tarayıcıda aç", use_container_width=True):
-                        open_in_browser(j.notebook_url)
+                    st.link_button("🌐 Aç", j.notebook_url, help="Notebook'u tarayıcıda aç", use_container_width=True)
                 # Manuel topla: notebooklm-py path'i (harvest=skip) → resume_download
                 # legacy path → eski harvest cycle tetikleme
                 if (j.status in ("generating", "done", "submitted")

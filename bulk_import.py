@@ -228,45 +228,17 @@ def download_drive_folder(folder_id_or_url: str,
             "Örnek: https://drive.google.com/drive/folders/ABCdef123..."
         )
     out_dir.mkdir(parents=True, exist_ok=True)
-    url = f"https://drive.google.com/drive/folders/{folder_id}"
 
-    # --- Birincil yol: gdown.download_folder ---
-    # Klasörde native Google Docs yoksa bu hızlı yol yeterli.
-    first_exc: Optional[Exception] = None
-    try:
-        downloaded = gdown.download_folder(
-            url=url,
-            output=str(out_dir),
-            quiet=quiet,
-            use_cookies=False,
-        )
-        if downloaded:
-            try:
-                paths = [Path(p) for p in downloaded if p and Path(p).exists()]
-                if paths:
-                    return paths
-            except Exception:
-                pass
-        # gdown hiç dosya döndürmedi → out_dir'daki dosyaları topla
-        all_files = sorted([p for p in out_dir.rglob("*") if p.is_file()])
-        if all_files:
-            return all_files
-    except Exception as e:
-        first_exc = e
-        if not quiet:
-            import sys as _sys
-            print(
-                f"[bulk_import] gdown.download_folder başarısız "
-                f"({type(e).__name__}), dosya-bazlı fallback deneniyor…",
-                file=_sys.stderr,
-            )
-
-    # --- Fallback: her dosyayı ayrı ayrı indir ---
+    # gdown 6.0.0'da ``drive.usercontent.google.com`` redirect parse bug'ı var:
+    # 303 redirect sonrası "Cannot retrieve the public link" hatası fırlatıp
+    # tüm klasör indirmeyi iptal ediyor. Bypass: her dosyayı tek tek requests
+    # ile indir (curl ile sorunsuz çalıştığı doğrulandı). gdown sadece klasör
+    # listesi almak için kullanılır (skip_download=True).
     return _download_drive_folder_per_file(
         folder_id=folder_id,
         out_dir=out_dir,
         quiet=quiet,
-        first_exc=first_exc,
+        first_exc=None,
     )
 
 
@@ -347,7 +319,17 @@ def _download_drive_folder_per_file(
                     )
             continue
 
-        # Normal dosya: doğrudan gdown.download ile indir
+        # Normal dosya: önce requests ile dene (gdown 6.0.0'da
+        # drive.usercontent.google.com redirect parse bug'ı var — curl/requests
+        # ile aynı URL sorunsuz çalışıyor). Başarısız olursa gdown'a fallback.
+        download_ok = _requests_download_drive_file(
+            file_id, local_path, quiet=quiet
+        )
+        if download_ok and local_path.exists() and local_path.stat().st_size > 0:
+            downloaded_paths.append(local_path)
+            continue
+
+        # Fallback: gdown.download (eski yol, bazı dosyalar için çalışabilir)
         try:
             result = gdown.download(
                 url=f"https://drive.google.com/uc?id={file_id}",
@@ -391,6 +373,108 @@ def _download_drive_folder_per_file(
         )
 
     return downloaded_paths
+
+
+def _requests_download_drive_file(
+    file_id: str,
+    dest: Path,
+    quiet: bool = True,
+) -> bool:
+    """Public Drive dosyasını requests ile direkt indir.
+
+    gdown 6.0.0'ın ``drive.usercontent.google.com`` redirect parse bug'ını
+    bypass eder. curl'ün yaptığını Python'da yapar: 303 redirect'i takip et,
+    içeriği yaz.
+
+    Büyük dosyalar için Google "virüs taraması yapılamadı" uyarısı gösterebilir;
+    ``confirm=t`` parametresi bunu otomatik geçer.
+
+    Returns True on success (dosya yazıldı ve boş değil), False yoksa.
+    """
+    try:
+        import requests as _req
+    except ImportError:
+        return False
+
+    import sys as _sys
+
+    headers = {
+        "User-Agent": (
+            "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) "
+            "Chrome/120.0.0.0 Safari/537.36"
+        ),
+    }
+    url = f"https://drive.google.com/uc?id={file_id}&export=download&confirm=t"
+
+    try:
+        with _req.get(
+            url,
+            headers=headers,
+            stream=True,
+            allow_redirects=True,
+            timeout=120,
+        ) as resp:
+            if resp.status_code != 200:
+                if not quiet:
+                    print(
+                        f"[bulk_import] requests indirme: HTTP {resp.status_code} "
+                        f"(file_id={file_id})",
+                        file=_sys.stderr,
+                    )
+                return False
+
+            # Content-Type kontrolü: HTML dönüyorsa muhtemelen onay sayfası
+            ctype = resp.headers.get("content-type", "")
+            if "text/html" in ctype.lower():
+                # HTML onay sayfası geldi → virüs tarama uyarısı, parse edip
+                # gerçek download URL'i bul (basit heuristic, çoğu dosyada
+                # confirm=t parametresi yeterli olur, bu nadir bir kenar durum)
+                if not quiet:
+                    print(
+                        f"[bulk_import] requests: HTML yanıt geldi "
+                        f"(virus scan warning?) — atlanıyor (file_id={file_id})",
+                        file=_sys.stderr,
+                    )
+                return False
+
+            dest.parent.mkdir(parents=True, exist_ok=True)
+            total = 0
+            with open(dest, "wb") as f:
+                for chunk in resp.iter_content(chunk_size=64 * 1024):
+                    if chunk:
+                        f.write(chunk)
+                        total += len(chunk)
+
+            if total == 0:
+                if not quiet:
+                    print(
+                        f"[bulk_import] requests indirme: boş dosya "
+                        f"(file_id={file_id})",
+                        file=_sys.stderr,
+                    )
+                try:
+                    dest.unlink()
+                except OSError:
+                    pass
+                return False
+
+            if not quiet:
+                print(
+                    f"[bulk_import] ✓ requests ile indirildi: {dest.name} "
+                    f"({total} bytes)",
+                    file=_sys.stderr,
+                )
+            return True
+
+    except Exception as e:
+        if not quiet:
+            print(
+                f"[bulk_import] requests indirme hatası "
+                f"(file_id={file_id}): {type(e).__name__}: {e}",
+                file=_sys.stderr,
+            )
+        return False
 
 
 def _try_export_google_doc(

@@ -51,10 +51,16 @@ except ImportError as _doc_err:
 # Drive URL/ID parsing
 # ---------------------------------------------------------------------------
 _DRIVE_FOLDER_PATTERNS = [
+    # Standart: /drive/folders/<id>
     re.compile(r"drive\.google\.com/drive/folders/([a-zA-Z0-9_-]+)"),
+    # Çok hesaplı oturum: /drive/u/0/folders/<id> veya /drive/u/1/folders/<id>
+    re.compile(r"drive\.google\.com/drive/u/\d+/folders/([a-zA-Z0-9_-]+)"),
+    # Eski folderview formatı
     re.compile(r"drive\.google\.com/folderview\?id=([a-zA-Z0-9_-]+)"),
+    # ?id= veya &id= parametreli her Drive URL'i
     re.compile(r"drive\.google\.com/.*[?&]id=([a-zA-Z0-9_-]+)"),
-    re.compile(r"^([a-zA-Z0-9_-]{20,})$"),  # plain folder ID
+    # Düz folder ID (20+ karakter)
+    re.compile(r"^([a-zA-Z0-9_-]{20,})$"),
 ]
 
 

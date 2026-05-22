@@ -3733,7 +3733,7 @@ def render_bulk_drive_section(*, key_prefix: str = "blk") -> None:
     çakışmasın diye verilir ('adm' admin tab, 'usr' user view)."""
     section_header(
         "🗂️ Drive'dan toplu docx import",
-        "Bir Drive klasöründeki tüm .docx dosyalarını otomatik script yap, queue'ya at",
+        "Bir Drive klasöründeki tüm .docx/.txt/.md dosyalarını otomatik script yap, queue'ya at",
     )
     if not _BULK_AVAILABLE:
         st.error(
@@ -3788,13 +3788,14 @@ def render_bulk_drive_section(*, key_prefix: str = "blk") -> None:
 
     st.info(
         "🔒 Her job için NotebookLM'e otomatik yüklenen source'lar:\n"
-        "  • **Script** + **Learning Objectives** (`<name>_lo.docx` companion varsa)\n"
+        "  • **Script** + **Learning Objectives** (`<name>_lo.<ext>` companion varsa)\n"
         "  • **4 ayrı sabit guide** (Narrative & Text-Free / History / "
         "Student Safety / 80-20 Animation)\n"
         "  • **Custom Prompt** (Role/Task/Constraints)\n"
         "  • Görseller\n\n"
-        "Drive klasöründe `senaryo1.docx` + `senaryo1_lo.docx` çiftleri "
-        "otomatik eşleştirilir — LO ayrı bir source olarak yüklenir.",
+        "Drive klasöründe `senaryo1.docx` + `senaryo1_lo.docx` (veya .txt/.md) "
+        "çiftleri otomatik eşleştirilir — LO ayrı bir source olarak yüklenir. "
+        "Mix de OK: `senaryo1.docx` + `senaryo1_lo.txt` çalışır.",
         icon="ℹ️",
     )
     with st.expander("👁 4 sabit guide'ı gör (read-only)"):
@@ -3890,7 +3891,7 @@ def render_bulk_drive_section(*, key_prefix: str = "blk") -> None:
         hd = st.columns([3, 1, 1])
         with hd[0]:
             st.success(
-                f"✓ **{preview['count']}** adet .docx · "
+                f"✓ **{preview['count']}** doküman · "
                 f"**{n_selected}** seçili"
             )
         with hd[1]:
@@ -5483,7 +5484,7 @@ def render_user_view() -> None:
             st.info(
                 "🔒 NotebookLM source listesi (her job otomatik):\n"
                 "1. `<Title>_Script.txt` — Senaryon\n"
-                "2. `<Title>_LearningObjectives.txt` — _lo.docx companion (varsa)\n"
+                "2. `<Title>_LearningObjectives.txt` — _lo.docx/.txt/.md companion (varsa)\n"
                 "3. Narrative & Text-Free Execution Guide\n"
                 "4. Historical Accuracy & Identity Protocol\n"
                 "5. Student Safety & Visual Harmony Guide\n"

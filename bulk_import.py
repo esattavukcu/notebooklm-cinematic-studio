@@ -88,8 +88,13 @@ def is_available() -> tuple[bool, str]:
 
 
 # ---------------------------------------------------------------------------
-# Docx parsing
+# Doküman parsing — .docx, .txt, .md destekler
 # ---------------------------------------------------------------------------
+# Desteklenen dosya uzantıları (lowercase, dot ile). Yeni format eklemek
+# için sadece bu listeyi + parse_document switch'ini güncelle.
+SUPPORTED_EXTENSIONS: tuple[str, ...] = (".docx", ".txt", ".md")
+
+
 def parse_docx(path: Path) -> str:
     """docx → düz metin. Paragraf ayraçları korunur, boş satırlar bir kez."""
     if not _DOCX_AVAILABLE:
@@ -99,32 +104,78 @@ def parse_docx(path: Path) -> str:
     for para in doc.paragraphs:
         t = (para.text or "").strip()
         parts.append(t)
-    # Çoklu boş satırları teke indir
     text = "\n".join(parts)
     text = re.sub(r"\n{3,}", "\n\n", text).strip()
     return text
 
 
+def parse_txt(path: Path) -> str:
+    """Plain text dosya oku — UTF-8 öncelik, latin-1 fallback (Windows export)."""
+    for encoding in ("utf-8", "utf-8-sig", "latin-1", "cp1254"):
+        try:
+            text = path.read_text(encoding=encoding)
+            # Çoklu boş satırları teke indir (paragraf normalizasyonu)
+            text = re.sub(r"\n{3,}", "\n\n", text).strip()
+            return text
+        except UnicodeDecodeError:
+            continue
+    raise RuntimeError(f"{path.name} text encoding tespit edilemedi (utf-8/latin-1/cp1254 hep fail)")
+
+
+def parse_document(path: Path) -> str:
+    """Generic parser — uzantıya göre uygun handler'a yönlendirir.
+
+    Desteklenen: .docx (python-docx), .txt + .md (plain text).
+    """
+    ext = path.suffix.lower()
+    if ext == ".docx":
+        return parse_docx(path)
+    if ext in (".txt", ".md"):
+        return parse_txt(path)
+    raise RuntimeError(f"Desteklenmeyen format: {ext} ({path.name})")
+
+
 def get_docx_metadata(path: Path) -> dict:
-    """docx core_properties → metadata dict.
+    """Doküman metadata → dict.
+
+    .docx için: core_properties (created, modified, author, ...).
+    .txt/.md için: filesystem stat (mtime → modified, sadece). docx'taki
+    'author' yok, bu yüzden author='' döner.
 
     Döner: {created, modified, author, last_modified_by, n_paragraphs}
-    'created' ve 'modified' ISO format string (UI'da formatlanır).
-    Drive 'added to Drive' time'ı doğrudan alınamaz (API key gerek);
-    docx modified time genelde yakın bir proxy (Google Docs → docx export'ta
-    export anının timestamp'i, Word'de save anının timestamp'i).
+    'created' ve 'modified' ISO format string.
     """
-    if not _DOCX_AVAILABLE:
-        return {}
+    ext = path.suffix.lower()
+    if ext == ".docx":
+        if not _DOCX_AVAILABLE:
+            return {}
+        try:
+            doc = _DocxDocument(str(path))
+            props = doc.core_properties
+            return {
+                "created": props.created.isoformat() if props.created else None,
+                "modified": props.modified.isoformat() if props.modified else None,
+                "author": (props.author or "").strip(),
+                "last_modified_by": (props.last_modified_by or "").strip(),
+                "n_paragraphs": len(doc.paragraphs),
+            }
+        except Exception:
+            return {}
+    # .txt / .md → sadece filesystem mtime + line count
     try:
-        doc = _DocxDocument(str(path))
-        props = doc.core_properties
+        from datetime import datetime as _dt
+        stat = path.stat()
+        # Line sayısı paragraf yaklaşığı
+        try:
+            n_lines = sum(1 for _ in path.open("r", encoding="utf-8", errors="ignore"))
+        except Exception:
+            n_lines = 0
         return {
-            "created": props.created.isoformat() if props.created else None,
-            "modified": props.modified.isoformat() if props.modified else None,
-            "author": (props.author or "").strip(),
-            "last_modified_by": (props.last_modified_by or "").strip(),
-            "n_paragraphs": len(doc.paragraphs),
+            "created": _dt.fromtimestamp(stat.st_ctime).isoformat(),
+            "modified": _dt.fromtimestamp(stat.st_mtime).isoformat(),
+            "author": "",
+            "last_modified_by": "",
+            "n_paragraphs": n_lines,
         }
     except Exception:
         return {}
@@ -195,34 +246,41 @@ def download_drive_folder(folder_id_or_url: str,
 
 def list_drive_folder_docx(folder_id_or_url: str,
                             tmp_dir: Optional[Path] = None) -> list[Path]:
-    """Klasördeki sadece .docx dosyalarının lokal path'lerini döner.
+    """Klasördeki desteklenen tüm dosyaların (docx/txt/md) lokal path'lerini döner.
+
+    İsim 'docx' içeriyor ama backward-compat için bırakıldı —
+    artık SUPPORTED_EXTENSIONS'ı tarar.
 
     Önizleme + actual import aynı download'u kullanır — gdown idempotent değil,
-    o yüzden tmp_dir hem önizleme hem import için aynı kullanılmalı (caller
-    yönetir). None ise her seferinde yeni tmp_dir açar.
+    o yüzden tmp_dir hem önizleme hem import için aynı kullanılmalı.
     """
     if tmp_dir is None:
         tmp_dir = Path(tempfile.mkdtemp(prefix="bulk_drive_"))
     files = download_drive_folder(folder_id_or_url, tmp_dir)
-    return [p for p in files if p.suffix.lower() == ".docx"]
+    return [p for p in files if p.suffix.lower() in SUPPORTED_EXTENSIONS]
 
 
 # ---------------------------------------------------------------------------
 # Bulk job creation
 # ---------------------------------------------------------------------------
 def pair_docx_with_lo(docx_paths: list[Path]) -> list[tuple[Path, Optional[Path]]]:
-    """Drive'daki docx'leri main + _lo companion olarak grupla.
+    """Drive'daki dokümanları main + _lo companion olarak grupla.
 
-    Eşleştirme: 'senaryo1.docx' (main) + 'senaryo1_lo.docx' (learning objectives).
-    `_lo` suffix'iyle biten dosyalar companion olarak kabul edilir; ana dosya
-    aynı klasörde bulunmazsa standalone (lo skip).
+    Eşleştirme: 'senaryo1.<ext>' (main) + 'senaryo1_lo.<ext>' (learning objectives).
+    Main ve LO **farklı uzantıda da olabilir** ('senaryo1.docx' + 'senaryo1_lo.txt'
+    veya 'senaryo1.txt' + 'senaryo1_lo.docx' gibi). `_lo` suffix'iyle biten
+    dosyalar companion olarak kabul edilir; ana dosya yoksa standalone (lo skip).
 
     Returns: [(main_path, lo_path_or_None), ...]
     Sıralama: main dosyaların stem'ine göre alfabetik.
     """
     by_stem: dict[str, Path] = {}
     for p in docx_paths:
-        if p.suffix.lower() != ".docx":
+        if p.suffix.lower() not in SUPPORTED_EXTENSIONS:
+            continue
+        # Aynı stem'de docx + txt varsa: docx'i öncele (daha zengin metadata)
+        existing = by_stem.get(p.stem)
+        if existing and existing.suffix.lower() == ".docx":
             continue
         by_stem[p.stem] = p
 
@@ -283,14 +341,14 @@ def bulk_create_jobs_from_docx_paths(
             lo_note = f" + {lo_path.name}" if lo_path else ""
             on_progress(f"[{i+1}/{len(pairs)}] {main_path.name}{lo_note} işleniyor…")
         try:
-            text = parse_docx(main_path)
+            text = parse_document(main_path)
             if not text or len(text.strip()) < 50:
                 errors.append((main_path.name, f"Çok kısa veya boş ({len(text)} chars)"))
                 continue
             lo_text = ""
             if lo_path:
                 try:
-                    lo_text = parse_docx(lo_path)
+                    lo_text = parse_document(lo_path)
                 except Exception as e:
                     errors.append((lo_path.name, f"LO parse fail: {e}"))
                     lo_text = ""
@@ -377,13 +435,17 @@ def bulk_import_from_drive(
 
 
 __all__ = [
+    "SUPPORTED_EXTENSIONS",
     "extract_folder_id",
     "is_available",
     "parse_docx",
+    "parse_txt",
+    "parse_document",
     "get_docx_metadata",
     "docx_to_title",
     "download_drive_folder",
     "list_drive_folder_docx",
+    "pair_docx_with_lo",
     "bulk_create_jobs_from_docx_paths",
     "bulk_import_from_drive",
 ]

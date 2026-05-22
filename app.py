@@ -257,6 +257,10 @@ class Profile:
     initialized: bool = False
     last_used: float = 0.0
     created_at: float = field(default_factory=time.time)
+    # "dev" | "prod" — dispatcher job.environment ile profile.environment eşler.
+    # Backward compat: eski profillerde alan yok → load_profiles default "prod"
+    # set eder (varolan sistem prod sayılır).
+    environment: str = "prod"
 
 
 @dataclass
@@ -291,6 +295,10 @@ class Job:
     custom_prompt: str = ""          # NotebookLM Cinematic Customize → Custom Prompt'a yapışan metin
     style_guides_used: list = field(default_factory=list)  # [filename, ...] — submit anında attach edilenler
     learning_objectives: str = ""    # _lo.docx companion content (bulk Drive import'tan), opsiyonel
+    # "dev" | "prod" — submit anında URL ?env=... parametresinden gelir.
+    # Dispatcher sadece aynı environment'taki profillere atar.
+    # Backward compat: eski job'larda alan yok → "prod" varsayılır.
+    environment: str = "prod"
     # Phase 4: Video Edit / Revize — bu job başka bir job'ı revize ediyorsa
     parent_job_id: str = ""              # Hangi job'ı revize ediyor (boş = orijinal)
     revision_instructions: str = ""      # "Ne değişsin?" (user'ın yazdığı revize prompt'u)
@@ -829,10 +837,28 @@ def _extract_sas_from_conn(conn: str) -> str:
     return m.group(1) if m else ""
 
 
-def upload_to_azure(local_path: Path, job_id: str) -> tuple[bool, str, str]:
+def _azure_prefix_for_env(env: str) -> str:
+    """Env'e göre Azure blob prefix. Default 'videos/' (prod) — env subfolder
+    eklenir: dev → 'videos/dev/', prod → 'videos/prod/'. Backward compat:
+    eski 'videos/' prefix'i prod sayılır (manuel migration gerekirse yapılır).
+    """
+    base = AZURE_BLOB_PREFIX.rstrip("/")
+    e = (env or "prod").strip().lower()
+    if e not in ALLOWED_ENVS:
+        e = "prod"
+    return f"{base}/{e}"
+
+
+def upload_to_azure(local_path: Path, job_id: str,
+                    environment: str = "prod") -> tuple[bool, str, str]:
     """Returns (success, remote_url_or_empty, error_or_empty).
     SAS-based connection ise döndürdüğü URL'e SAS append'lenir →
-    private container'da bile direkt browser'da oynatılabilir."""
+    private container'da bile direkt browser'da oynatılabilir.
+
+    environment='dev'|'prod' → blob path 'videos/dev/<id>.mp4' veya
+    'videos/prod/<id>.mp4'. Dev ile prod ayrı klasörler, audit + cleanup
+    için.
+    """
     if not AZURE_ENABLED:
         return False, "", "azure_disabled"
     try:
@@ -842,7 +868,8 @@ def upload_to_azure(local_path: Path, job_id: str) -> tuple[bool, str, str]:
         return False, "", "azure-storage-blob package not installed"
 
     try:
-        blob_name = f"{AZURE_BLOB_PREFIX.rstrip('/')}/{job_id}.mp4"
+        env_prefix = _azure_prefix_for_env(environment)
+        blob_name = f"{env_prefix}/{job_id}.mp4"
         svc = BlobServiceClient.from_connection_string(AZURE_CONN)
         container = svc.get_container_client(AZURE_CONTAINER)
         # Container yoksa oluşturmaya çalış (yetkisi varsa). Yoksa next call fail eder.
@@ -1847,9 +1874,6 @@ class Worker:
         if not queued:
             return
 
-        # Round-robin: en eski kullanılan profil önce
-        profiles.sort(key=lambda p: p.last_used)
-
         # Profil başına slot hesapla
         slot_map: dict[str, int] = {}
         for p in profiles:
@@ -1864,21 +1888,28 @@ class Worker:
                 slots = min(slots, max(0, p.daily_limit - today))
             slot_map[p.id] = slots
 
-        # Round-robin: profillerden sırayla bir job al
+        # Env-aware dispatch:
+        # Her queued job için, o job'un env'ine uygun (initialized + slot var)
+        # profilleri filtrele, en az kullanılan profile assign et.
+        # Dev job dev profile'a, prod job prod profile'a gider — kotalar ayrı.
         any_dispatched = False
-        idx = 0
-        while queued and any(slot_map.get(p.id, 0) > 0 for p in profiles):
-            p = profiles[idx % len(profiles)]
-            idx += 1
-            if slot_map.get(p.id, 0) <= 0:
-                # Bu profil dolu, bir sonrakine geç
-                if idx > len(profiles) * 2 and not any_dispatched:
-                    break
+        for job in list(queued):
+            job_env = (job.environment or "prod").strip().lower()
+            if job_env not in ALLOWED_ENVS:
+                job_env = "prod"
+            matching = [p for p in profiles
+                        if (p.environment or "prod").strip().lower() == job_env
+                        and slot_map.get(p.id, 0) > 0]
+            if not matching:
+                # Bu env için profil yok veya tüm slot'lar dolu —
+                # job kuyrukta bekler, sonraki round'da tekrar denenir
                 continue
-            job = queued.pop(0)
-            self._launch_job(job, p)
-            slot_map[p.id] -= 1
-            p.last_used = time.time()
+            # En eski kullanılan profili seç (round-robin)
+            matching.sort(key=lambda p: p.last_used)
+            target_profile = matching[0]
+            self._launch_job(job, target_profile)
+            slot_map[target_profile.id] -= 1
+            target_profile.last_used = time.time()
             any_dispatched = True
 
         if any_dispatched:
@@ -2345,9 +2376,23 @@ class Worker:
 
             # 4. Azure upload (best-effort, fail olursa job done kalır)
             if AZURE_ENABLED and local_mp4.exists():
-                log_fp.write(f"## Azure upload: {local_mp4.name}\n")
+                # Job env'ini al — Azure prefix dev/prod ayırımı için
+                _env_for_azure = "prod"
+                try:
+                    _job_now = next(
+                        (j for j in load_jobs() if j.id == job_id), None
+                    )
+                    if _job_now:
+                        _env_for_azure = (_job_now.environment or "prod")
+                except Exception:
+                    pass
+                log_fp.write(
+                    f"## Azure upload: {local_mp4.name} (env={_env_for_azure})\n"
+                )
                 log_fp.flush()
-                ok, remote_url, err = upload_to_azure(local_mp4, job_id)
+                ok, remote_url, err = upload_to_azure(
+                    local_mp4, job_id, environment=_env_for_azure,
+                )
                 jobs2 = load_jobs()
                 _slack_job = None
                 for j in jobs2:
@@ -2894,7 +2939,10 @@ class Worker:
             if AZURE_ENABLED and target.video_local_path:
                 full_path = APP_DIR / target.video_local_path
                 if full_path.exists():
-                    ok, remote_url, err = upload_to_azure(full_path, job_id)
+                    ok, remote_url, err = upload_to_azure(
+                        full_path, job_id,
+                        environment=(target.environment or "prod"),
+                    )
                     jobs2 = load_jobs()
                     for j in jobs2:
                         if j.id == job_id:
@@ -3017,10 +3065,16 @@ class Worker:
                 break
         save_jobs(jobs)
 
-        # Azure upload (best-effort)
+        # Azure upload (best-effort) — job env'iyle prefix doğru gelir
         if AZURE_ENABLED and out_path.exists():
             try:
-                ok, url, err = upload_to_azure(out_path, job_id)
+                _resume_env = "prod"
+                _job_now = next((j for j in jobs if j.id == job_id), None)
+                if _job_now:
+                    _resume_env = (_job_now.environment or "prod")
+                ok, url, err = upload_to_azure(
+                    out_path, job_id, environment=_resume_env,
+                )
                 if ok:
                     jobs = load_jobs()
                     for j in jobs:
@@ -3467,6 +3521,28 @@ def _is_admin() -> bool:
     return bool(auth and auth.get("role") == "admin")
 
 
+# Environment routing — URL ?env=dev|prod (default prod). Dev/prod fiziksel
+# olarak aynı app ama dispatcher + storage + UI env'e göre bölünür.
+ALLOWED_ENVS = ("dev", "prod")
+
+
+def current_env() -> str:
+    """URL ?env=... param'ı oku. Sonra session_state'e cache (refresh sonrası
+    da kalsın). Default 'prod' — backward compat ve safe-by-default."""
+    try:
+        q = st.query_params.get("env", "")
+    except Exception:
+        q = ""
+    if q in ALLOWED_ENVS:
+        st.session_state["_env"] = q
+        return q
+    # Param yok → session_state'den oku, o da yoksa prod
+    cached = st.session_state.get("_env", "")
+    if cached in ALLOWED_ENVS:
+        return cached
+    return "prod"
+
+
 def _user_name() -> str:
     """User view'ın "kim gönderdi" alanı için — display_name'den alır."""
     auth = current_user()
@@ -3882,6 +3958,9 @@ def render_bulk_drive_section(*, key_prefix: str = "blk") -> None:
         else:
             submitter = _user_name() or "bulk"
 
+            # current_env'i closure'a yakala (background içinde kullanılır)
+            _bulk_env = current_env()
+
             def _job_factory(title, text, custom_prompt, submitted_by,
                              learning_objectives: str = ""):
                 return {
@@ -3894,6 +3973,7 @@ def render_bulk_drive_section(*, key_prefix: str = "blk") -> None:
                     "assets": [],
                     "created_at": time.time(),
                     "learning_objectives": learning_objectives,
+                    "environment": _bulk_env,
                 }
 
             progress_box = st.empty()
@@ -3970,6 +4050,8 @@ def render_bulk_drive_section(*, key_prefix: str = "blk") -> None:
                             created_at=jd["created_at"],
                             custom_prompt=jd["custom_prompt"],
                             learning_objectives=jd.get("learning_objectives", ""),
+                            # Bulk submit aktif env'e gider (URL ?env=...)
+                            environment=jd.get("environment", "prod"),
                         )
                         j.assets = []
                         created_jobs.append(j)
@@ -4000,9 +4082,39 @@ def render_bulk_drive_section(*, key_prefix: str = "blk") -> None:
 # USER VIEW — Mustafa-tier sadeliği. Tek sayfa, tek textarea, tek button.
 # ---------------------------------------------------------------------------
 def render_user_view() -> None:
-    profiles = load_profiles()
-    jobs = load_jobs()
+    profiles_all = load_profiles()
+    jobs_all = load_jobs()
     today = date.today()
+
+    # --- Environment routing: URL ?env=dev|prod ---
+    env = current_env()
+    # Env badge + dev/prod switch link
+    _env_color = "#f59e0b" if env == "dev" else "#10b981"  # dev=turuncu, prod=yeşil
+    _env_label = "🧪 DEV" if env == "dev" else "🚀 PROD"
+    _other_env = "prod" if env == "dev" else "dev"
+    _other_label = "🚀 PROD" if env == "dev" else "🧪 DEV"
+    st.markdown(
+        f"""<div style="display:flex; align-items:center; gap:12px;
+              padding:8px 14px; background:{_env_color}15;
+              border-left:4px solid {_env_color};
+              border-radius:8px; margin-bottom:14px;">
+          <span style="font-size:1.1rem; font-weight:700; color:{_env_color};">
+            {_env_label}
+          </span>
+          <span style="opacity:0.6; font-size:0.85rem;">ortamı aktif</span>
+          <a href="?env={_other_env}" style="margin-left:auto;
+              font-size:0.85rem; text-decoration:none;
+              padding:4px 10px; background:#ffffff20;
+              border-radius:6px;">{_other_label} ortamına geç →</a>
+        </div>""",
+        unsafe_allow_html=True,
+    )
+
+    # Bu env'in profilleri + job'ları (UI'da sadece o env görünür)
+    profiles = [p for p in profiles_all
+                if (p.environment or "prod").strip().lower() == env]
+    jobs = [j for j in jobs_all
+            if (j.environment or "prod").strip().lower() == env]
 
     # Aktif hesap sayısı + bugün üretilen toplam
     initialized_profiles = [p for p in profiles if p.initialized]
@@ -4121,6 +4233,9 @@ def render_user_view() -> None:
                         parent_job_id=parent.id,
                         revision_instructions=instr,
                         revision_video_url=parent.video_remote_url,
+                        # Revize parent ile aynı env'de kalır (dev'in revisi
+                        # dev'de, prod revize prod'da)
+                        environment=(parent.environment or "prod"),
                     )
                     jobs_all = load_jobs()
                     jobs_all.append(new_job)
@@ -5464,6 +5579,9 @@ def render_user_view() -> None:
                 iterations=iterations_at_submit,
                 assets=assets_at_submit,
                 custom_prompt=custom_prompt_submit,
+                # Env URL param'dan (default prod). Dispatcher buna uygun
+                # profili seçer.
+                environment=current_env(),
                 # style_guides_used kaldırıldı (Phase E.3 — yanlış yorumdu)
             ))
             save_jobs(jobs_all)
@@ -5700,12 +5818,18 @@ with st.sidebar:
         limit_str = f"{today_count}/{p.daily_limit}" if p.daily_limit > 0 else f"{today_count}/∞"
         # İsim uzunsa kısalt
         name_short = p.name if len(p.name) <= 28 else p.name[:27] + "…"
+        # Env badge: dev=turuncu, prod=yeşil
+        _p_env = (p.environment or "prod").lower()
+        _env_clr = "#f59e0b" if _p_env == "dev" else "#10b981"
+        _env_txt = "🧪 DEV" if _p_env == "dev" else "🚀 PROD"
 
         with st.container(border=True):
             st.markdown(
                 f'<div style="display:flex; align-items:center; gap:6px; margin-bottom:4px;">'
                 f'<span style="font-size:0.85rem;">{dot}</span>'
-                f'<span style="font-weight:600; font-size:0.92rem; flex:1; overflow:hidden; text-overflow:ellipsis; white-space:nowrap;" title="{p.name}">{name_short}</span>'
+                f'<span style="font-weight:600; font-size:0.88rem; flex:1; overflow:hidden; text-overflow:ellipsis; white-space:nowrap;" title="{p.name}">{name_short}</span>'
+                f'<span style="font-size:0.68rem; padding:1px 6px; background:{_env_clr}20; '
+                f'color:{_env_clr}; border-radius:8px; font-weight:600;">{_env_txt}</span>'
                 f'</div>'
                 f'<div style="font-size:0.74rem; opacity:0.75; margin-bottom:6px;">'
                 f'bugün <b>{limit_str}</b> &nbsp;·&nbsp; paralel <b>×{p.max_concurrent}</b>'
@@ -5873,6 +5997,17 @@ with st.sidebar:
                     value=p.headless,
                     key=f"hl_{p.id}",
                 )
+                new_env = st.selectbox(
+                    "Environment",
+                    options=["prod", "dev"],
+                    index=0 if (p.environment or "prod") == "prod" else 1,
+                    key=f"env_{p.id}",
+                    help=(
+                        "Bu profilin hangi ortama atanacağı. Dispatcher "
+                        "sadece aynı env'deki job'ları bu profile gönderir. "
+                        "prod=canlı kullanım, dev=test/staging."
+                    ),
+                )
                 if st.button("Kaydet", key=f"save_{p.id}"):
                     ps = load_profiles()
                     for x in ps:
@@ -5882,6 +6017,7 @@ with st.sidebar:
                             x.daily_limit = int(new_limit)
                             x.max_concurrent = int(new_max_c)
                             x.headless = bool(new_headless)
+                            x.environment = new_env
                             break
                     save_profiles(ps)
                     st.toast("Kaydedildi.", icon="✅")
@@ -5893,6 +6029,16 @@ with st.sidebar:
             "Hesap adı",
             placeholder="örn. baran@yga.org.tr",
             help="Sadece ayırt etmek için — istediğin ismi ver",
+        )
+        np_env = st.selectbox(
+            "Environment",
+            options=["prod", "dev"],
+            index=0,
+            help=(
+                "Hangi ortama atanacak. prod=canlı kullanım, "
+                "dev=test/staging. Dispatcher sadece aynı env'deki "
+                "job'ları bu profile gönderir."
+            ),
         )
         with st.expander("Gelişmiş (opsiyonel)"):
             np_authuser = st.number_input(
@@ -5923,6 +6069,7 @@ with st.sidebar:
                     max_concurrent=int(np_concurrent),
                     headless=True,
                     initialized=False,
+                    environment=np_env,
                 )
                 ps.append(new_p)
                 save_profiles(ps)

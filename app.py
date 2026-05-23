@@ -1692,6 +1692,9 @@ class Worker:
         # Stale-resume sweeper: aktif resume thread'lerini takip et ki aynı
         # job için birden fazla resume thread spawn etmeyelim.
         self._resume_threads: dict[str, threading.Thread] = {}
+        # _auto_init_check'in smoke_test FAIL log spam'ini bastırmak için
+        # profile_id → son fail timestamp.
+        self._smoke_fail_ts: dict[str, float] = {}
 
     def start(self) -> None:
         if not self._thread.is_alive():
@@ -1958,18 +1961,55 @@ class Worker:
     def _auto_init_check(self) -> None:
         """auth.json yazılmış profilleri otomatik 'initialized=True' yap.
         Kullanıcının elle 'Login tamamlandı' butonuna basmasına gerek kalmaz.
-        notebooklm_automator.py --init modunda framenavigated event'inde
-        auth.json kaydediyor — biz burada onu polling'e bağlıyoruz."""
+
+        ÖNEMLİ: Sadece auth.json varlığı + size kontrolü YETERLİ DEĞİL.
+        Chromium signin sayfasında bile Google'ın anonim cookies'i (NID,
+        CONSENT) var ve >100 byte JSON üretiyor. Asıl auth doğrulaması için
+        notebooklm-py smoke_test ile gerçek NotebookLM endpoint'ine bir
+        notebook list çağrısı yapılır — sadece bu geçerse initialized=True.
+
+        Smoke test ~1-2 sn sürer. Polling thread'inde çalıştığı için ana
+        UI'yi etkilemez. initialized=False olanlarda 1 kez koşar, sonuca
+        göre kararı verir; True olursa bir daha çalışmaz."""
+        from notebooklm_client import smoke_test as _nlm_smoke
+
         profiles = load_profiles()
         changed = False
         for p in profiles:
             if p.initialized:
                 continue
             auth_path = PROFILES_DIR / p.id / "auth.json"
-            if auth_path.exists() and auth_path.stat().st_size > 100:
+            if not (auth_path.exists() and auth_path.stat().st_size > 100):
+                continue
+            # auth.json son fail'den daha yeni mi? Yoksa smoke_test'i her
+            # polling'de tekrarlamak boşa yük (1-2 sn HTTP request). Sadece
+            # auth.json yeniden yazılmışsa (kullanıcı yeniden login etmişse)
+            # tekrar dene.
+            auth_mtime = auth_path.stat().st_mtime
+            last_fail = self._smoke_fail_ts.get(p.id, 0.0)
+            if last_fail and auth_mtime <= last_fail:
+                continue  # auth.json hâlâ aynı dosya — tekrar smoke etme
+            try:
+                ok, msg = _nlm_smoke(p.id)
+            except Exception as e:
+                ok, msg = False, f"{type(e).__name__}: {e}"
+            if ok:
                 p.initialized = True
                 changed = True
-                launcher_log(f"Auto-init: profile {p.name} ({p.id}) marked initialized.")
+                # Başarı: fail cache'i temizle (sonradan deinit olursa
+                # smoke yeniden çalışabilsin)
+                self._smoke_fail_ts.pop(p.id, None)
+                launcher_log(
+                    f"Auto-init: profile {p.name} ({p.id}) smoke_test PASSED — initialized=True. {msg}"
+                )
+            else:
+                # auth.json var ama yetki yok — login tamamlanmadı.
+                # initialized=False bırak, UI ⚪ ve 'Hesabı aktive et' göstersin.
+                self._smoke_fail_ts[p.id] = time.time()
+                launcher_log(
+                    f"Auto-init: profile {p.name} ({p.id}) auth.json var "
+                    f"ama smoke_test FAIL — initialized=False bırakıldı. {msg}"
+                )
         if changed:
             save_profiles(profiles)
 

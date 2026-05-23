@@ -604,12 +604,16 @@ def run_init(profile_dir: Path, authuser: int, emitter: EventEmitter) -> int:
             )
 
             # Chrome'un ölümünü port-polling ile izle + periyodik save.
-            # Her 5 sn'de bir state'i yakala — login tamamlandıkça cookies
-            # birikecek, son successful save final state'i tutar.
+            # Her 5 sn'de bir state'i yakala — AMA sadece kullanıcı en az bir
+            # kez notebooklm.google.com'a ulaştıktan sonra. Aksi takdirde
+            # signin sayfasında bekleme cookies'i (NID, CONSENT) auth.json'a
+            # yazılır ve admin UI yanlışlıkla 🟢 "initialized" gösterir.
+            # saved_once["value"] sadece _on_framenav notebooklm'e ulaşınca
+            # True olur — bu, gerçek bir login completion proxy'si.
             _last_periodic = 0.0
             while True:
                 now = time.time()
-                if now - _last_periodic >= 5.0:
+                if now - _last_periodic >= 5.0 and saved_once["value"]:
                     try:
                         _save_storage_state(reason="periodic")
                     except Exception:

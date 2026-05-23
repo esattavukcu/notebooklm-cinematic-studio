@@ -42,10 +42,12 @@ if [ -z "$NOVNC_DIR" ]; then
 fi
 echo "    noVNC dizini: $NOVNC_DIR"
 
-# noVNC vnc.html sayfasını default olarak ayarla (kullanıcı vnc.html / vnc_lite.html
-# arasında seçim yapmasın)
-if [ -f "$NOVNC_DIR/vnc_lite.html" ] && [ ! -f "$NOVNC_DIR/index.html" ]; then
-  $SUDO ln -sf "$NOVNC_DIR/vnc_lite.html" "$NOVNC_DIR/index.html"
+# noVNC full client (vnc.html) default index.html olarak ayarla.
+# vnc_lite.html'ten farkı: scaling, clipboard, settings panel, auto-reconnect,
+# ping/keepalive desteği. Login UX'i için bunlar elzem.
+# -f ile mevcut symlink üzerine yaz (eski kurulumlarda lite'a bağlı olabilir).
+if [ -f "$NOVNC_DIR/vnc.html" ]; then
+  $SUDO ln -sf "$NOVNC_DIR/vnc.html" "$NOVNC_DIR/index.html"
 fi
 
 echo "==> [2/4] systemd service'leri yazılıyor..."
@@ -59,7 +61,7 @@ After=network.target
 [Service]
 Type=simple
 User=ubuntu
-ExecStart=/usr/bin/Xvfb :99 -screen 0 1280x900x24 -ac +extension GLX +extension RANDR +extension RENDER
+ExecStart=/usr/bin/Xvfb :99 -screen 0 1440x1024x24 -ac +extension GLX +extension RANDR +extension RENDER -noreset
 Restart=always
 RestartSec=3
 
@@ -82,7 +84,13 @@ Environment=DISPLAY=:99
 # -listen localhost: Sadece local interface'te dinler, dışa kapalı
 # -forever: x11vnc bağlantı sonrası kapanmasın
 # -shared: Birden fazla VNC client bağlanabilsin
-ExecStart=/usr/bin/x11vnc -display :99 -nopw -forever -shared -listen localhost -rfbport 5900 -nocursor
+# -noxdamage: Xvfb'de damage extension broken — polling kullan, yoksa frame
+#   update'leri eksik gelir (yazarken karakterler kayboluyor gibi görünür)
+# -defer 1 -wait 5: frame debounce — daha az ama daha tutarlı update
+# -ping 10: 10sn'de bir keepalive RFB frame → idle WebSocket TCP düşmez
+# -ncache 10 -ncache_cr: offscreen pixel caching, scroll/menu akıcılığı
+# -nocursor KALDIRILDI — cursor görünür, yazma pozisyonu takip edilebilir
+ExecStart=/usr/bin/x11vnc -display :99 -nopw -forever -shared -listen localhost -rfbport 5900 -noxdamage -defer 1 -wait 5 -ping 10 -ncache 10 -ncache_cr
 Restart=always
 RestartSec=3
 

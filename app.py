@@ -6075,8 +6075,25 @@ with st.sidebar:
             init_started_at = st.session_state.get(f"init_started_{p.id}", 0)
             if VNC_ENABLED and init_started_at and (time.time() - init_started_at) < 600:
                 # Init son 10 dk'da başlatıldı — VNC linki göster
+                # noVNC URL parametreleri:
+                # - autoconnect=1: "Bağlan" tıklamaya gerek yok
+                # - resize=scale: viewport'a sığ, scroll yok
+                # - quality=6, compression=2: dengeli (default)
+                # - show_dot=true: cursor görünmediğinde nokta göster (yazma pozisyonu)
+                # - reconnect=true, reconnect_delay=2000: WebSocket koparsa
+                #   2sn sonra otomatik yeniden bağlan (kopma UX'i)
+                vnc_url = (
+                    "/vnc/vnc.html"
+                    "?autoconnect=1"
+                    "&resize=scale"
+                    "&quality=6"
+                    "&compression=2"
+                    "&show_dot=true"
+                    "&reconnect=true"
+                    "&reconnect_delay=2000"
+                )
                 st.markdown(
-                    '<a href="/vnc/" target="_blank" '
+                    f'<a href="{vnc_url}" target="_blank" '
                     'style="display:block; text-align:center; padding:8px 10px; '
                     'background:#10B981; color:white; border-radius:6px; '
                     'text-decoration:none; font-size:0.85rem; font-weight:600; margin-top:6px;">'

@@ -456,9 +456,15 @@ def run_init(profile_dir: Path, authuser: int, emitter: EventEmitter) -> int:
     import random
     port = random.randint(9300, 9899)
 
-    # Manuel test'te çalışan minimal flag set'i — Playwright'ın 40+ flag'i
-    # Xvfb'de SIGTRAP'a sebep oluyor. Burada about:blank'a açıp navigation'ı
-    # CDP üzerinden Playwright'a yaptırıyoruz.
+    # --app= mode: chromeless single-window (tab bar yok, adres çubuğu yok,
+    # menü yok). Yeni sekme açmak mekanik olarak imkansız. Promo'ları/popup'ları
+    # öldüren flag'ler de eklendi — fresh profile her seferinde first-run
+    # state'inde olduğu için Welcome/Translate/MediaRouter/EU-choice dialogları
+    # her açılışta tetikleniyordu.
+    signin_url = (
+        f"https://accounts.google.com/AccountChooser?"
+        f"continue=https%3A%2F%2Fnotebooklm.google.com%2F&authuser={authuser}"
+    )
     chrome_args = [
         chrome_bin,
         "--no-sandbox",
@@ -466,9 +472,15 @@ def run_init(profile_dir: Path, authuser: int, emitter: EventEmitter) -> int:
         "--enable-unsafe-swiftshader",  # Xvfb'de software GL fallback
         "--no-first-run",
         "--no-default-browser-check",
+        "--disable-default-apps",
+        "--disable-component-update",
+        "--disable-extensions",
+        "--disable-session-crashed-bubble",
+        "--disable-search-engine-choice-screen",
+        "--disable-features=Translate,MediaRouter,OptimizationHints,DesktopPWAsRunOnOsLogin",
         f"--user-data-dir={profile_dir}",
         f"--remote-debugging-port={port}",
-        "about:blank",
+        f"--app={signin_url}",
     ]
     if os.environ.get("DISPLAY", "").startswith(":"):
         chrome_args.insert(1, "--ozone-platform=x11")

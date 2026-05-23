@@ -644,13 +644,37 @@ def run_init(profile_dir: Path, authuser: int, emitter: EventEmitter) -> int:
             # sahte-🟢 koruması; framenav'a güvenmek zorunda değiliz.
             def _save_if_notebooklm_loaded() -> None:
                 try:
-                    for _p in (context.pages or []):
-                        url = (_p.url or "").lower()
-                        if "notebooklm.google.com" in url and "accounts.google.com" not in url:
-                            _save_storage_state(reason="poll")
-                            return
-                except Exception:
-                    pass
+                    # DEBUG: tüm context'lerdeki tüm page URL'lerini topla
+                    all_urls = []
+                    for ctx in browser.contexts:
+                        for _p in (ctx.pages or []):
+                            try:
+                                all_urls.append(_p.url or "(empty)")
+                            except Exception as ue:
+                                all_urls.append(f"(err: {ue})")
+                    emitter.emit("poll_debug", urls=all_urls, n_contexts=len(browser.contexts))
+
+                    # Notebooklm.google.com'da olan page var mı? Onun context'inden save et.
+                    for ctx in browser.contexts:
+                        for _p in (ctx.pages or []):
+                            url = (_p.url or "").lower()
+                            if "notebooklm.google.com" in url and "accounts.google.com" not in url:
+                                # Cookie'leri spesifik bu context'ten al
+                                try:
+                                    state = ctx.storage_state()
+                                    n = len(state.get("cookies") or [])
+                                    if n >= best_save["n_cookies"]:
+                                        tmp = auth_json.with_suffix(".json.tmp")
+                                        tmp.write_text(json.dumps(state), encoding="utf-8")
+                                        tmp.replace(auth_json)
+                                        best_save["n_cookies"] = n
+                                        emitter.emit("auth_saved", path=str(auth_json), cookies=n, reason="poll_ctx")
+                                        saved_once["value"] = True
+                                except Exception as se:
+                                    emitter.emit("poll_save_error", error=str(se)[:200])
+                                return
+                except Exception as e:
+                    emitter.emit("poll_error", error=str(e)[:200])
 
             _last_periodic = 0.0
             while True:

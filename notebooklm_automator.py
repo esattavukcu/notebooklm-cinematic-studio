@@ -632,21 +632,31 @@ def run_init(profile_dir: Path, authuser: int, emitter: EventEmitter) -> int:
                 hint="Tarayıcıda Google ile giriş yap, ardından pencereyi kapat.",
             )
 
-            # Chrome'un ölümünü port-polling ile izle + periyodik save.
-            # Her 5 sn'de bir state'i yakala — AMA sadece kullanıcı en az bir
-            # kez notebooklm.google.com'a ulaştıktan sonra. Aksi takdirde
-            # signin sayfasında bekleme cookies'i (NID, CONSENT) auth.json'a
-            # yazılır ve admin UI yanlışlıkla 🟢 "initialized" gösterir.
-            # saved_once["value"] sadece _on_framenav notebooklm'e ulaşınca
-            # True olur — bu, gerçek bir login completion proxy'si.
+            # Chrome'un ölümünü port-polling ile izle + periyodik URL-bazlı save.
+            #
+            # framenavigated listener event-based bir mekanizma ama bazı durumlarda
+            # fire etmiyor (Playwright CDP race, cross-origin redirect, SPA nav).
+            # Sahte-🟢 problemini önlemek için "saved_once kullan" yaklaşımı bu
+            # senaryolarda hiç save yapmıyordu.
+            #
+            # Yeni yaklaşım: Her 3 sn'de aktif page'leri tara. Biri gerçekten
+            # notebooklm.google.com'daysa (login bitmiş demek) save et. URL check
+            # sahte-🟢 koruması; framenav'a güvenmek zorunda değiliz.
+            def _save_if_notebooklm_loaded() -> None:
+                try:
+                    for _p in (context.pages or []):
+                        url = (_p.url or "").lower()
+                        if "notebooklm.google.com" in url and "accounts.google.com" not in url:
+                            _save_storage_state(reason="poll")
+                            return
+                except Exception:
+                    pass
+
             _last_periodic = 0.0
             while True:
                 now = time.time()
-                if now - _last_periodic >= 5.0 and saved_once["value"]:
-                    try:
-                        _save_storage_state(reason="periodic")
-                    except Exception:
-                        pass
+                if now - _last_periodic >= 3.0:
+                    _save_if_notebooklm_loaded()
                     _last_periodic = now
                 try:
                     urllib.request.urlopen(cdp_url, timeout=2)

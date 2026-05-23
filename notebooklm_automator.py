@@ -456,15 +456,19 @@ def run_init(profile_dir: Path, authuser: int, emitter: EventEmitter) -> int:
     import random
     port = random.randint(9300, 9899)
 
-    # --app= mode: chromeless single-window (tab bar yok, adres çubuğu yok,
-    # menü yok). Yeni sekme açmak mekanik olarak imkansız. Promo'ları/popup'ları
-    # öldüren flag'ler de eklendi — fresh profile her seferinde first-run
-    # state'inde olduğu için Welcome/Translate/MediaRouter/EU-choice dialogları
-    # her açılışta tetikleniyordu.
+    # Pencere modu sunucu/lokal ayrımına göre:
+    # - SUNUCU (DISPLAY=:N, Xvfb): --app=URL chromeless single-window. VNC'de
+    #   tab açıp kapanma + first-run promo'ları sorun yaratıyordu, --app bunları
+    #   mekanik olarak imkansızlaştırıyor.
+    # - LOKAL (Mac/Windows native): normal pencere (tab bar + adres çubuğu).
+    #   Google'ın login redirect chain'i bazen notebooklm.google.com'a ulaşmadan
+    #   farklı bir sayfaya düşüyor (consent, account chooser, "Verify it's you")
+    #   — chromeless modda kullanıcı manuel URL yazıp kurtaramıyordu.
     signin_url = (
         f"https://accounts.google.com/AccountChooser?"
         f"continue=https%3A%2F%2Fnotebooklm.google.com%2F&authuser={authuser}"
     )
+    is_xvfb = os.environ.get("DISPLAY", "").startswith(":")
     chrome_args = [
         chrome_bin,
         "--no-sandbox",
@@ -480,11 +484,15 @@ def run_init(profile_dir: Path, authuser: int, emitter: EventEmitter) -> int:
         "--disable-features=Translate,MediaRouter,OptimizationHints,DesktopPWAsRunOnOsLogin",
         f"--user-data-dir={profile_dir}",
         f"--remote-debugging-port={port}",
-        f"--app={signin_url}",
     ]
-    if os.environ.get("DISPLAY", "").startswith(":"):
+    if is_xvfb:
+        # Sunucu/VNC: chromeless --app + X11 ozone
         chrome_args.insert(1, "--ozone-platform=x11")
         chrome_args.insert(2, "--disable-gpu")
+        chrome_args.append(f"--app={signin_url}")
+    else:
+        # Lokal: normal pencere, URL bar açık → user manuel navigate edebilir
+        chrome_args.append(signin_url)
     # CHROME_PROXY_SERVER → Chromium'u proxy üzerinden başlatır.
     # Kullanım: yeni bir hesabı sunucu IP'sine bağlı olarak login etmek için
     # SSH SOCKS tunnel ile birlikte ("ssh -D 1080 ..." sonra

@@ -118,7 +118,11 @@ EOF
 
 echo "==> [3/4] Servisleri başlat..."
 $SUDO systemctl daemon-reload
-$SUDO systemctl enable --now xvfb x11vnc novnc
+$SUDO systemctl enable xvfb x11vnc novnc
+# restart şart — unit dosyası değişmiş olabilir (yeni install veya update).
+# enable --now sadece pasif servisleri başlatır, çalışanları restart etmez.
+# Çalışan servisi yeni unit content'ine almak için explicit restart gerekir.
+$SUDO systemctl restart xvfb x11vnc novnc
 sleep 2
 
 echo

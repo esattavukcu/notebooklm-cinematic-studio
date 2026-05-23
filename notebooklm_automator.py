@@ -644,15 +644,61 @@ def run_init(profile_dir: Path, authuser: int, emitter: EventEmitter) -> int:
             # sahte-🟢 koruması; framenav'a güvenmek zorunda değiliz.
             def _save_if_notebooklm_loaded() -> None:
                 try:
-                    # DEBUG: tüm context'lerdeki tüm page URL'lerini topla
-                    all_urls = []
+                    # DEBUG: Playwright görünümü
+                    pw_urls = []
                     for ctx in browser.contexts:
                         for _p in (ctx.pages or []):
                             try:
-                                all_urls.append(_p.url or "(empty)")
+                                pw_urls.append(_p.url or "(empty)")
                             except Exception as ue:
-                                all_urls.append(f"(err: {ue})")
-                    emitter.emit("poll_debug", urls=all_urls, n_contexts=len(browser.contexts))
+                                pw_urls.append(f"(err: {ue})")
+                    # DEBUG: RAW CDP görünümü (Playwright'ı bypass et)
+                    raw_targets = []
+                    try:
+                        with urllib.request.urlopen(
+                            f"http://127.0.0.1:{port}/json/list", timeout=2
+                        ) as r:
+                            data = json.loads(r.read())
+                            raw_targets = [
+                                {"type": t.get("type"), "url": (t.get("url") or "")[:120]}
+                                for t in data
+                            ]
+                    except Exception as re:
+                        raw_targets = [{"err": str(re)[:100]}]
+                    emitter.emit(
+                        "poll_debug",
+                        pw_urls=pw_urls,
+                        pw_contexts=len(browser.contexts),
+                        raw_targets=raw_targets,
+                    )
+
+                    # Raw CDP'de notebooklm tab varsa save et. Playwright pages
+                    # listesine güvenmiyoruz — bazı durumlarda outdated.
+                    has_notebooklm = any(
+                        "notebooklm.google.com" in (t.get("url") or "").lower()
+                        and "accounts.google.com" not in (t.get("url") or "").lower()
+                        for t in raw_targets
+                    )
+                    if has_notebooklm:
+                        # Context'lerden cookies topla — hangi context'te olduğu
+                        # önemli değil, ana hedef session cookie'leri.
+                        for ctx in browser.contexts:
+                            try:
+                                state = ctx.storage_state()
+                                n = len(state.get("cookies") or [])
+                                if n >= best_save["n_cookies"]:
+                                    tmp = auth_json.with_suffix(".json.tmp")
+                                    tmp.write_text(json.dumps(state), encoding="utf-8")
+                                    tmp.replace(auth_json)
+                                    best_save["n_cookies"] = n
+                                    emitter.emit(
+                                        "auth_saved", path=str(auth_json),
+                                        cookies=n, reason="poll_raw",
+                                    )
+                                    saved_once["value"] = True
+                                    return
+                            except Exception as se:
+                                emitter.emit("poll_save_error", error=str(se)[:200])
 
                     # Notebooklm.google.com'da olan page var mı? Onun context'inden save et.
                     for ctx in browser.contexts:

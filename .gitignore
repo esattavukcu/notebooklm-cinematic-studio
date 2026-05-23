@@ -14,3 +14,6 @@ launcher.log
 .pytest_cache/
 build/
 dist/
+
+# deploy/deploy.sh state — her sunucu kendi son-deploy HEAD'ini tutar
+.last-deployed-head

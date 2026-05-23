@@ -591,20 +591,41 @@ def run_init(profile_dir: Path, authuser: int, emitter: EventEmitter) -> int:
                 if "notebooklm.google.com" in url:
                     _save_storage_state(reason="framenav")
 
+            def _attach_to_page(p) -> None:
+                """framenavigated listener'ı bir page'e tak (idempotent)."""
+                try:
+                    p.on("framenavigated", _on_framenav)
+                except Exception:
+                    pass
+
+            # Mevcut tüm page'lere tak — normal Chrome açılışında birden fazla
+            # page olabiliyor (new tab + signin URL). Sadece pages[0]'a takarsak
+            # notebooklm sayfası başka page'de açılırsa event'i kaçırırız.
+            for _p in (context.pages or []):
+                _attach_to_page(_p)
+            # Yeni açılan page'lere de tak (Google login sürecinde popup/window
+            # açılabilir, sonra notebooklm'e oradan ulaşılabilir)
             try:
-                page.on("framenavigated", _on_framenav)
+                context.on("page", _attach_to_page)
             except Exception:
                 pass
 
-            # Chrome about:blank'te açıldı; şimdi Google login'e yönlendir
-            try:
-                page.goto(
-                    f"{DEFAULT_HOMEPAGE}?authuser={authuser}",
-                    wait_until="domcontentloaded",
-                    timeout=30000,
-                )
-            except Exception as e:
-                emitter.emit("init_nav_warning", error=str(e)[:200])
+            # Chrome açılışında zaten signin URL'ine gitti (chrome_args'ta
+            # positional). page.goto ile garantilemeye gerek yok — bazı
+            # durumlarda goto first page'e zorlandığında notebooklm yerine
+            # signin'i tekrar yükleyip kullanıcının ilerlemesini sıfırlayabilir.
+            # Sadece "active page yok" durumunda fallback olarak goto:
+            if not context.pages:
+                try:
+                    page = context.new_page()
+                    _attach_to_page(page)
+                    page.goto(
+                        f"{DEFAULT_HOMEPAGE}?authuser={authuser}",
+                        wait_until="domcontentloaded",
+                        timeout=30000,
+                    )
+                except Exception as e:
+                    emitter.emit("init_nav_warning", error=str(e)[:200])
 
             emitter.emit(
                 "init_waiting_for_close",

@@ -88,9 +88,11 @@ Environment=DISPLAY=:99
 #   update'leri eksik gelir (yazarken karakterler kayboluyor gibi görünür)
 # -defer 1 -wait 5: frame debounce — daha az ama daha tutarlı update
 # -ping 10: 10sn'de bir keepalive RFB frame → idle WebSocket TCP düşmez
-# -ncache 10 -ncache_cr: offscreen pixel caching, scroll/menu akıcılığı
 # -nocursor KALDIRILDI — cursor görünür, yazma pozisyonu takip edilebilir
-ExecStart=/usr/bin/x11vnc -display :99 -nopw -forever -shared -listen localhost -rfbport 5900 -noxdamage -defer 1 -wait 5 -ping 10 -ncache 10 -ncache_cr
+# NOT: -ncache flag'i bilerek kullanılmıyor — framebuffer'ı 10x büyütüp altına
+# offscreen cache alanı ekliyor. Native VNC viewer'lar bu cache'i kırpıyor ama
+# noVNC bilmiyor → ekranın çoğu siyah cache alanı olarak görünüyor.
+ExecStart=/usr/bin/x11vnc -display :99 -nopw -forever -shared -listen localhost -rfbport 5900 -noxdamage -defer 1 -wait 5 -ping 10
 Restart=always
 RestartSec=3
 

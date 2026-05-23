@@ -1681,6 +1681,38 @@ def search_images(query: str, limit: int = 12,
 
 
 # ---------------------------------------------------------------------------
+# Auth failure detection
+# ---------------------------------------------------------------------------
+# NotebookLM cookies expire, signin redirect, vs. yedi mi? Bu fonksiyon hem
+# pipeline stage'ine hem error mesajına bakarak geniş yakalama yapar. Eskiden
+# sadece `e.stage == "auth"` kontrolü vardı — ama cookies pipeline ortasında
+# (örn. video_gen) expire olursa stage başka oluyor, auth handler tetiklenmiyor
+# ve aynı profile'a 20 job daha gönderiliyordu.
+_AUTH_FAIL_PATTERNS = (
+    "redirected to login",
+    "accounts.google.com",
+    "/signin",
+    "auth token",
+    "auth.json",
+    "nlm auth",
+    "login_required",
+    "login required",
+    "session expired",
+    "unauthorized",
+    "401",
+    "403",
+)
+
+
+def is_auth_failure(stage: str, error_msg: str) -> bool:
+    """Pipeline stage veya error mesajından auth fail çıkarımı."""
+    if (stage or "").lower() == "auth":
+        return True
+    msg = (error_msg or "").lower()
+    return any(pat in msg for pat in _AUTH_FAIL_PATTERNS)
+
+
+# ---------------------------------------------------------------------------
 # Worker — background dispatcher thread
 # ---------------------------------------------------------------------------
 class Worker:
@@ -2012,6 +2044,71 @@ class Worker:
                 )
         if changed:
             save_profiles(profiles)
+
+    def _handle_auth_failure(self, profile_id: str, profile_name: str,
+                             job_id: str, err_msg: str) -> None:
+        """Auth fail merkezi handler — 3 dağınık akış yerine tek giriş noktası.
+
+        Yapılan iş:
+        1. Job'u "queued"a geri al (status reset, profile_id temizle) — quota
+           pattern'iyle aynı. Dispatcher başka müsait profile'a gönderir.
+           Job'un error alanına AUTH_FAIL: prefix'i bırak (debugging için).
+        2. Profile init=False yap (idempotent — sadece ilk transition aktif iş yapar):
+           - auth.json sil ki sahte initialized=True tekrar tetiklenmesin
+           - Slack notification gönder (admin re-login yapması için)
+        3. İkinci ve sonraki çağrılar (zaten init=False ise) — sadece job
+           requeue, Slack/file delete tekrar yapılmaz (spam önlenir).
+        """
+        # 1) Job'u queued'a geri al
+        jobs_all = load_jobs()
+        target_title = ""
+        for j in jobs_all:
+            if j.id == job_id:
+                target_title = j.title
+                j.status = "queued"
+                # AUTH_FAIL marker — log/debug için, dispatch'te clear olur
+                j.error = f"AUTH_FAIL ({profile_name}): {str(err_msg)[:200]}"
+                j.profile_id = ""
+                j.profile_name = ""
+                j.started_at = 0.0
+                j.finished_at = 0.0
+                j.notebook_url = ""
+                j.pid = 0
+                break
+        save_jobs(jobs_all)
+        launcher_log(
+            f"Job {job_id} AUTH_FAIL on {profile_name} → requeued: {err_msg[:120]}"
+        )
+
+        # 2) Profile state transition (idempotent)
+        ps = load_profiles()
+        was_initialized = False
+        for p in ps:
+            if p.id == profile_id:
+                was_initialized = p.initialized
+                p.initialized = False
+                break
+        if was_initialized:
+            save_profiles(ps)
+            # auth.json sil → sahte initialized tekrar tetiklenmesin
+            try:
+                auth_p = PROFILES_DIR / profile_id / "auth.json"
+                if auth_p.exists():
+                    auth_p.unlink()
+            except OSError:
+                pass
+            # Slack: ilk transition'da TEK kez bildir
+            send_slack_message(
+                f"🚨 *Hesap yetkisiz:* `{profile_name}`\n"
+                f"NotebookLM session expired. Bu profile'a artık iş gönderilmiyor.\n"
+                f"Admin panelden 'Yeniden giriş' yapılması gerek.\n"
+                f"Job: _{target_title[:120]}_ (kuyruğa geri alındı, başka profile denenecek)"
+            )
+            launcher_log(
+                f"Profile {profile_name} ({profile_id}) AUTH_FAIL transition: "
+                f"init=True → init=False, auth.json silindi, Slack gönderildi"
+            )
+        # else: zaten init=False — başka bir job aynı anda failed olmuş, no-op
 
     def _today_count_for(self, jobs: list[Job], profile_id: str) -> int:
         today = date.today()
@@ -2514,7 +2611,21 @@ class Worker:
                         "raw": str(e)[:500],
                     })
                     return
-                # Hata: job status=failed + auth ise profile init=False
+                # Auth detection — sadece e.stage="auth" değil, ortada
+                # expire olan cookies de pipeline'ın herhangi bir aşamasında
+                # signin redirect'ine düşebilir.
+                if is_auth_failure(e.stage, str(e)):
+                    log_fp.write(
+                        f"## AUTH_FAIL detected (stage={e.stage}) → "
+                        f"requeue job + mark profile init=False + Slack\n"
+                    )
+                    log_fp.flush()
+                    self._handle_auth_failure(
+                        profile.id, profile.name, job_id,
+                        f"{e.stage}: {str(e)[:200]}"
+                    )
+                    return
+                # Diğer hatalar — sadece job failed
                 jobs_all = load_jobs()
                 for j in jobs_all:
                     if j.id == job_id:
@@ -2523,20 +2634,6 @@ class Worker:
                         j.finished_at = time.time()
                         break
                 save_jobs(jobs_all)
-                if e.stage == "auth":
-                    # Profile re-init gerek
-                    try:
-                        auth_p = auth_path_for(profile.id)
-                        if auth_p.exists():
-                            auth_p.unlink()
-                        ps = load_profiles()
-                        for p in ps:
-                            if p.id == profile.id:
-                                p.initialized = False
-                                break
-                        save_profiles(ps)
-                    except Exception:
-                        pass
                 return
 
             # 3. Başarı — Job güncelle
@@ -2661,37 +2758,14 @@ class Worker:
                 auth_token = fetch_nlm_auth_token(cookies, authuser=profile.authuser)
                 log_fp.write(f"## auth: token fetched ({auth_token[:6]}…{auth_token[-4:]})\n")
             except NlmError as e:
-                # Token expired ya da cookie geçersiz — Playwright init gerek
+                # Token expired ya da cookie geçersiz — auth fail.
+                # Tek bir handler: job requeue + profile deinit + Slack.
                 log_fp.write(f"## auth FAIL: {e}\n")
                 log_fp.flush()
-                self._apply_event(job_id, {
-                    "type": "automation_error",
-                    "error": f"NLM auth: {str(e)[:200]}",
-                })
-                # Job'ı failed olarak işaretle
-                jobs_all = load_jobs()
-                for j in jobs_all:
-                    if j.id == job_id:
-                        j.status = "failed"
-                        j.error = f"NLM auth: {str(e)[:200]}"
-                        j.finished_at = time.time()
-                        # auth.json'u sil ki "Hesabı aktive et" tekrar gözüksün
-                        try:
-                            auth_json.unlink()
-                        except OSError:
-                            pass
-                        # Profile'i initialized=False yap
-                        try:
-                            ps = load_profiles()
-                            for p in ps:
-                                if p.id == profile.id:
-                                    p.initialized = False
-                                    break
-                            save_profiles(ps)
-                        except Exception:
-                            pass
-                        break
-                save_jobs(jobs_all)
+                self._handle_auth_failure(
+                    profile.id, profile.name, job_id,
+                    f"NLM auth: {str(e)[:200]}"
+                )
                 return
             log_fp.flush()
 
@@ -2898,27 +2972,16 @@ class Worker:
             target.pid = 0
             launcher_log(f"Job {target.id} requeued: {target.profile_name} kotası dolu, başka profile denenecek.")
         elif etype in ("login_required_headless", "login_timeout"):
-            target.error = (
-                "Hesap login süresi geçmiş veya hiç yapılmamış. "
-                "Yöneticinin admin panelinden 'Yeniden giriş' yapması gerek."
+            # Auth fail: merkez handler — requeue + init=False + Slack
+            # (idempotent transition: ilk düşüşte Slack, sonraki çağrılarda no-op).
+            # Handler kendi load_jobs/save_jobs yapar — burada erken return ile
+            # alttaki save_jobs(jobs)'un handler'ın yazdığını üzerine yazmasını
+            # engelliyoruz.
+            self._handle_auth_failure(
+                target.profile_id, target.profile_name, target.id,
+                f"login event: {etype}",
             )
-            # Profili initialized=False yap ki dispatch tekrar denemesin
-            try:
-                ps = load_profiles()
-                for p in ps:
-                    if p.id == target.profile_id:
-                        p.initialized = False
-                        # auth.json'u sil ki yenisi yazılana kadar geçerli sayılmasın
-                        auth = PROFILES_DIR / p.id / "auth.json"
-                        if auth.exists():
-                            try:
-                                auth.unlink()
-                            except OSError:
-                                pass
-                        break
-                save_profiles(ps)
-            except Exception:
-                pass
+            return
         elif etype == "automation_complete":
             # Eğer quota_exceeded başka event tarafından zaten queued'a alındıysa
             # (kota auto-retry), bu event'i skip et — yoksa failed'e override eder.

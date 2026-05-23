@@ -6722,29 +6722,48 @@ with tab_status:
     elif not jobs_display:
         st.info(f"Bu filtrede (`{_jf}`) gösterilecek job yok.", icon="🔍")
     else:
-        jobs_sorted = sorted(jobs_display, key=lambda j: j.created_at, reverse=True)
+        # Sort key gösterilen tarihle aynı olsun — yoksa sort ve display
+        # farklı timestamp'e bakar (ör. created_at vs started_at) ve user'a
+        # tutarsız görünür. "En son aktif" tarihi tercih ediyoruz: finished_at
+        # > started_at > created_at. Bu sayede yeni başlamış/bitmiş job'lar
+        # her zaman tepede olur.
+        def _job_sort_ts(j: "Job") -> float:
+            return j.finished_at or j.started_at or j.created_at
+
+        jobs_sorted = sorted(jobs_display, key=_job_sort_ts, reverse=True)
+
+        # Kolon sırası: TARİH en sola alındı (user'ın isteği — kronolojik
+        # tarama için ana gözlem ekseni). Sırasıyla:
+        # TARİH | DURUM | BAŞLIK | PROFİL | SÜRE | NOTEBOOK/HATA | İŞLEM
+        _col_widths = [1.2, 1.1, 3.2, 1.6, 0.9, 2.6, 1.2]
 
         st.markdown('<div class="job-row-wrap">', unsafe_allow_html=True)
         # Header (geniş ekranda görünür, dar ekranda CSS gizler)
         st.markdown('<div class="job-header">', unsafe_allow_html=True)
-        h = st.columns([1.1, 3.2, 1.6, 1, 1, 2.6, 1.2])
-        h[0].markdown("<small style='opacity:0.7; font-weight:600;'>DURUM</small>", unsafe_allow_html=True)
-        h[1].markdown("<small style='opacity:0.7; font-weight:600;'>BAŞLIK</small>", unsafe_allow_html=True)
-        h[2].markdown("<small style='opacity:0.7; font-weight:600;'>PROFİL / GÖNDEREN</small>", unsafe_allow_html=True)
-        h[3].markdown("<small style='opacity:0.7; font-weight:600;'>TARİH</small>", unsafe_allow_html=True)
+        h = st.columns(_col_widths)
+        h[0].markdown("<small style='opacity:0.7; font-weight:600;'>TARİH</small>", unsafe_allow_html=True)
+        h[1].markdown("<small style='opacity:0.7; font-weight:600;'>DURUM</small>", unsafe_allow_html=True)
+        h[2].markdown("<small style='opacity:0.7; font-weight:600;'>BAŞLIK</small>", unsafe_allow_html=True)
+        h[3].markdown("<small style='opacity:0.7; font-weight:600;'>PROFİL / GÖNDEREN</small>", unsafe_allow_html=True)
         h[4].markdown("<small style='opacity:0.7; font-weight:600;'>SÜRE</small>", unsafe_allow_html=True)
         h[5].markdown("<small style='opacity:0.7; font-weight:600;'>NOTEBOOK / HATA</small>", unsafe_allow_html=True)
         h[6].markdown("<small style='opacity:0.7; font-weight:600;'>İŞLEM</small>", unsafe_allow_html=True)
         st.markdown('</div>', unsafe_allow_html=True)
 
         for j in jobs_sorted:
-            cs = st.columns([1.1, 3.2, 1.6, 1, 1, 2.6, 1.2])
-            cs[0].markdown(status_pill(j.status), unsafe_allow_html=True)
+            cs = st.columns(_col_widths)
+            # cs[0]: TARİH (en sol)
+            _ts = _job_sort_ts(j)
+            cs[0].markdown(f"<span style='font-size:0.85rem;'>{fmt_datetime(_ts)}</span>", unsafe_allow_html=True)
+            # cs[1]: DURUM
+            cs[1].markdown(status_pill(j.status), unsafe_allow_html=True)
+            # cs[2]: BAŞLIK
             title_short = j.title if len(j.title) <= 90 else j.title[:89] + "…"
-            cs[1].markdown(
+            cs[2].markdown(
                 f'<div style="font-size:0.92rem; line-height:1.35;" title="{j.title}">{title_short}</div>',
                 unsafe_allow_html=True,
             )
+            # cs[3]: PROFİL / GÖNDEREN
             profile_short = (j.profile_name or "—")
             if len(profile_short) > 22:
                 profile_short = profile_short[:21] + "…"
@@ -6753,13 +6772,12 @@ with tab_status:
                 f'<div style="font-size:0.74rem; opacity:0.65; margin-top:2px;">'
                 f'gönderen: <b>{submitter}</b></div>'
             ) if submitter else ""
-            cs[2].markdown(
+            cs[3].markdown(
                 f'<div style="font-size:0.85rem; opacity:0.85;" title="{j.profile_name}">{profile_short}</div>'
                 f'{submitter_html}',
                 unsafe_allow_html=True,
             )
-            _ts = j.started_at or j.created_at  # queued job'larda started_at = 0
-            cs[3].markdown(f"<span style='font-size:0.85rem;'>{fmt_datetime(_ts)}</span>", unsafe_allow_html=True)
+            # cs[4]: SÜRE
             cs[4].markdown(f"<span style='font-size:0.85rem;'>{fmt_duration(j.started_at, j.finished_at)}</span>", unsafe_allow_html=True)
 
             with cs[5]:

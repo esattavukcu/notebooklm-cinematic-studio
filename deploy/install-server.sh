@@ -43,6 +43,12 @@ $SUDO apt-get install -y -qq \
 PY_VER=$(python3 -c 'import sys; print("%d.%d" % sys.version_info[:2])')
 echo "    Python $PY_VER tespit edildi."
 
+# Timezone: Europe/Istanbul (+03). UI'da gösterilen saatler ve "bugün" sayacı
+# Türkiye saatine göre çalışsın diye. EC2 default'u UTC.
+echo "==> Timezone Europe/Istanbul olarak ayarlanıyor..."
+$SUDO timedatectl set-timezone Europe/Istanbul
+echo "    $(date)"
+
 echo "==> [2/6] Repo klonlanıyor..."
 if [ -d "$APP_DIR/.git" ]; then
   echo "    Zaten var, pull ediliyor..."

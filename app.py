@@ -136,6 +136,13 @@ TERMINAL_STATUSES = {"done", "failed", "submitted", "stopped"}
 # done       = video harvest edildi (+ Azure'a yüklendi); gerçekten tamamlandı.
 HARVEST_PICKUP_STATUSES = {"generating", "done"}  # geriye dönük uyum için "done" da
 
+# Environment routing — URL ?env=dev|prod. Worker thread'i bunu module-load
+# sırasında okuduğu için ÇOK ERKEN tanımlı olması şart (race condition fix).
+ALLOWED_ENVS = ("dev", "prod")
+DEFAULT_ENV = os.environ.get("DEFAULT_ENV", "dev").strip().lower()
+if DEFAULT_ENV not in ALLOWED_ENVS:
+    DEFAULT_ENV = "dev"
+
 DISPATCH_INTERVAL_SEC = 2.0
 # Profil NotebookLM kota hatası yedikten sonra kaç saat block kalır?
 # Google'ın gerçek reset zamanı Pacific time (~07-08:00 UTC) — bizim UTC date
@@ -3810,18 +3817,8 @@ def _is_admin() -> bool:
     return bool(auth and auth.get("role") == "admin")
 
 
-# Environment routing — URL ?env=dev|prod. Dev/prod fiziksel olarak aynı
-# app ama dispatcher + storage + UI env'e göre bölünür.
-ALLOWED_ENVS = ("dev", "prod")
-# Default env: URL param + session yoksa hangi env gösterilsin?
-# Şu an "dev" — mevcut 8 hesabın hepsi dev'de, prod boş. Prod hesapları
-# eklenince DEFAULT_ENV=prod yap ki canlı kullanıcılar default prod görsün.
-# .env'den DEFAULT_ENV=prod override edilebilir (deploy-time switch).
-DEFAULT_ENV = os.environ.get("DEFAULT_ENV", "dev").strip().lower()
-if DEFAULT_ENV not in ALLOWED_ENVS:
-    DEFAULT_ENV = "dev"
-
-
+# ALLOWED_ENVS / DEFAULT_ENV: yukarıda ~line 140 civarında tanımlı (worker
+# thread race condition fix). current_env() onları kullanır.
 def current_env() -> str:
     """URL ?env=... param'ı oku. Sonra session_state'e cache (refresh sonrası
     da kalsın). Default DEFAULT_ENV (env-config'den).

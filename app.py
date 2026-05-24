@@ -2601,14 +2601,22 @@ class Worker:
                     ))
                 )
                 if is_quota:
+                    # Mid-flight (video_wait/video_download): gen başlamış, Google
+                    # tarafında video üretiliyor. Job'u demote ETME — notebook_url'i
+                    # koru ki stale-resume sweeper kurtarabilsin. Sadece profile'ı
+                    # blokla (yeni iş düşmesin).
+                    mid_flight = e.stage in ("video_wait", "video_download")
                     log_fp.write(
-                        f"## quota_exceeded detected (stage={e.stage}) → "
-                        f"requeue job + mark profile blocked today\n"
+                        f"## quota_exceeded detected (stage={e.stage}, "
+                        f"mid_flight={mid_flight}) → "
+                        f"{'preserve generating' if mid_flight else 'requeue'} "
+                        f"+ block profile today\n"
                     )
                     log_fp.flush()
                     self._apply_event(job_id, {
                         "type": "quota_exceeded",
                         "raw": str(e)[:500],
+                        "mid_flight": mid_flight,
                     })
                     return
                 # Auth detection — sadece e.stage="auth" değil, ortada
@@ -2935,8 +2943,14 @@ class Worker:
                 target.notebook_url = url
         elif etype == "quota_exceeded":
             # Bu profilin kotası dolmuş — bugün için bir failed kayıt bırak ki
-            # _quota_blocked_today() bu profili pas geçsin. Ama job'un kendisini
-            # queued'a döndür, başka profile dispatch edilsin.
+            # _quota_blocked_today() bu profili pas geçsin.
+            #
+            # mid_flight=True (video_wait/video_download stage'i): gen başlamış,
+            # Google'da üretim devam ediyor. notebook_url'i koru, status="generating"
+            # bırak → stale-resume sweeper kurtarır.
+            # mid_flight=False (video_gen stage'i): gen başlamadı → job'u queued'a
+            # döndür, başka profile dispatch edilsin.
+            mid_flight = bool(evt.get("mid_flight", False))
             quota_marker = Job(
                 id=uuid.uuid4().hex[:12],
                 title=f"[KOTA] {target.title[:50]}",
@@ -2958,19 +2972,31 @@ class Worker:
                 _qb_done = sum(1 for j in _qb_jobs if j.status == "done")
                 _qb_total = len([j for j in _qb_jobs if not j.title.startswith("[KOTA]")])
                 _qb_extra = f"\n📊 Oturum: {_qb_done}/{_qb_total} tamamlandı · {_qb_q} iş kota açılana kadar bekliyor"
-            send_slack_message(
-                f"🚫 *Kota doldu:* `{target.profile_name}`\n"
-                f"Job kuyrukta bekliyor, başka profile aktarıldı: _{target.title[:100]}_{_qb_extra}"
-            )
-            # Asıl job'u queued'a geri al — Worker başka profile dene
-            target.status = "queued"
-            target.profile_id = ""
-            target.profile_name = ""
-            target.started_at = 0.0
-            target.finished_at = 0.0
-            target.notebook_url = ""  # eski profilin oluşturduğu notebook'u unut
-            target.pid = 0
-            launcher_log(f"Job {target.id} requeued: {target.profile_name} kotası dolu, başka profile denenecek.")
+            if mid_flight:
+                # Gen başlamış, Google üretiyor — job'a dokunma, sadece profile blok.
+                send_slack_message(
+                    f"⚠️ *Kota mid-flight:* `{target.profile_name}`\n"
+                    f"Video Google'da üretiliyor, stale-resume bekliyor: "
+                    f"_{target.title[:100]}_{_qb_extra}"
+                )
+                launcher_log(
+                    f"Job {target.id} mid-flight quota ({target.profile_name}): "
+                    f"notebook_url korundu, stale-resume sweeper indirecek."
+                )
+            else:
+                send_slack_message(
+                    f"🚫 *Kota doldu:* `{target.profile_name}`\n"
+                    f"Job kuyrukta bekliyor, başka profile aktarıldı: _{target.title[:100]}_{_qb_extra}"
+                )
+                # Asıl job'u queued'a geri al — Worker başka profile dene
+                target.status = "queued"
+                target.profile_id = ""
+                target.profile_name = ""
+                target.started_at = 0.0
+                target.finished_at = 0.0
+                target.notebook_url = ""  # eski profilin oluşturduğu notebook'u unut
+                target.pid = 0
+                launcher_log(f"Job {target.id} requeued: {target.profile_name} kotası dolu, başka profile denenecek.")
         elif etype in ("login_required_headless", "login_timeout"):
             # Auth fail: merkez handler — requeue + init=False + Slack
             # (idempotent transition: ilk düşüşte Slack, sonraki çağrılarda no-op).

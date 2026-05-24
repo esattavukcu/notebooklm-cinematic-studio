@@ -3373,12 +3373,24 @@ class Worker:
                 )
                 if ok:
                     jobs = load_jobs()
+                    _slack_job = None
                     for j in jobs:
                         if j.id == job_id:
                             j.video_remote_url = url
                             j.harvest_status = "uploaded"
+                            _slack_job = j
                             break
                     save_jobs(jobs)
+                    if _slack_job:
+                        _submitter = (
+                            f" · gönderen: {_slack_job.submitted_by}"
+                            if _slack_job.submitted_by else ""
+                        )
+                        send_slack_message(
+                            f"✅ *Video hazır!*\n"
+                            f"📹 {_slack_job.title[:120]}{_submitter}\n"
+                            f"☁️ {url}"
+                        )
             except Exception:
                 pass
 

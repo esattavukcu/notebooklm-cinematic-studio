@@ -2613,6 +2613,21 @@ class Worker:
                     # koru ki stale-resume sweeper kurtarabilsin. Sadece profile'ı
                     # blokla (yeni iş düşmesin).
                     mid_flight = e.stage in ("video_wait", "video_download")
+                    # Edge case: kota reset anında library video_wait stage'inde
+                    # "artifact was removed by the server" / "disappeared" hatası
+                    # raise edebilir — bu durumda artifact aslında hiç oluşmadı
+                    # (Google quota'ya takılıp sessizce sildi). Notebook boş kalır,
+                    # stale-resume'ın kurtaracağı bir şey yok. mid_flight=False
+                    # yap → job queued'a düşsün, başka profile dispatch edilsin.
+                    if mid_flight and (
+                        "artifact was removed" in err_msg
+                        or "disappeared from list" in err_msg
+                    ):
+                        mid_flight = False
+                        log_fp.write(
+                            "## artifact-never-persisted override → "
+                            "mid_flight=False (requeue to another profile)\n"
+                        )
                     log_fp.write(
                         f"## quota_exceeded detected (stage={e.stage}, "
                         f"mid_flight={mid_flight}) → "

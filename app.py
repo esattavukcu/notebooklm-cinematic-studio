@@ -337,6 +337,7 @@ class Batch:
     last_notified_terminal: int = 0    # son bildirim anındaki terminal (done+failed) sayısı
     queued_empty_notified: bool = False # "sırada bekleyen kalmadı" bildirimi gönderildi mi
     notified_complete: bool = False     # oturum özeti gönderildi mi
+    quota_wall_notified: bool = False   # batch'in tüm profilleri quota-blocked olunca 1× duvar mesajı
     completed_at: float = 0.0
 
 
@@ -1734,6 +1735,9 @@ class Worker:
         # _auto_init_check'in smoke_test FAIL log spam'ini bastırmak için
         # profile_id → son fail timestamp.
         self._smoke_fail_ts: dict[str, float] = {}
+        # Env-eşleşmesiz queued job uyarısını throttle etmek için
+        # env → son uyarı timestamp (saatte 1×).
+        self._env_warn_ts: dict[str, float] = {}
 
     def start(self) -> None:
         if not self._thread.is_alive():
@@ -1849,6 +1853,43 @@ class Worker:
                 )
                 batch.queued_empty_notified = True
                 changed = True
+
+            # -- Kota duvarı bildirimi: tüm queued env'lerinde profil kalmadıysa --
+            # Per-job quota Slack'i kaldırıldı (spam'di). Yerine batch-level
+            # 1× toplu mesaj: tüm profiller bugün için bloke olunca fire eder.
+            if n_q > 0 and not batch.quota_wall_notified:
+                initialized_profiles = [p for p in load_profiles() if p.initialized]
+                queued_envs = set(
+                    (j.environment or "prod").strip().lower()
+                    for j in queued_jobs
+                )
+                blocked_names: set[str] = set()
+                all_walled = True
+                for env in queued_envs:
+                    env_profiles = [p for p in initialized_profiles
+                                    if (p.environment or "prod").strip().lower() == env]
+                    if not env_profiles:
+                        # env-eşleşmesiz queued — env validation flow'unun işi,
+                        # quota duvarı değil. Bu batch için duvar tetikleme.
+                        all_walled = False
+                        break
+                    blocked = [p for p in env_profiles
+                               if self._quota_blocked_today(jobs, p.id)]
+                    if len(blocked) < len(env_profiles):
+                        all_walled = False
+                        break
+                    blocked_names.update(p.name for p in env_profiles)
+                if all_walled and blocked_names:
+                    names_str = ", ".join(sorted(blocked_names))
+                    send_slack_message(
+                        f"🛑 *Kota duvarı*\n"
+                        f"📁 {batch.name}\n"
+                        f"⏳ {n_q} iş yarın quota reset olunca otomatik devam edecek\n"
+                        f"✅ {n_done} tamamlandı · ❌ {n_fail} hatalı\n"
+                        f"👥 Kapalı profiller: {names_str}"
+                    )
+                    batch.quota_wall_notified = True
+                    changed = True
 
             # -- İlerleme bildirimi (her threshold tamamlamada) --
             threshold = max(5, batch.total // 3)
@@ -2188,6 +2229,11 @@ class Worker:
         # Her queued job için, o job'un env'ine uygun (initialized + slot var)
         # profilleri filtrele, en az kullanılan profile assign et.
         # Dev job dev profile'a, prod job prod profile'a gider — kotalar ayrı.
+        # Env-mismatch detection: hangi env'lerde initialized profile var,
+        # uyarı throttling için tut.
+        envs_with_profile = set(
+            (p.environment or "prod").strip().lower() for p in profiles
+        )
         any_dispatched = False
         for job in list(queued):
             job_env = (job.environment or "prod").strip().lower()
@@ -2197,6 +2243,21 @@ class Worker:
                         if (p.environment or "prod").strip().lower() == job_env
                         and slot_map.get(p.id, 0) > 0]
             if not matching:
+                # Env'de hiç initialized profile yoksa bu sessiz takılma'dır
+                # (slot dolu olmasıyla aynı şey değil). Saatte 1× uyarı bas.
+                if job_env not in envs_with_profile:
+                    now = time.time()
+                    if now - self._env_warn_ts.get(job_env, 0.0) > 3600:
+                        env_queued_count = sum(
+                            1 for j in queued
+                            if (j.environment or "prod").strip().lower() == job_env
+                        )
+                        launcher_log(
+                            f"⚠ Dispatcher silent-skip: env={job_env!r} için "
+                            f"initialized profile yok ({env_queued_count} queued job "
+                            f"sonsuza kadar bekleyebilir). Submit env'i doğru mu?"
+                        )
+                        self._env_warn_ts[job_env] = now
                 # Bu env için profil yok veya tüm slot'lar dolu —
                 # job kuyrukta bekler, sonraki round'da tekrar denenir
                 continue
@@ -2727,9 +2788,8 @@ class Worker:
                 if _slack_job:
                     _submitter = f" · gönderen: {_slack_job.submitted_by}" if _slack_job.submitted_by else ""
                     send_slack_message(
-                        f"✅ *Video hazır!*\n"
-                        f"📹 {_slack_job.title[:120]}{_submitter}\n"
-                        f"☁️ {remote_url}"
+                        f"✅ *Video hazır:* <{remote_url}|{_slack_job.title[:120]}>"
+                        f"{_submitter}"
                     )
                 launcher_log(
                     f"Azure upload for {job_id}: "
@@ -2986,29 +3046,19 @@ class Worker:
                 submitted_by="system",
             )
             jobs.append(quota_marker)
-            # Kota bildirimine batch bağlamı ekle
-            _qb_extra = ""
-            if target.batch_id:
-                _qb_jobs = [j for j in jobs if j.batch_id == target.batch_id]
-                _qb_q = sum(1 for j in _qb_jobs if j.status == "queued")
-                _qb_done = sum(1 for j in _qb_jobs if j.status == "done")
-                _qb_total = len([j for j in _qb_jobs if not j.title.startswith("[KOTA]")])
-                _qb_extra = f"\n📊 Oturum: {_qb_done}/{_qb_total} tamamlandı · {_qb_q} iş kota açılana kadar bekliyor"
+            # Slack: per-event spam yerine batch-level "kota duvarı" mesajı
+            # (_batch_monitor_round → _check_quota_wall) — tüm profiller
+            # bugün için bloklanınca 1× toplu bildirim. Burada sadece launcher.log.
             if mid_flight:
                 # Gen başlamış, Google üretiyor — job'a dokunma, sadece profile blok.
-                send_slack_message(
-                    f"⚠️ *Kota mid-flight:* `{target.profile_name}`\n"
-                    f"Video Google'da üretiliyor, stale-resume bekliyor: "
-                    f"_{target.title[:100]}_{_qb_extra}"
-                )
                 launcher_log(
                     f"Job {target.id} mid-flight quota ({target.profile_name}): "
                     f"notebook_url korundu, stale-resume sweeper indirecek."
                 )
             else:
-                send_slack_message(
-                    f"🚫 *Kota doldu:* `{target.profile_name}`\n"
-                    f"Job kuyrukta bekliyor, başka profile aktarıldı: _{target.title[:100]}_{_qb_extra}"
+                launcher_log(
+                    f"Job {target.id} quota ({target.profile_name}): "
+                    f"queued'a alındı, başka profile dispatch edilecek."
                 )
                 # Asıl job'u queued'a geri al — Worker başka profile dene
                 target.status = "queued"
@@ -3018,7 +3068,6 @@ class Worker:
                 target.finished_at = 0.0
                 target.notebook_url = ""  # eski profilin oluşturduğu notebook'u unut
                 target.pid = 0
-                launcher_log(f"Job {target.id} requeued: {target.profile_name} kotası dolu, başka profile denenecek.")
         elif etype in ("login_required_headless", "login_timeout"):
             # Auth fail: merkez handler — requeue + init=False + Slack
             # (idempotent transition: ilk düşüşte Slack, sonraki çağrılarda no-op).
@@ -3402,9 +3451,8 @@ class Worker:
                             if _slack_job.submitted_by else ""
                         )
                         send_slack_message(
-                            f"✅ *Video hazır!*\n"
-                            f"📹 {_slack_job.title[:120]}{_submitter}\n"
-                            f"☁️ {url}"
+                            f"✅ *Video hazır:* <{url}|{_slack_job.title[:120]}>"
+                            f"{_submitter}"
                         )
             except Exception:
                 pass
@@ -4276,15 +4324,28 @@ def render_bulk_drive_section(*, key_prefix: str = "blk") -> None:
     # ---- Submit handler ----
     if submit_btn:
         folder_id = bulk_extract_folder_id(drive_url) if drive_url else None
+        # Env-eşleşmesiz submit'i bloklama: silent-skip dispatcher'ı sonsuz
+        # döngüye sokuyordu (env=dev jobs, env=prod profiles → 34h sessizlik).
+        _submit_env = current_env()
+        _env_profiles = [
+            p for p in load_profiles()
+            if p.initialized and (p.environment or "prod").strip().lower() == _submit_env
+        ]
         if not folder_id:
             st.error("Geçerli Drive klasör URL/ID değil.")
         elif not prompt_template.strip():
             st.error("Custom prompt boş olamaz.")
+        elif not _env_profiles:
+            st.error(
+                f"`{_submit_env}` ortamında initialized profil yok — "
+                f"submit blokludur (jobs dispatch edilmezdi). "
+                f"Önce bir profil ekle ve login et veya farklı env'e geç."
+            )
         else:
             submitter = _user_name() or "bulk"
 
             # current_env'i closure'a yakala (background içinde kullanılır)
-            _bulk_env = current_env()
+            _bulk_env = _submit_env
 
             def _job_factory(title, text, custom_prompt, submitted_by,
                              learning_objectives: str = ""):

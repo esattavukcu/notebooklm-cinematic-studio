@@ -9,9 +9,12 @@
 #   4) Sonunda özet: kaç başarılı, kaç fail
 #
 # Kullanım:
-#   ./deploy/login.sh                # interaktif menü
+#   ./deploy/login.sh                # interaktif menü (numara | a | n | d | q)
 #   ./deploy/login.sh --all          # tüm ⚪'lara peşpeşe
 #   ./deploy/login.sh <profile_id>   # spesifik bir profil
+#
+# İnteraktif menüde 'n' → sunucuda yeni profil yarat + hemen login akışı.
+# İnteraktif menüde 'd' → sunucuda profil sil (profiles.json + chrome_profiles/).
 #
 # Config (env var override edilebilir):
 #   NLM_SSH_KEY     — SSH key path (default: ~/Downloads/dev-internal-00.pem)
@@ -41,6 +44,182 @@ if [ ! -d .venv ]; then
 fi
 
 ssh_run() { ssh -i "$SSH_KEY" -o ConnectTimeout=10 "$SSH_HOST" "$@"; }
+
+# Sunucuya yeni profil ekle. Panel'deki "Hesap oluştur"un birebir aynısı:
+# uuid12 id, authuser=0, daily_limit=3, max_concurrent=1, initialized=False.
+# Başarılıysa new_id'yi stdout'a yazar, PROFILE_LINES + SELECTED_IDS'i günceller.
+add_new_profile() {
+  echo
+  echo "── Yeni profil ──"
+  read -rp "İsim (email vb.): " np_name
+  np_name=$(printf '%s' "$np_name" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')
+  if [ -z "$np_name" ]; then
+    echo "✗ İsim boş olamaz."
+    return 1
+  fi
+
+  read -rp "Environment [prod] / dev: " np_env
+  np_env=$(printf '%s' "$np_env" | tr '[:upper:]' '[:lower:]')
+  np_env="${np_env:-prod}"
+  if [ "$np_env" != "prod" ] && [ "$np_env" != "dev" ]; then
+    echo "✗ Geçersiz environment: $np_env (prod ya da dev olmalı)"
+    return 1
+  fi
+
+  local new_id
+  new_id=$(python3 -c "import uuid; print(uuid.uuid4().hex[:12])")
+
+  # JSON payload'u local'de üret — name'de apostrof/özel karakter olsa bile
+  # shell quoting'inden bağımsız (sys.argv ile geçiyor, json.dumps escape ediyor).
+  local profile_payload
+  profile_payload=$(python3 -c "
+import json, sys, time
+print(json.dumps({
+    'id': sys.argv[1],
+    'name': sys.argv[2],
+    'authuser': 0,
+    'daily_limit': 3,
+    'max_concurrent': 1,
+    'headless': True,
+    'initialized': False,
+    'last_used': 0.0,
+    'created_at': time.time(),
+    'environment': sys.argv[3],
+}))
+" "$new_id" "$np_name" "$np_env")
+
+  echo "→ Sunucuya kaydediliyor: $np_name [$np_env] id=$new_id"
+  local add_out
+  add_out=$(ssh -i "$SSH_KEY" -o ConnectTimeout=10 "$SSH_HOST" \
+    "cd $REMOTE_REPO && python3 -c \"
+import json, sys
+from pathlib import Path
+new_profile = json.loads(sys.stdin.read())
+p = Path('data/profiles.json')
+profiles = json.loads(p.read_text())
+for x in profiles:
+    if x.get('id') == new_profile['id']:
+        print('FAIL: id çakıştı:', new_profile['id']); sys.exit(1)
+    if x.get('name') == new_profile['name']:
+        print('FAIL: bu isimde profil zaten var:', new_profile['name']); sys.exit(1)
+profiles.append(new_profile)
+tmp = p.with_suffix('.json.tmp')
+tmp.write_text(json.dumps(profiles, indent=2))
+tmp.replace(p)
+print('OK')
+\"" <<<"$profile_payload" 2>&1)
+
+  if [ "$add_out" != "OK" ]; then
+    echo "✗ Sunucuya kaydedilemedi: $add_out"
+    return 1
+  fi
+  echo "✓ Sunucuda kaydedildi."
+
+  # Listeye + seçime ekle ki profile_name() ve login akışı bulabilsin
+  PROFILE_LINES+=("$new_id|$np_name|$np_env|N")
+  SELECTED_IDS+=("$new_id")
+  return 0
+}
+
+# Sunucudan profil sil — profiles.json'dan kaydı çıkar + chrome_profiles/<id>
+# klasörünü temizle. Aktif (queued/running/generating) job varsa uyarır.
+# Jobs.json'daki tarihsel kayıtlara dokunmaz (orphan profile_id ref'leri kalır).
+delete_profile() {
+  if [ ${#PROFILE_LINES[@]} -eq 0 ]; then
+    echo "✗ Silinecek profil yok."
+    return 1
+  fi
+
+  echo
+  echo "── Profil sil ──"
+  echo "Mevcut profiller:"
+  local i=0
+  for line in "${PROFILE_LINES[@]}"; do
+    IFS='|' read -r pid name env init <<<"$line"
+    i=$((i+1))
+    local marker="⚪"
+    [ "$init" = "Y" ] && marker="🟢"
+    printf "  %2d) %s %-30s [%s]  id=%s\n" "$i" "$marker" "$name" "$env" "$pid"
+  done
+  echo
+  read -rp "Hangi numarayı silmek istiyorsun? (q = iptal): " dchoice
+
+  case "$dchoice" in
+    q|Q|"") echo "İptal edildi."; return 1 ;;
+  esac
+
+  local didx=$((dchoice-1))
+  if [ "$didx" -lt 0 ] || [ "$didx" -ge ${#PROFILE_LINES[@]} ]; then
+    echo "✗ Geçersiz numara: $dchoice"
+    return 1
+  fi
+  IFS='|' read -r dpid dname denv dinit <<<"${PROFILE_LINES[$didx]}"
+
+  # Aktif job kontrolü — uyar ama bloklama, user karar versin
+  local active_count
+  active_count=$(ssh -i "$SSH_KEY" -o ConnectTimeout=10 "$SSH_HOST" \
+    "cd $REMOTE_REPO && python3 -c \"
+import json
+from pathlib import Path
+jobs = json.loads(Path('data/jobs.json').read_text())
+items = list(jobs.values()) if isinstance(jobs, dict) else jobs
+active = [j for j in items if j.get('profile_id') == '$dpid' and j.get('status') in ('queued','running','generating')]
+print(len(active))
+\"" 2>/dev/null || echo "?")
+
+  echo
+  echo "Silinecek: $dname [$denv]  id=$dpid"
+  if [ "$active_count" != "0" ] && [ "$active_count" != "?" ]; then
+    echo "⚠ Bu profilde $active_count aktif job var (queued/running/generating)."
+    echo "  Silersen bu job'lar orphan kalır."
+  fi
+  read -rp "Onaylıyor musun? (yes / hayır): " confirm
+  if [ "$confirm" != "yes" ]; then
+    echo "İptal edildi."
+    return 1
+  fi
+
+  # Sunucudan sil
+  echo "→ Sunucuda profiles.json'dan çıkarılıyor..."
+  local del_out
+  del_out=$(ssh -i "$SSH_KEY" -o ConnectTimeout=10 "$SSH_HOST" \
+    "cd $REMOTE_REPO && python3 -c \"
+import json
+from pathlib import Path
+p = Path('data/profiles.json')
+profiles = json.loads(p.read_text())
+before = len(profiles)
+profiles = [x for x in profiles if x.get('id') != '$dpid']
+if len(profiles) == before:
+    print('FAIL: profil bulunamadı:', '$dpid')
+else:
+    tmp = p.with_suffix('.json.tmp')
+    tmp.write_text(json.dumps(profiles, indent=2))
+    tmp.replace(p)
+    print('OK')
+\"" 2>&1)
+
+  if [ "$del_out" != "OK" ]; then
+    echo "✗ profiles.json'dan silinemedi: $del_out"
+    return 1
+  fi
+
+  echo "→ Sunucuda chrome_profiles/$dpid temizleniyor..."
+  ssh_run "rm -rf $REMOTE_REPO/chrome_profiles/$dpid" || true
+
+  echo "✓ Silindi: $dname"
+
+  # PROFILE_LINES'tan da düşür (interaktif menü tutarlı kalsın)
+  local new_lines=()
+  for line in "${PROFILE_LINES[@]}"; do
+    IFS='|' read -r pid _ _ _ <<<"$line"
+    if [ "$pid" != "$dpid" ]; then
+      new_lines+=("$line")
+    fi
+  done
+  PROFILE_LINES=("${new_lines[@]}")
+  return 0
+}
 
 # ---- Profilleri sunucudan oku ---------------------------------------------
 echo "==> Sunucudan profil listesi alınıyor..."
@@ -110,11 +289,22 @@ else
     printf "  %2d) %s %-30s [%s]\n" "$i" "$marker" "$name" "$env"
   done
   echo
-  echo "Seçim:  '1 3 5' (boşluklarla), 'a' (tüm ⚪), 'q' (çık)"
+  echo "Seçim:  '1 3 5' (boşluklarla), 'a' (tüm ⚪), 'n' (yeni profil), 'd' (sil), 'q' (çık)"
   read -rp "→ " choice
 
   case "$choice" in
     q|Q) echo "Çıkıldı."; exit 0 ;;
+    n|N)
+      if ! add_new_profile; then
+        exit 1
+      fi
+      ;;
+    d|D)
+      delete_profile || true
+      echo
+      echo "Tekrar çalıştır: ./deploy/login.sh"
+      exit 0
+      ;;
     a|A)
       for line in "${PROFILE_LINES[@]}"; do
         IFS='|' read -r pid name env init <<<"$line"

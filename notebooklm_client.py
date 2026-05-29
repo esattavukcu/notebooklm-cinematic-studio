@@ -115,9 +115,13 @@ async def _submit_job_async(
     t_start = time.time()
     on_event("client_starting", auth=str(auth_path))
 
-    # keepalive=300 → cookie SIDTS rotation otomatik (long-running 30dk+)
+    # keepalive=300 → cookie SIDTS rotation otomatik (long-running 30dk+).
+    # v0.5.0: from_storage() doğrudan async-context-manager wrapper döndürür
+    # (await deprecated, v1.0'da kaldırılacak). Auth/connection lifecycle
+    # hataları async-with __aenter__ aşamasında raise edilir, body try'larında
+    # yakalanır veya caller'a fırlar.
     try:
-        client_ctx = await NotebookLMClient.from_storage(
+        client_ctx = NotebookLMClient.from_storage(
             path=str(auth_path), keepalive=300, keepalive_min_interval=60,
         )
     except Exception as e:
@@ -302,7 +306,7 @@ async def _smoke_async(auth_path: Path) -> tuple[bool, str]:
     if not auth_path.exists():
         return False, f"auth.json yok: {auth_path}"
     try:
-        async with await NotebookLMClient.from_storage(path=str(auth_path)) as c:
+        async with NotebookLMClient.from_storage(path=str(auth_path)) as c:
             notebooks = await c.notebooks.list()
             nb_list = list(notebooks) if hasattr(notebooks, "__iter__") else notebooks
             return True, f"OK: {len(nb_list)} notebook görüldü."
@@ -345,8 +349,9 @@ async def _resume_download_async(
     if not auth_path.exists():
         raise NotebookLMClientError(f"auth.json yok: {auth_path}", stage="auth")
 
+    # v0.5.0: from_storage() async-context-manager döndürür, await istemez.
     try:
-        client_ctx = await NotebookLMClient.from_storage(
+        client_ctx = NotebookLMClient.from_storage(
             path=str(auth_path), keepalive=300, keepalive_min_interval=60,
         )
     except Exception as e:

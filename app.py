@@ -156,6 +156,14 @@ STALE_RESUME_CHECK_INTERVAL_SEC = 5 * 60   # Sweeper her 5dk'da bir tarar
 STALE_RESUME_MIN_AGE_SEC = 90 * 60         # 90dk+ "generating" → stuck kabul
 STALE_RESUME_MAX_ATTEMPTS = 3              # Job başına max attempt
 STALE_RESUME_BACKOFF_SEC = [10*60, 30*60, 60*60]  # 10dk → 30dk → 60dk
+
+# Auth health check parametreleri (proaktif expire tespiti).
+# Plan A reactive akışındaki "1. job ziyan" sorununu çözer — periyodik
+# smoke_test ile profil expire'larını önceden yakalayıp Slack alert atar.
+AUTH_HEALTH_CHECK_INTERVAL_SEC = int(os.environ.get(
+    "AUTH_HEALTH_CHECK_INTERVAL_SEC", str(4 * 3600)  # 4 saat default
+))
+AUTH_HEALTH_PROBE_TIMEOUT_SEC = 25  # smoke_test per profile timeout
 JOB_LOG_TAIL_LINES = 400
 
 # Harvest module config — env var ile override edilebilir.
@@ -1784,6 +1792,9 @@ class Worker:
         last_harvest_check = 0.0
         last_stale_check = 0.0
         last_batch_check = 0.0
+        # Auth health check ilk round'da çalışmasın — server boot anında
+        # initialize henüz tamamlanmamış olabilir. İlk full interval'dan sonra ilk.
+        last_auth_health_check = time.time()
         while not self._stop_evt.is_set():
             try:
                 self._auto_init_check()
@@ -1802,6 +1813,11 @@ class Worker:
                 if time.time() - last_batch_check >= 30:
                     self._batch_monitor_round()
                     last_batch_check = time.time()
+                # Auth health check: periyodik smoke test → expired profilleri
+                # SUBMIT'TEN ÖNCE keşfet + Slack alert (1. job ziyanını önler)
+                if time.time() - last_auth_health_check >= AUTH_HEALTH_CHECK_INTERVAL_SEC:
+                    self._auth_health_check_round()
+                    last_auth_health_check = time.time()
             except Exception as e:
                 launcher_log(f"dispatch error: {e!r}")
             self._stop_evt.wait(DISPATCH_INTERVAL_SEC)
@@ -2157,6 +2173,106 @@ class Worker:
                 f"init=True → init=False, auth.json silindi, Slack gönderildi"
             )
         # else: zaten init=False — başka bir job aynı anda failed olmuş, no-op
+
+    def _mark_profile_expired(self, profile_id: str, profile_name: str,
+                              reason: str) -> bool:
+        """Job context'i olmadan profil expire mark — proaktif health check için.
+
+        _handle_auth_failure'ın job-agnostic kardeşi. Idempotent: zaten
+        initialized=False ise no-op (Slack spam önlenir).
+
+        Returns: True if transition happened (init=True → False), False if no-op.
+        """
+        ps = load_profiles()
+        was_initialized = False
+        for p in ps:
+            if p.id == profile_id:
+                was_initialized = p.initialized
+                p.initialized = False
+                break
+        if not was_initialized:
+            return False
+        save_profiles(ps)
+        # auth.json sil → sahte initialized tekrar tetiklenmesin
+        try:
+            auth_p = PROFILES_DIR / profile_id / "auth.json"
+            if auth_p.exists():
+                auth_p.unlink()
+        except OSError:
+            pass
+        # Slack alert — actionable hint ile (login.sh komutu)
+        send_slack_message(
+            f"🚨 *Hesap session expired (proaktif tespit):* `{profile_name}`\n"
+            f"Sebep: {reason[:200]}\n"
+            f"Profile init=False yapıldı, dispatcher yeni job göndermiyor.\n\n"
+            f"*Düzeltmek için Mac'te çalıştır:*\n"
+            f"```\n./deploy/login.sh\n```\n"
+            f"Listeden `{profile_name}` seç → Chrome açılır → login → "
+            f"otomatik sunucuya rsync."
+        )
+        launcher_log(
+            f"Profile {profile_name} ({profile_id}) PROACTIVE_AUTH_FAIL: "
+            f"init=True → init=False, auth.json silindi, Slack gönderildi. "
+            f"Reason: {reason[:120]}"
+        )
+        return True
+
+    def _auth_health_check_round(self) -> None:
+        """Proaktif auth check: initialized profillere smoke_test çağırıp
+        expired olanları mark et. Worker._loop her N saatte bir tetikler.
+
+        Plan A reactive flow'unda 1. job kaybını önler — submit zamanı yerine
+        periyodik kontrolde expire keşfedilir, Slack alert ile admin uyarılır.
+        """
+        try:
+            from notebooklm_client import smoke_test as _nlm_smoke
+        except ImportError:
+            return  # library yok → check anlamsız
+        ps = load_profiles()
+        initialized = [p for p in ps if p.initialized]
+        if not initialized:
+            return
+        launcher_log(
+            f"Auth health check başladı — {len(initialized)} initialized profile"
+        )
+        flagged = 0
+        for p in initialized:
+            try:
+                ok, msg = _nlm_smoke(p.id)
+            except Exception as e:
+                # Network/timeout vs. — geçici hata sayıp atla, sonraki round'a bırak
+                launcher_log(
+                    f"Auth health: {p.name} smoke exception (skip this round): "
+                    f"{type(e).__name__}: {str(e)[:120]}"
+                )
+                continue
+            if ok:
+                continue
+            # Fail edebilir 2 sebepten: auth expired (önemli) veya transient
+            # (geçici). "Authentication expired", "Missing required cookies",
+            # "Redirected to: accounts.google.com" gibi keyword'ler kalıcı.
+            m_low = (msg or "").lower()
+            is_real_auth_fail = (
+                "auth" in m_low
+                or "expired" in m_low
+                or "missing required cookies" in m_low
+                or "accounts.google.com" in m_low
+                or "not logged in" in m_low
+                or "redirect" in m_low
+            )
+            if not is_real_auth_fail:
+                launcher_log(
+                    f"Auth health: {p.name} smoke FAIL ama auth-fail değil "
+                    f"(transient varsayıldı): {msg[:140]}"
+                )
+                continue
+            if self._mark_profile_expired(p.id, p.name, reason=msg[:240]):
+                flagged += 1
+        if flagged:
+            launcher_log(
+                f"Auth health check bitti: {flagged}/{len(initialized)} profile "
+                f"expired olarak mark edildi"
+            )
 
     def _today_count_for(self, jobs: list[Job], profile_id: str) -> int:
         today = date.today()

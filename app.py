@@ -6141,7 +6141,29 @@ def render_user_view() -> None:
 
     # Bu env'in TÜM job'ları (jobs zaten env'e göre filtrelenmiş — render_user_view
     # başında). Herkes hepsini görür; submit eden etiketle gösterilir.
-    all_jobs_sorted = sorted(jobs, key=lambda j: j.created_at, reverse=True)[:80]
+    #
+    # Dedup: Aynı title için "aktif/başarılı" kayıt (done/generating/running/
+    # queued/submitted) varsa, o title'ın stopped/failed kayıtlarını GİZLE.
+    # Sebep: retry/re-import yeni Job kaydı açıyor → bir script hem stopped hem
+    # done görünüyordu (2 ayrı kart). Done'lar gerçek video → hepsi kalır;
+    # ölü stopped/failed çiftler gizlenir. Gizliyse görünmezler ama veride durur.
+    _SUPERSEDING = {"done", "generating", "running", "queued", "submitted"}
+    _titles_with_active = {
+        (j.title or "").strip()
+        for j in jobs
+        if j.status in _SUPERSEDING
+    }
+
+    def _is_superseded(j: Job) -> bool:
+        return (
+            j.status in ("stopped", "failed")
+            and (j.title or "").strip() in _titles_with_active
+        )
+
+    _visible_jobs = [j for j in jobs if not _is_superseded(j)]
+    all_jobs_sorted = sorted(
+        _visible_jobs, key=lambda j: j.created_at, reverse=True
+    )[:80]
 
     # batch_id → Drive source URL haritası (kaynak linki göstermek için)
     _batch_source = {}
@@ -6153,7 +6175,7 @@ def render_user_view() -> None:
     except Exception:
         _batch_source = {}
 
-    section_header(f"🎬 Tüm videolar", f"{len(jobs)} kayıt (herkes)")
+    section_header(f"🎬 Tüm videolar", f"{len(_visible_jobs)} kayıt (herkes)")
 
     if not all_jobs_sorted:
         empty_state(

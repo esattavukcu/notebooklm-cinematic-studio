@@ -5473,779 +5473,788 @@ def render_user_view() -> None:
     # Önceki run'da bir mesaj set edildiyse göster (callback render'dan önce çalışır)
     _msg = st.session_state.pop("_script_msg", None)
 
-    # ===== 3-Step pipeline state =====
-    ui_step = int(st.session_state.get("ui_step", 1))
-
-    # Step indicator stripe (her zaman görünür)
-    def _step_pill(num: int, label: str, active: bool, done: bool) -> str:
-        if done:
-            bg, fg, icon = "#10B981", "#FFFFFF", "✓"
-        elif active:
-            bg, fg, icon = "#6366F1", "#FFFFFF", str(num)
-        else:
-            bg, fg, icon = "rgba(156,163,175,0.25)", "#9CA3AF", str(num)
-        return (
-            f'<span style="display:inline-flex; align-items:center; gap:6px; '
-            f'padding:4px 10px; background:{bg}; color:{fg}; border-radius:14px; '
-            f'font-size:0.8rem; font-weight:600;">'
-            f'<span style="background:rgba(255,255,255,0.2); width:18px; height:18px; '
-            f'border-radius:9px; display:inline-flex; align-items:center; justify-content:center; '
-            f'font-size:0.72rem;">{icon}</span>{label}</span>'
-        )
-
-    st.markdown("&nbsp;", unsafe_allow_html=True)
-    st.markdown(
-        '<div style="display:flex; gap:8px; flex-wrap:wrap; margin-bottom:10px;">'
-        + _step_pill(1, "Senaryo", ui_step == 1, ui_step > 1)
-        + _step_pill(2, "Görseller", ui_step == 2, ui_step > 2)
-        + _step_pill(3, "Cinematic", ui_step == 3, False)
-        + '</div>',
-        unsafe_allow_html=True,
+    # --- Tekli senaryo akışı: aç/kapa ---
+    _show_single = st.toggle(
+        "📝 Tekli senaryo oluştur",
+        value=st.session_state.get("show_single_flow", True),
+        key="show_single_flow",
+        help="Tek script yapıştırıp video üret. Kapatırsan sadece "
+             "video listesi + Drive toplu görünür.",
     )
+    if _show_single:
+        # ===== 3-Step pipeline state =====
+        ui_step = int(st.session_state.get("ui_step", 1))
 
-    # ===== STEP 1: Senaryonu Hazırla =====
-    if ui_step == 1:
+        # Step indicator stripe (her zaman görünür)
+        def _step_pill(num: int, label: str, active: bool, done: bool) -> str:
+            if done:
+                bg, fg, icon = "#10B981", "#FFFFFF", "✓"
+            elif active:
+                bg, fg, icon = "#6366F1", "#FFFFFF", str(num)
+            else:
+                bg, fg, icon = "rgba(156,163,175,0.25)", "#9CA3AF", str(num)
+            return (
+                f'<span style="display:inline-flex; align-items:center; gap:6px; '
+                f'padding:4px 10px; background:{bg}; color:{fg}; border-radius:14px; '
+                f'font-size:0.8rem; font-weight:600;">'
+                f'<span style="background:rgba(255,255,255,0.2); width:18px; height:18px; '
+                f'border-radius:9px; display:inline-flex; align-items:center; justify-content:center; '
+                f'font-size:0.72rem;">{icon}</span>{label}</span>'
+            )
+
+        st.markdown("&nbsp;", unsafe_allow_html=True)
         st.markdown(
-            '<div style="font-size:1.05rem; font-weight:700; margin-bottom:0.2rem;">'
-            '1️⃣ Senaryonu Hazırla</div>'
-            '<div style="font-size:0.8rem; opacity:0.7; margin-bottom:0.5rem;">'
-            'Aşağıya ya hazır <b>script</b>\'i yapıştır → <b>Çıktıyı kullan</b>, '
-            'ya da <b>prompt</b>\'u yapıştır → <b>Çıktı oluştur</b> (LLM script üretir). '
-            'Yardımcı: <b>🤖 Weird Facts template</b>\'ini aşağıdaki form\'la doldurabilirsin.</div>',
+            '<div style="display:flex; gap:8px; flex-wrap:wrap; margin-bottom:10px;">'
+            + _step_pill(1, "Senaryo", ui_step == 1, ui_step > 1)
+            + _step_pill(2, "Görseller", ui_step == 2, ui_step > 2)
+            + _step_pill(3, "Cinematic", ui_step == 3, False)
+            + '</div>',
             unsafe_allow_html=True,
         )
 
-        # --- Weird Facts template form (opsiyonel, kolay prompt üretme) ---
-        if LLM_ENABLED:
-            with st.expander("🤖 Weird Facts template kullan", expanded=False):
-                st.caption(
-                    "Bu form, Twin Learning Vision'ın Weird Facts script writer "
-                    "prompt'unu inşa eder ve text alanına yapıştırır. Sonra "
-                    "'Çıktı oluştur' butonuna bas."
-                )
-                wf_cs = st.columns(2)
-                with wf_cs[0]:
-                    st.text_input(
-                        "Konu (TOPIC)",
-                        key="wf_topic",
-                        placeholder="örn. Işığın madde ile etkileşimi sonucunda soğurulma",
+        # ===== STEP 1: Senaryonu Hazırla =====
+        if ui_step == 1:
+            st.markdown(
+                '<div style="font-size:1.05rem; font-weight:700; margin-bottom:0.2rem;">'
+                '1️⃣ Senaryonu Hazırla</div>'
+                '<div style="font-size:0.8rem; opacity:0.7; margin-bottom:0.5rem;">'
+                'Aşağıya ya hazır <b>script</b>\'i yapıştır → <b>Çıktıyı kullan</b>, '
+                'ya da <b>prompt</b>\'u yapıştır → <b>Çıktı oluştur</b> (LLM script üretir). '
+                'Yardımcı: <b>🤖 Weird Facts template</b>\'ini aşağıdaki form\'la doldurabilirsin.</div>',
+                unsafe_allow_html=True,
+            )
+
+            # --- Weird Facts template form (opsiyonel, kolay prompt üretme) ---
+            if LLM_ENABLED:
+                with st.expander("🤖 Weird Facts template kullan", expanded=False):
+                    st.caption(
+                        "Bu form, Twin Learning Vision'ın Weird Facts script writer "
+                        "prompt'unu inşa eder ve text alanına yapıştırır. Sonra "
+                        "'Çıktı oluştur' butonuna bas."
                     )
-                    st.text_input(
-                        "Sınıf seviyesi (GRADE)",
-                        key="wf_grade",
-                        placeholder="örn. 7",
+                    wf_cs = st.columns(2)
+                    with wf_cs[0]:
+                        st.text_input(
+                            "Konu (TOPIC)",
+                            key="wf_topic",
+                            placeholder="örn. Işığın madde ile etkileşimi sonucunda soğurulma",
+                        )
+                        st.text_input(
+                            "Sınıf seviyesi (GRADE)",
+                            key="wf_grade",
+                            placeholder="örn. 7",
+                        )
+                    with wf_cs[1]:
+                        st.selectbox(
+                            "Dil",
+                            options=["TR", "EN"],
+                            key="wf_language",
+                        )
+                        st.text_area(
+                            "Kazanım (LEARNING OBJECTIVE)",
+                            key="wf_lo",
+                            height=80,
+                            placeholder="a) ...\nb) ...\nc) ...",
+                        )
+                    st.button(
+                        "📋 Template'i text alanına yapıştır",
+                        on_click=_cb_apply_wf_template,
+                        use_container_width=True,
+                        key="btn_wf_apply",
                     )
-                with wf_cs[1]:
+
+            st.text_area(
+                "Senaryo / Prompt",
+                height=360,
+                placeholder="Senaryo veya prompt'u yapıştır...\n\n"
+                            "Hazır script'in varsa direkt yapıştır + 'Çıktıyı kullan'.\n"
+                            "Prompt yapıştırırsan + 'Çıktı oluştur' → LLM script üretecek.",
+                label_visibility="collapsed",
+                key="script_draft",
+                on_change=_cb_text_changed,
+            )
+
+            # --- Step 1 action buttons ---
+            if LLM_ENABLED:
+                # Gemini model selector — sadece "Çıktı oluştur" için kullanılır
+                model_ids = [m[0] for m in GEMINI_MODELS]
+                model_labels = {m[0]: m[1] for m in GEMINI_MODELS}
+                if "script_model" not in st.session_state or st.session_state["script_model"] not in model_ids:
+                    st.session_state["script_model"] = GEMINI_DEFAULT_MODEL
+
+                cs_s1 = st.columns([1.2, 1.4, 1.4])
+                with cs_s1[0]:
                     st.selectbox(
-                        "Dil",
-                        options=["TR", "EN"],
-                        key="wf_language",
+                        "AI Model",
+                        options=model_ids,
+                        format_func=lambda mid: model_labels.get(mid, mid).split(" — ")[0],
+                        key="script_model",
+                        label_visibility="collapsed",
+                        help="Flash önerilir. Pro uzun script'lerde 2-5dk sürebilir.",
                     )
-                    st.text_area(
-                        "Kazanım (LEARNING OBJECTIVE)",
-                        key="wf_lo",
-                        height=80,
-                        placeholder="a) ...\nb) ...\nc) ...",
+                with cs_s1[1]:
+                    st.button(
+                        "🤖 Çıktı oluştur",
+                        type="secondary",
+                        use_container_width=True,
+                        on_click=_cb_generate_output,
+                        key="btn_generate_output",
+                        help="Text alandaki PROMPT'u Gemini'ye gönder, script üret. "
+                             "Flash ~5-30sn, Pro 2-5dk olabilir.",
                     )
+                with cs_s1[2]:
+                    st.button(
+                        "✓ Çıktıyı kullan",
+                        type="primary",
+                        use_container_width=True,
+                        on_click=_cb_use_output,
+                        key="btn_use_output",
+                        help="Text alandaki SCRIPT'i kabul et, Step 2'ye geç.",
+                    )
+            else:
+                # LLM kapalıysa sadece "kullan" butonu
                 st.button(
-                    "📋 Template'i text alanına yapıştır",
-                    on_click=_cb_apply_wf_template,
-                    use_container_width=True,
-                    key="btn_wf_apply",
-                )
-
-        st.text_area(
-            "Senaryo / Prompt",
-            height=360,
-            placeholder="Senaryo veya prompt'u yapıştır...\n\n"
-                        "Hazır script'in varsa direkt yapıştır + 'Çıktıyı kullan'.\n"
-                        "Prompt yapıştırırsan + 'Çıktı oluştur' → LLM script üretecek.",
-            label_visibility="collapsed",
-            key="script_draft",
-            on_change=_cb_text_changed,
-        )
-
-        # --- Step 1 action buttons ---
-        if LLM_ENABLED:
-            # Gemini model selector — sadece "Çıktı oluştur" için kullanılır
-            model_ids = [m[0] for m in GEMINI_MODELS]
-            model_labels = {m[0]: m[1] for m in GEMINI_MODELS}
-            if "script_model" not in st.session_state or st.session_state["script_model"] not in model_ids:
-                st.session_state["script_model"] = GEMINI_DEFAULT_MODEL
-
-            cs_s1 = st.columns([1.2, 1.4, 1.4])
-            with cs_s1[0]:
-                st.selectbox(
-                    "AI Model",
-                    options=model_ids,
-                    format_func=lambda mid: model_labels.get(mid, mid).split(" — ")[0],
-                    key="script_model",
-                    label_visibility="collapsed",
-                    help="Flash önerilir. Pro uzun script'lerde 2-5dk sürebilir.",
-                )
-            with cs_s1[1]:
-                st.button(
-                    "🤖 Çıktı oluştur",
-                    type="secondary",
-                    use_container_width=True,
-                    on_click=_cb_generate_output,
-                    key="btn_generate_output",
-                    help="Text alandaki PROMPT'u Gemini'ye gönder, script üret. "
-                         "Flash ~5-30sn, Pro 2-5dk olabilir.",
-                )
-            with cs_s1[2]:
-                st.button(
-                    "✓ Çıktıyı kullan",
+                    "✓ Çıktıyı kullan ve devam et",
                     type="primary",
                     use_container_width=True,
                     on_click=_cb_use_output,
-                    key="btn_use_output",
-                    help="Text alandaki SCRIPT'i kabul et, Step 2'ye geç.",
+                    key="btn_use_output_only",
                 )
+
         else:
-            # LLM kapalıysa sadece "kullan" butonu
-            st.button(
-                "✓ Çıktıyı kullan ve devam et",
-                type="primary",
-                use_container_width=True,
-                on_click=_cb_use_output,
-                key="btn_use_output_only",
-            )
-
-    else:
-        # ui_step > 1 → Step 1 collapsed summary
-        _draft_preview = (st.session_state.get("script_draft") or "").strip()
-        _preview = (_draft_preview[:120] + "…") if len(_draft_preview) > 120 else _draft_preview
-        cs_sum = st.columns([5, 1])
-        with cs_sum[0]:
-            st.markdown(
-                f'<div style="padding:10px 14px; background:rgba(16,185,129,0.08); '
-                f'border-left:3px solid #10B981; border-radius:6px; margin-bottom:8px;">'
-                f'<div style="font-size:0.85rem; font-weight:600;">✓ 1. Senaryo hazır</div>'
-                f'<div style="font-size:0.78rem; opacity:0.75; margin-top:4px; font-style:italic;">'
-                f'"{_preview}"</div></div>',
-                unsafe_allow_html=True,
-            )
-        with cs_sum[1]:
-            st.button(
-                "↩ Düzenle",
-                on_click=_cb_back_to_step,
-                args=(1,),
-                use_container_width=True,
-                key="btn_back_step1",
-            )
-
-    # ===== AI Editor (LLM aktifse, sadece Step 1'de görünür) =====
-    # Script üretildikten sonra feedback'le ince ayar (eski Phase A iter loop).
-    # Model selector Step 1 ana row'da zaten var — burada dup eklemiyoruz.
-    if LLM_ENABLED and ui_step == 1:
-        iter_count = len(st.session_state["script_iterations"])
-        # Sadece initial-generation dışı gerçek iterasyon varsa label'da göster
-        real_iters = sum(
-            1 for it in st.session_state["script_iterations"]
-            if it.get("feedback", "") and not it["feedback"].startswith("(initial")
-        )
-        expander_label = "✨ AI ile rafine et (feedback ver)"
-        if real_iters:
-            expander_label += f" — {real_iters} iterasyon"
-        with st.expander(expander_label, expanded=False):
-            st.caption(
-                "Script'i beğendinse atla. Beğenmediysen aşağıya 'ne değişsin' "
-                "yaz, üstteki model'le AI yeniden üretsin."
-            )
-            st.text_area(
-                "Feedback / değişiklik notları",
-                key="script_feedback",
-                height=80,
-                placeholder=(
-                    "örn. 'biraz daha kısa tut, hook'u güçlendir, sonunda kicker ekle'"
-                ),
-            )
-            cs = st.columns([2, 1])
-            with cs[0]:
-                st.button(
-                    "🔄 AI ile yeniden üret",
-                    type="primary",
-                    use_container_width=True,
-                    on_click=_cb_regenerate,
-                    key="btn_regenerate",
-                )
-            with cs[1]:
-                if iter_count:
-                    st.button(
-                        "🔁 Sıfırla",
-                        use_container_width=True,
-                        help="İterasyon geçmişini temizle",
-                        on_click=_cb_reset_history,
-                        key="btn_reset_history",
-                    )
-
-            # İterasyon geçmişi — geri dönme imkanı
-            if iter_count:
-                st.markdown("**Geçmiş versiyonlar**")
-                for i, it in enumerate(reversed(st.session_state["script_iterations"])):
-                    actual_i = iter_count - 1 - i
-                    short_fb = (it["feedback"][:60] + "…") if len(it["feedback"]) > 60 else it["feedback"]
-                    used_model = it.get("model", "?")
-                    # Model id'sinden kısa label türet (örn. qwen3-next-80b)
-                    model_short = used_model.split("/")[-1].replace(":free", "")
-                    with st.container(border=True):
-                        cs2 = st.columns([5, 1])
-                        with cs2[0]:
-                            st.caption(f"v{actual_i + 1} · `{model_short}` — {short_fb}")
-                            with st.expander("Görüntüle", expanded=False):
-                                st.text(it["script"])
-                        with cs2[1]:
-                            st.button(
-                                "↶ Geri dön",
-                                key=f"revert_{actual_i}",
-                                use_container_width=True,
-                                on_click=_cb_revert,
-                                args=(actual_i,),
-                            )
-
-    # ===== STEP 2: Görseller (Phase B/C/D) =====
-    # ui_step >= 2 olunca açılır. ui_step > 2 ise collapsed summary.
-    if ui_step >= 2 and LLM_ENABLED:
-        assets = st.session_state.get("script_assets", []) or []
-        n_assets = len(assets)
-        n_selected = sum(1 for a in assets if a.get("selected_image"))
-
-        if ui_step == 2:
-            st.markdown("&nbsp;", unsafe_allow_html=True)
-            st.markdown(
-                '<div style="font-size:1.05rem; font-weight:700; margin-bottom:0.2rem;">'
-                '2️⃣ Görseller</div>'
-                '<div style="font-size:0.8rem; opacity:0.7; margin-bottom:0.5rem;">'
-                'LLM script\'ten gerçek-durum nesneleri çıkarır → her biri için '
-                'görsel ara / AI ile üret / manuel URL. Beğendiklerinden seç. '
-                'İstemiyorsan <b>Bu adımı atla</b> butonuyla geç.</div>',
-                unsafe_allow_html=True,
-            )
-
-            # Gemini model selector — asset extraction için, Step 1'le ortak key
-            _s2_model_ids = [m[0] for m in GEMINI_MODELS]
-            _s2_model_labels = {m[0]: m[1] for m in GEMINI_MODELS}
-            if "script_model" not in st.session_state or st.session_state["script_model"] not in _s2_model_ids:
-                st.session_state["script_model"] = GEMINI_DEFAULT_MODEL
-            st.selectbox(
-                "AI Model (asset extraction için)",
-                options=_s2_model_ids,
-                format_func=lambda mid: _s2_model_labels.get(mid, mid).split(" — ")[0],
-                key="script_model",
-                help="Flash önerilir (5-30sn). Pro daha kaliteli ama uzun script'lerde "
-                     "2-5dk sürebilir — gerçekten gerekirse seç.",
-            )
-            # Pro seçildiyse uyar
-            if st.session_state.get("script_model") == "pro":
-                st.caption(
-                    "⏳ **Pro model uzun input'larda yavaştır** — bu Step için "
-                    "Flash genelde yeterli, sadece çok kaliteli çıktı gerekiyorsa Pro tut."
-                )
-
-            # Step 2 action row: extract + skip + next
-            top_cs = st.columns([1.6, 1, 1, 1])
-            with top_cs[0]:
-                extract_label = ("🔄 Yeniden çıkar (listeyi sıfırlar)"
-                                 if n_assets else "🖼 Görselleri çıkar")
-                st.button(
-                    extract_label,
-                    type="primary",
-                    use_container_width=True,
-                    on_click=_cb_extract_assets,
-                    key="btn_extract_assets",
-                    help="Aktif senaryoyu LLM'e gönderir, görsel listesi çıkarır."
-                )
-            with top_cs[1]:
-                if n_assets:
-                    st.button(
-                        "➕ Manuel ekle",
-                        use_container_width=True,
-                        on_click=_cb_add_asset,
-                        key="btn_add_asset_top",
-                    )
-            with top_cs[2]:
-                st.button(
-                    "⏭ Bu adımı atla",
-                    use_container_width=True,
-                    on_click=_cb_skip_step2,
-                    key="btn_skip_step2",
-                    help="Görselsiz devam et — Cinematic sadece script'i kullanır."
-                )
-            with top_cs[3]:
-                _can_next = (n_selected > 0) or (n_assets == 0)  # ya seçim ya hiç asset yok
-                if st.button(
-                    "Step 3 ▶",
-                    type="primary" if n_selected > 0 else "secondary",
-                    use_container_width=True,
-                    key="btn_next_step3",
-                    disabled=not n_selected and bool(n_assets),
-                    help=("En az 1 görsel seç ya da atla." if n_assets and not n_selected
-                          else "Cinematic adımına geç."),
-                ):
-                    st.session_state["ui_step"] = 3
-                    st.rerun()
-
-            # Asset extractor prompt override (gizli expander)
-            with st.expander("⚙ Gelişmiş: Asset extractor prompt'unu düzenle", expanded=False):
-                st.caption(
-                    "Default: kodda sabit prompt (gerçek-durum nesneler için). "
-                    "Buradan değiştirirsen, sadece bu oturumda 'Görselleri çıkar' "
-                    "çağrılarında kullanılır."
-                )
-                st.text_area(
-                    "Asset extractor system prompt",
-                    key="asset_extractor_prompt_override",
-                    value=st.session_state.get(
-                        "asset_extractor_prompt_override", ""
-                    ),
-                    height=180,
-                    placeholder="Boş bırak = default prompt kullanılır",
-                    help="Boş bırakırsan kodda tanımlı ASSET_EXTRACTOR_SYSTEM kullanılır.",
-                )
-
-            st.markdown("&nbsp;", unsafe_allow_html=True)
-        else:
-            # ui_step == 3 → Step 2 collapsed summary
-            _summary = f"{n_assets} öneri · {n_selected} seçili" if n_assets else "atlandı"
-            cs_sum2 = st.columns([5, 1])
-            with cs_sum2[0]:
+            # ui_step > 1 → Step 1 collapsed summary
+            _draft_preview = (st.session_state.get("script_draft") or "").strip()
+            _preview = (_draft_preview[:120] + "…") if len(_draft_preview) > 120 else _draft_preview
+            cs_sum = st.columns([5, 1])
+            with cs_sum[0]:
                 st.markdown(
                     f'<div style="padding:10px 14px; background:rgba(16,185,129,0.08); '
                     f'border-left:3px solid #10B981; border-radius:6px; margin-bottom:8px;">'
-                    f'<div style="font-size:0.85rem; font-weight:600;">✓ 2. Görseller — {_summary}</div></div>',
+                    f'<div style="font-size:0.85rem; font-weight:600;">✓ 1. Senaryo hazır</div>'
+                    f'<div style="font-size:0.78rem; opacity:0.75; margin-top:4px; font-style:italic;">'
+                    f'"{_preview}"</div></div>',
                     unsafe_allow_html=True,
                 )
-            with cs_sum2[1]:
+            with cs_sum[1]:
                 st.button(
                     "↩ Düzenle",
                     on_click=_cb_back_to_step,
-                    args=(2,),
+                    args=(1,),
                     use_container_width=True,
-                    key="btn_back_step2",
+                    key="btn_back_step1",
                 )
 
-    # ===== Phase B detail UI: sadece ui_step == 2 iken render =====
-    # Asset listesinin ayrıntılı per-item UI'sı (eski expander içeriği,
-    # şimdi açık layout). Üst butonlar (extract/skip/next) yukarıdaki
-    # wrapper'da Step 2 header'ında yer alıyor.
-    if ui_step == 2 and LLM_ENABLED:
-        assets = st.session_state.get("script_assets", []) or []
-        n_assets = len(assets)
-        if n_assets:
-            # "Tümünü sil" küçük buton (top row'dan ayrı)
-            del_cs = st.columns([5, 1])
-            with del_cs[1]:
-                st.button(
-                    "🗑 Tümünü sil",
-                    use_container_width=True,
-                    on_click=_cb_clear_assets,
-                    key="btn_clear_assets",
+        # ===== AI Editor (LLM aktifse, sadece Step 1'de görünür) =====
+        # Script üretildikten sonra feedback'le ince ayar (eski Phase A iter loop).
+        # Model selector Step 1 ana row'da zaten var — burada dup eklemiyoruz.
+        if LLM_ENABLED and ui_step == 1:
+            iter_count = len(st.session_state["script_iterations"])
+            # Sadece initial-generation dışı gerçek iterasyon varsa label'da göster
+            real_iters = sum(
+                1 for it in st.session_state["script_iterations"]
+                if it.get("feedback", "") and not it["feedback"].startswith("(initial")
+            )
+            expander_label = "✨ AI ile rafine et (feedback ver)"
+            if real_iters:
+                expander_label += f" — {real_iters} iterasyon"
+            with st.expander(expander_label, expanded=False):
+                st.caption(
+                    "Script'i beğendinse atla. Beğenmediysen aşağıya 'ne değişsin' "
+                    "yaz, üstteki model'le AI yeniden üretsin."
                 )
+                st.text_area(
+                    "Feedback / değişiklik notları",
+                    key="script_feedback",
+                    height=80,
+                    placeholder=(
+                        "örn. 'biraz daha kısa tut, hook'u güçlendir, sonunda kicker ekle'"
+                    ),
+                )
+                cs = st.columns([2, 1])
+                with cs[0]:
+                    st.button(
+                        "🔄 AI ile yeniden üret",
+                        type="primary",
+                        use_container_width=True,
+                        on_click=_cb_regenerate,
+                        key="btn_regenerate",
+                    )
+                with cs[1]:
+                    if iter_count:
+                        st.button(
+                            "🔁 Sıfırla",
+                            use_container_width=True,
+                            help="İterasyon geçmişini temizle",
+                            on_click=_cb_reset_history,
+                            key="btn_reset_history",
+                        )
 
-            if True:
+                # İterasyon geçmişi — geri dönme imkanı
+                if iter_count:
+                    st.markdown("**Geçmiş versiyonlar**")
+                    for i, it in enumerate(reversed(st.session_state["script_iterations"])):
+                        actual_i = iter_count - 1 - i
+                        short_fb = (it["feedback"][:60] + "…") if len(it["feedback"]) > 60 else it["feedback"]
+                        used_model = it.get("model", "?")
+                        # Model id'sinden kısa label türet (örn. qwen3-next-80b)
+                        model_short = used_model.split("/")[-1].replace(":free", "")
+                        with st.container(border=True):
+                            cs2 = st.columns([5, 1])
+                            with cs2[0]:
+                                st.caption(f"v{actual_i + 1} · `{model_short}` — {short_fb}")
+                                with st.expander("Görüntüle", expanded=False):
+                                    st.text(it["script"])
+                            with cs2[1]:
+                                st.button(
+                                    "↶ Geri dön",
+                                    key=f"revert_{actual_i}",
+                                    use_container_width=True,
+                                    on_click=_cb_revert,
+                                    args=(actual_i,),
+                                )
+
+        # ===== STEP 2: Görseller (Phase B/C/D) =====
+        # ui_step >= 2 olunca açılır. ui_step > 2 ise collapsed summary.
+        if ui_step >= 2 and LLM_ENABLED:
+            assets = st.session_state.get("script_assets", []) or []
+            n_assets = len(assets)
+            n_selected = sum(1 for a in assets if a.get("selected_image"))
+
+            if ui_step == 2:
                 st.markdown("&nbsp;", unsafe_allow_html=True)
-                STYLE_OPTS = ["photo", "illustration", "diagram", "archive"]
-                STYLE_ICON = {
-                    "photo": "📷", "illustration": "🎨",
-                    "diagram": "📊", "archive": "🗄"
-                }
-                for idx, asset in enumerate(assets):
-                    aid = asset.get("id") or uuid.uuid4().hex[:8]
-                    asset["id"] = aid  # ensure id always present
-                    style_now = asset.get("style", "photo")
-                    if style_now not in STYLE_OPTS:
-                        style_now = "photo"
-                    icon = STYLE_ICON.get(style_now, "📷")
+                st.markdown(
+                    '<div style="font-size:1.05rem; font-weight:700; margin-bottom:0.2rem;">'
+                    '2️⃣ Görseller</div>'
+                    '<div style="font-size:0.8rem; opacity:0.7; margin-bottom:0.5rem;">'
+                    'LLM script\'ten gerçek-durum nesneleri çıkarır → her biri için '
+                    'görsel ara / AI ile üret / manuel URL. Beğendiklerinden seç. '
+                    'İstemiyorsan <b>Bu adımı atla</b> butonuyla geç.</div>',
+                    unsafe_allow_html=True,
+                )
 
-                    with st.container(border=True):
-                        head = st.columns([5, 1.2, 0.6])
-                        with head[0]:
-                            pos = asset.get("position", "")
-                            st.markdown(
-                                f'<div style="font-size:0.85rem; font-weight:600; '
-                                f'margin-bottom:2px;">'
-                                f'{icon} <span style="opacity:0.55;">#{idx+1}</span> · '
-                                f'<span style="opacity:0.7; font-weight:500; '
-                                f'font-style:italic;">{pos[:90] if pos else "(konum belirtilmedi)"}</span>'
-                                f'</div>',
-                                unsafe_allow_html=True,
-                            )
-                        with head[1]:
-                            st.selectbox(
-                                "Stil",
-                                options=STYLE_OPTS,
-                                index=STYLE_OPTS.index(style_now),
-                                label_visibility="collapsed",
-                                key=f"asset_style_{aid}",
-                                on_change=_cb_asset_edit,
-                                args=(aid, "style", f"asset_style_{aid}"),
-                            )
-                        with head[2]:
-                            st.button(
-                                "🗑",
-                                key=f"asset_del_{aid}",
-                                use_container_width=True,
-                                on_click=_cb_delete_asset,
-                                args=(aid,),
-                                help="Bu öneriyi sil",
-                            )
-                        st.text_input(
-                            "Açıklama (TR)",
-                            value=asset.get("description", ""),
-                            key=f"asset_desc_{aid}",
-                            on_change=_cb_asset_edit,
-                            args=(aid, "description", f"asset_desc_{aid}"),
+                # Gemini model selector — asset extraction için, Step 1'le ortak key
+                _s2_model_ids = [m[0] for m in GEMINI_MODELS]
+                _s2_model_labels = {m[0]: m[1] for m in GEMINI_MODELS}
+                if "script_model" not in st.session_state or st.session_state["script_model"] not in _s2_model_ids:
+                    st.session_state["script_model"] = GEMINI_DEFAULT_MODEL
+                st.selectbox(
+                    "AI Model (asset extraction için)",
+                    options=_s2_model_ids,
+                    format_func=lambda mid: _s2_model_labels.get(mid, mid).split(" — ")[0],
+                    key="script_model",
+                    help="Flash önerilir (5-30sn). Pro daha kaliteli ama uzun script'lerde "
+                         "2-5dk sürebilir — gerçekten gerekirse seç.",
+                )
+                # Pro seçildiyse uyar
+                if st.session_state.get("script_model") == "pro":
+                    st.caption(
+                        "⏳ **Pro model uzun input'larda yavaştır** — bu Step için "
+                        "Flash genelde yeterli, sadece çok kaliteli çıktı gerekiyorsa Pro tut."
+                    )
+
+                # Step 2 action row: extract + skip + next
+                top_cs = st.columns([1.6, 1, 1, 1])
+                with top_cs[0]:
+                    extract_label = ("🔄 Yeniden çıkar (listeyi sıfırlar)"
+                                     if n_assets else "🖼 Görselleri çıkar")
+                    st.button(
+                        extract_label,
+                        type="primary",
+                        use_container_width=True,
+                        on_click=_cb_extract_assets,
+                        key="btn_extract_assets",
+                        help="Aktif senaryoyu LLM'e gönderir, görsel listesi çıkarır."
+                    )
+                with top_cs[1]:
+                    if n_assets:
+                        st.button(
+                            "➕ Manuel ekle",
+                            use_container_width=True,
+                            on_click=_cb_add_asset,
+                            key="btn_add_asset_top",
                         )
-                        st.text_input(
-                            "Search query (EN, image API'leri için)",
-                            value=asset.get("query", ""),
-                            key=f"asset_query_{aid}",
-                            on_change=_cb_asset_edit,
-                            args=(aid, "query", f"asset_query_{aid}"),
-                            help="3-6 İngilizce keyword. Phase C'de Wikimedia/Openverse search'e gönderilecek.",
-                        )
+                with top_cs[2]:
+                    st.button(
+                        "⏭ Bu adımı atla",
+                        use_container_width=True,
+                        on_click=_cb_skip_step2,
+                        key="btn_skip_step2",
+                        help="Görselsiz devam et — Cinematic sadece script'i kullanır."
+                    )
+                with top_cs[3]:
+                    _can_next = (n_selected > 0) or (n_assets == 0)  # ya seçim ya hiç asset yok
+                    if st.button(
+                        "Step 3 ▶",
+                        type="primary" if n_selected > 0 else "secondary",
+                        use_container_width=True,
+                        key="btn_next_step3",
+                        disabled=not n_selected and bool(n_assets),
+                        help=("En az 1 görsel seç ya da atla." if n_assets and not n_selected
+                              else "Cinematic adımına geç."),
+                    ):
+                        st.session_state["ui_step"] = 3
+                        st.rerun()
 
-                        # ===== Phase C: Image search per asset =====
-                        selected = asset.get("selected_image")
-                        candidates = asset.get("candidates") or []
+                # Asset extractor prompt override (gizli expander)
+                with st.expander("⚙ Gelişmiş: Asset extractor prompt'unu düzenle", expanded=False):
+                    st.caption(
+                        "Default: kodda sabit prompt (gerçek-durum nesneler için). "
+                        "Buradan değiştirirsen, sadece bu oturumda 'Görselleri çıkar' "
+                        "çağrılarında kullanılır."
+                    )
+                    st.text_area(
+                        "Asset extractor system prompt",
+                        key="asset_extractor_prompt_override",
+                        value=st.session_state.get(
+                            "asset_extractor_prompt_override", ""
+                        ),
+                        height=180,
+                        placeholder="Boş bırak = default prompt kullanılır",
+                        help="Boş bırakırsan kodda tanımlı ASSET_EXTRACTOR_SYSTEM kullanılır.",
+                    )
 
-                        if selected:
-                            # Seçili görsel — sade görünüm + değiştirme imkanı
-                            st.markdown("---")
-                            sc = st.columns([1, 2.5, 1])
-                            with sc[0]:
-                                try:
-                                    st.image(selected.get("thumb_url"),
-                                             use_container_width=True)
-                                except Exception:
-                                    st.caption("(thumbnail yüklenemedi)")
-                            with sc[1]:
-                                src_emoji = {
-                                    "wikimedia": "🌐", "openverse": "🌍",
-                                    "pixabay": "🎯", "pexels": "📸",
-                                    "pollinations": "🤖", "manual": "✏",
-                                }.get(selected.get("source", ""), "🖼")
+                st.markdown("&nbsp;", unsafe_allow_html=True)
+            else:
+                # ui_step == 3 → Step 2 collapsed summary
+                _summary = f"{n_assets} öneri · {n_selected} seçili" if n_assets else "atlandı"
+                cs_sum2 = st.columns([5, 1])
+                with cs_sum2[0]:
+                    st.markdown(
+                        f'<div style="padding:10px 14px; background:rgba(16,185,129,0.08); '
+                        f'border-left:3px solid #10B981; border-radius:6px; margin-bottom:8px;">'
+                        f'<div style="font-size:0.85rem; font-weight:600;">✓ 2. Görseller — {_summary}</div></div>',
+                        unsafe_allow_html=True,
+                    )
+                with cs_sum2[1]:
+                    st.button(
+                        "↩ Düzenle",
+                        on_click=_cb_back_to_step,
+                        args=(2,),
+                        use_container_width=True,
+                        key="btn_back_step2",
+                    )
+
+        # ===== Phase B detail UI: sadece ui_step == 2 iken render =====
+        # Asset listesinin ayrıntılı per-item UI'sı (eski expander içeriği,
+        # şimdi açık layout). Üst butonlar (extract/skip/next) yukarıdaki
+        # wrapper'da Step 2 header'ında yer alıyor.
+        if ui_step == 2 and LLM_ENABLED:
+            assets = st.session_state.get("script_assets", []) or []
+            n_assets = len(assets)
+            if n_assets:
+                # "Tümünü sil" küçük buton (top row'dan ayrı)
+                del_cs = st.columns([5, 1])
+                with del_cs[1]:
+                    st.button(
+                        "🗑 Tümünü sil",
+                        use_container_width=True,
+                        on_click=_cb_clear_assets,
+                        key="btn_clear_assets",
+                    )
+
+                if True:
+                    st.markdown("&nbsp;", unsafe_allow_html=True)
+                    STYLE_OPTS = ["photo", "illustration", "diagram", "archive"]
+                    STYLE_ICON = {
+                        "photo": "📷", "illustration": "🎨",
+                        "diagram": "📊", "archive": "🗄"
+                    }
+                    for idx, asset in enumerate(assets):
+                        aid = asset.get("id") or uuid.uuid4().hex[:8]
+                        asset["id"] = aid  # ensure id always present
+                        style_now = asset.get("style", "photo")
+                        if style_now not in STYLE_OPTS:
+                            style_now = "photo"
+                        icon = STYLE_ICON.get(style_now, "📷")
+
+                        with st.container(border=True):
+                            head = st.columns([5, 1.2, 0.6])
+                            with head[0]:
+                                pos = asset.get("position", "")
                                 st.markdown(
-                                    f'<div style="font-size:0.85rem;">'
-                                    f'<b>✅ Seçili</b> · {src_emoji} {selected.get("source","?")}<br>'
-                                    f'<span style="opacity:0.7; font-size:0.78rem;">'
-                                    f'📜 Lisans: <b>{selected.get("license","?")}</b><br>'
-                                    f'👤 {selected.get("attribution","")[:60]}</span>'
+                                    f'<div style="font-size:0.85rem; font-weight:600; '
+                                    f'margin-bottom:2px;">'
+                                    f'{icon} <span style="opacity:0.55;">#{idx+1}</span> · '
+                                    f'<span style="opacity:0.7; font-weight:500; '
+                                    f'font-style:italic;">{pos[:90] if pos else "(konum belirtilmedi)"}</span>'
                                     f'</div>',
                                     unsafe_allow_html=True,
                                 )
-                                if selected.get("page_url"):
-                                    st.markdown(
-                                        f'<a href="{selected["page_url"]}" target="_blank" '
-                                        f'style="font-size:0.75rem; opacity:0.7;">↗ kaynak sayfa</a>',
-                                        unsafe_allow_html=True,
-                                    )
-                            with sc[2]:
-                                st.button(
-                                    "✕ Kaldır",
-                                    key=f"asset_unsel_{aid}",
-                                    use_container_width=True,
-                                    on_click=_cb_clear_selection,
-                                    args=(aid,),
-                                    help="Seçimi kaldır, başka görsel seç",
-                                )
-                        elif not candidates:
-                            # Henüz arama yapılmamış — search + generate butonları
-                            st.markdown("&nbsp;", unsafe_allow_html=True)
-                            search_cs = st.columns([2, 2, 1.5])
-                            with search_cs[0]:
-                                st.button(
-                                    "🔍 Görsel ara",
-                                    key=f"asset_search_{aid}",
-                                    on_click=_cb_search_images,
-                                    args=(aid,),
-                                    use_container_width=True,
-                                    help="Aktif kaynaklarda bu query ile ara",
-                                )
-                            with search_cs[1]:
-                                st.button(
-                                    "🎨 AI ile üret",
-                                    key=f"asset_gen_{aid}",
-                                    on_click=_cb_generate_images,
-                                    args=(aid,),
-                                    use_container_width=True,
-                                    help="Pollinations.ai ile 4 varyant üret (free, key gerek yok)",
-                                )
-                            with search_cs[2]:
-                                # Pollinations model selector
-                                _pmodel_ids = [m[0] for m in POLLINATIONS_MODELS]
-                                _pmodel_lbls = {m[0]: m[1] for m in POLLINATIONS_MODELS}
-                                _pmkey = f"asset_genmodel_{aid}"
-                                if _pmkey not in st.session_state:
-                                    st.session_state[_pmkey] = "flux"
+                            with head[1]:
                                 st.selectbox(
-                                    "AI modeli",
-                                    options=_pmodel_ids,
-                                    format_func=lambda m: _pmodel_lbls.get(m, m).split(" — ")[0],
-                                    key=_pmkey,
+                                    "Stil",
+                                    options=STYLE_OPTS,
+                                    index=STYLE_OPTS.index(style_now),
                                     label_visibility="collapsed",
-                                    help="AI üretim modeli (üret butonunda kullanılır)",
+                                    key=f"asset_style_{aid}",
+                                    on_change=_cb_asset_edit,
+                                    args=(aid, "style", f"asset_style_{aid}"),
                                 )
-
-                            # Aktif kaynak listesi
-                            _active = ["Wikimedia", "Openverse"]
-                            if PIXABAY_API_KEY:
-                                _active.append("Pixabay")
-                            if PEXELS_API_KEY:
-                                _active.append("Pexels")
-                            st.caption(
-                                f"Arama kaynakları: **{' · '.join(_active)}** "
-                                f"&nbsp;·&nbsp; AI üretim: **Pollinations.ai** (free)"
+                            with head[2]:
+                                st.button(
+                                    "🗑",
+                                    key=f"asset_del_{aid}",
+                                    use_container_width=True,
+                                    on_click=_cb_delete_asset,
+                                    args=(aid,),
+                                    help="Bu öneriyi sil",
+                                )
+                            st.text_input(
+                                "Açıklama (TR)",
+                                value=asset.get("description", ""),
+                                key=f"asset_desc_{aid}",
+                                on_change=_cb_asset_edit,
+                                args=(aid, "description", f"asset_desc_{aid}"),
+                            )
+                            st.text_input(
+                                "Search query (EN, image API'leri için)",
+                                value=asset.get("query", ""),
+                                key=f"asset_query_{aid}",
+                                on_change=_cb_asset_edit,
+                                args=(aid, "query", f"asset_query_{aid}"),
+                                help="3-6 İngilizce keyword. Phase C'de Wikimedia/Openverse search'e gönderilecek.",
                             )
 
-                            # Manuel URL paste — kullanıcı kendisi URL bulup yapıştırabilir
-                            with st.expander("✏ Manuel URL yapıştır", expanded=False):
-                                _q_for_external = (asset.get("query") or "").strip()
-                                if _q_for_external:
-                                    _g_url = "https://www.google.com/search?tbm=isch&q=" + urllib.parse.quote(_q_for_external)
-                                    _ddg_url = "https://duckduckgo.com/?iax=images&ia=images&q=" + urllib.parse.quote(_q_for_external)
+                            # ===== Phase C: Image search per asset =====
+                            selected = asset.get("selected_image")
+                            candidates = asset.get("candidates") or []
+
+                            if selected:
+                                # Seçili görsel — sade görünüm + değiştirme imkanı
+                                st.markdown("---")
+                                sc = st.columns([1, 2.5, 1])
+                                with sc[0]:
+                                    try:
+                                        st.image(selected.get("thumb_url"),
+                                                 use_container_width=True)
+                                    except Exception:
+                                        st.caption("(thumbnail yüklenemedi)")
+                                with sc[1]:
+                                    src_emoji = {
+                                        "wikimedia": "🌐", "openverse": "🌍",
+                                        "pixabay": "🎯", "pexels": "📸",
+                                        "pollinations": "🤖", "manual": "✏",
+                                    }.get(selected.get("source", ""), "🖼")
                                     st.markdown(
-                                        f'<div style="font-size:0.78rem; opacity:0.8; margin-bottom:6px;">'
-                                        f'Bulamadıysan dış arama: '
-                                        f'<a href="{_g_url}" target="_blank">🔗 Google Images</a> · '
-                                        f'<a href="{_ddg_url}" target="_blank">🔗 DuckDuckGo</a> '
-                                        f'→ uygun görseli bul → <b>resme sağ tıkla → "Resim adresini kopyala"</b>'
+                                        f'<div style="font-size:0.85rem;">'
+                                        f'<b>✅ Seçili</b> · {src_emoji} {selected.get("source","?")}<br>'
+                                        f'<span style="opacity:0.7; font-size:0.78rem;">'
+                                        f'📜 Lisans: <b>{selected.get("license","?")}</b><br>'
+                                        f'👤 {selected.get("attribution","")[:60]}</span>'
                                         f'</div>',
                                         unsafe_allow_html=True,
                                     )
-                                _manual_key = f"asset_manual_url_{aid}"
-                                st.text_input(
-                                    "Görsel URL'i (https://... ile başlamalı)",
-                                    key=_manual_key,
-                                    placeholder="https://example.com/image.jpg",
-                                )
-                                st.button(
-                                    "Bu URL'i kullan",
-                                    key=f"asset_manual_use_{aid}",
-                                    on_click=_cb_use_manual_url,
-                                    args=(aid, _manual_key),
-                                )
-                        else:
-                            # Aday görseller var, henüz seçim yok
-                            st.markdown("---")
-                            n_cands = len(candidates)
-                            # Tipini belirt (gerçek arama sonuçları mı, AI üretim mi)
-                            sources_in_cands = {c.get("source", "?") for c in candidates}
-                            is_all_ai = sources_in_cands == {"pollinations"}
-                            label_kind = "AI varyant" if is_all_ai else "aday görsel"
-                            head_cs = st.columns([3, 1.3, 1.3])
-                            with head_cs[0]:
-                                st.markdown(
-                                    f'<small><b>{n_cands} {label_kind}</b> · '
-                                    f'birini seç ↓</small>',
-                                    unsafe_allow_html=True,
-                                )
-                            with head_cs[1]:
-                                st.button(
-                                    "🔄 Yeniden ara",
-                                    key=f"asset_research_{aid}",
-                                    on_click=_cb_search_images,
-                                    args=(aid,),
-                                    use_container_width=True,
-                                    help="Aramayı yenile",
-                                )
-                            with head_cs[2]:
-                                st.button(
-                                    "🎨 AI üret",
-                                    key=f"asset_gen2_{aid}",
-                                    on_click=_cb_generate_images,
-                                    args=(aid,),
-                                    use_container_width=True,
-                                    help="Beğenmediysen Pollinations'la 4 varyant üret",
-                                )
-
-                            # Thumbnail grid — 4 sütun
-                            cands_to_show = candidates[:8]
-                            n_cols = 4
-                            for row_start in range(0, len(cands_to_show), n_cols):
-                                row = cands_to_show[row_start:row_start + n_cols]
-                                grid_cs = st.columns(n_cols)
-                                for j, cand in enumerate(row):
-                                    cand_idx = row_start + j
-                                    with grid_cs[j]:
-                                        try:
-                                            st.image(
-                                                cand.get("thumb_url"),
-                                                use_container_width=True,
-                                            )
-                                        except Exception:
-                                            st.caption("⚠ yüklenemedi")
-                                        src_short = {
-                                            "wikimedia": "🌐 wm",
-                                            "openverse": "🌍 ov",
-                                            "pixabay": "🎯 pix",
-                                            "pexels": "📸 pex",
-                                            "pollinations": "🤖 AI",
-                                            "manual": "✏ man",
-                                        }.get(cand.get("source", ""), "?")
-                                        license_short = (cand.get("license") or "")[:14]
+                                    if selected.get("page_url"):
                                         st.markdown(
-                                            f'<div style="font-size:0.7rem; opacity:0.7; '
-                                            f'text-align:center; line-height:1.2; margin-top:-4px;">'
-                                            f'{src_short} · {license_short}</div>',
+                                            f'<a href="{selected["page_url"]}" target="_blank" '
+                                            f'style="font-size:0.75rem; opacity:0.7;">↗ kaynak sayfa</a>',
                                             unsafe_allow_html=True,
                                         )
-                                        st.button(
-                                            "Seç",
-                                            key=f"asset_pick_{aid}_{cand_idx}",
-                                            on_click=_cb_select_image,
-                                            args=(aid, cand_idx),
-                                            use_container_width=True,
-                                        )
+                                with sc[2]:
+                                    st.button(
+                                        "✕ Kaldır",
+                                        key=f"asset_unsel_{aid}",
+                                        use_container_width=True,
+                                        on_click=_cb_clear_selection,
+                                        args=(aid,),
+                                        help="Seçimi kaldır, başka görsel seç",
+                                    )
+                            elif not candidates:
+                                # Henüz arama yapılmamış — search + generate butonları
+                                st.markdown("&nbsp;", unsafe_allow_html=True)
+                                search_cs = st.columns([2, 2, 1.5])
+                                with search_cs[0]:
+                                    st.button(
+                                        "🔍 Görsel ara",
+                                        key=f"asset_search_{aid}",
+                                        on_click=_cb_search_images,
+                                        args=(aid,),
+                                        use_container_width=True,
+                                        help="Aktif kaynaklarda bu query ile ara",
+                                    )
+                                with search_cs[1]:
+                                    st.button(
+                                        "🎨 AI ile üret",
+                                        key=f"asset_gen_{aid}",
+                                        on_click=_cb_generate_images,
+                                        args=(aid,),
+                                        use_container_width=True,
+                                        help="Pollinations.ai ile 4 varyant üret (free, key gerek yok)",
+                                    )
+                                with search_cs[2]:
+                                    # Pollinations model selector
+                                    _pmodel_ids = [m[0] for m in POLLINATIONS_MODELS]
+                                    _pmodel_lbls = {m[0]: m[1] for m in POLLINATIONS_MODELS}
+                                    _pmkey = f"asset_genmodel_{aid}"
+                                    if _pmkey not in st.session_state:
+                                        st.session_state[_pmkey] = "flux"
+                                    st.selectbox(
+                                        "AI modeli",
+                                        options=_pmodel_ids,
+                                        format_func=lambda m: _pmodel_lbls.get(m, m).split(" — ")[0],
+                                        key=_pmkey,
+                                        label_visibility="collapsed",
+                                        help="AI üretim modeli (üret butonunda kullanılır)",
+                                    )
 
-                            # Manuel URL paste — adaylar varken de erişilebilir
-                            with st.expander("✏ Beğenmediysen: manuel URL yapıştır", expanded=False):
-                                _q_for_external2 = (asset.get("query") or "").strip()
-                                if _q_for_external2:
-                                    _g_url2 = "https://www.google.com/search?tbm=isch&q=" + urllib.parse.quote(_q_for_external2)
+                                # Aktif kaynak listesi
+                                _active = ["Wikimedia", "Openverse"]
+                                if PIXABAY_API_KEY:
+                                    _active.append("Pixabay")
+                                if PEXELS_API_KEY:
+                                    _active.append("Pexels")
+                                st.caption(
+                                    f"Arama kaynakları: **{' · '.join(_active)}** "
+                                    f"&nbsp;·&nbsp; AI üretim: **Pollinations.ai** (free)"
+                                )
+
+                                # Manuel URL paste — kullanıcı kendisi URL bulup yapıştırabilir
+                                with st.expander("✏ Manuel URL yapıştır", expanded=False):
+                                    _q_for_external = (asset.get("query") or "").strip()
+                                    if _q_for_external:
+                                        _g_url = "https://www.google.com/search?tbm=isch&q=" + urllib.parse.quote(_q_for_external)
+                                        _ddg_url = "https://duckduckgo.com/?iax=images&ia=images&q=" + urllib.parse.quote(_q_for_external)
+                                        st.markdown(
+                                            f'<div style="font-size:0.78rem; opacity:0.8; margin-bottom:6px;">'
+                                            f'Bulamadıysan dış arama: '
+                                            f'<a href="{_g_url}" target="_blank">🔗 Google Images</a> · '
+                                            f'<a href="{_ddg_url}" target="_blank">🔗 DuckDuckGo</a> '
+                                            f'→ uygun görseli bul → <b>resme sağ tıkla → "Resim adresini kopyala"</b>'
+                                            f'</div>',
+                                            unsafe_allow_html=True,
+                                        )
+                                    _manual_key = f"asset_manual_url_{aid}"
+                                    st.text_input(
+                                        "Görsel URL'i (https://... ile başlamalı)",
+                                        key=_manual_key,
+                                        placeholder="https://example.com/image.jpg",
+                                    )
+                                    st.button(
+                                        "Bu URL'i kullan",
+                                        key=f"asset_manual_use_{aid}",
+                                        on_click=_cb_use_manual_url,
+                                        args=(aid, _manual_key),
+                                    )
+                            else:
+                                # Aday görseller var, henüz seçim yok
+                                st.markdown("---")
+                                n_cands = len(candidates)
+                                # Tipini belirt (gerçek arama sonuçları mı, AI üretim mi)
+                                sources_in_cands = {c.get("source", "?") for c in candidates}
+                                is_all_ai = sources_in_cands == {"pollinations"}
+                                label_kind = "AI varyant" if is_all_ai else "aday görsel"
+                                head_cs = st.columns([3, 1.3, 1.3])
+                                with head_cs[0]:
                                     st.markdown(
-                                        f'<a href="{_g_url2}" target="_blank" '
-                                        f'style="font-size:0.78rem;">🔗 Google Images\'te aç</a>',
+                                        f'<small><b>{n_cands} {label_kind}</b> · '
+                                        f'birini seç ↓</small>',
                                         unsafe_allow_html=True,
                                     )
-                                _manual_key2 = f"asset_manual_url2_{aid}"
-                                st.text_input(
-                                    "Görsel URL'i",
-                                    key=_manual_key2,
-                                    placeholder="https://example.com/image.jpg",
-                                )
-                                st.button(
-                                    "Bu URL'i kullan",
-                                    key=f"asset_manual_use2_{aid}",
-                                    on_click=_cb_use_manual_url,
-                                    args=(aid, _manual_key2),
-                                )
+                                with head_cs[1]:
+                                    st.button(
+                                        "🔄 Yeniden ara",
+                                        key=f"asset_research_{aid}",
+                                        on_click=_cb_search_images,
+                                        args=(aid,),
+                                        use_container_width=True,
+                                        help="Aramayı yenile",
+                                    )
+                                with head_cs[2]:
+                                    st.button(
+                                        "🎨 AI üret",
+                                        key=f"asset_gen2_{aid}",
+                                        on_click=_cb_generate_images,
+                                        args=(aid,),
+                                        use_container_width=True,
+                                        help="Beğenmediysen Pollinations'la 4 varyant üret",
+                                    )
 
-    # ===== STEP 3: Cinematic Video (Custom Prompt + Submit) =====
-    # Source listesi her seçili görselin description+position bilgisiyle birlikte
-    # enumere edilir → NotebookLM hangi görseli script'in hangi anında göstereceğini bilir.
-    _assets_now = st.session_state.get("script_assets", []) or []
-    _selected_assets = [a for a in _assets_now if a.get("selected_image")]
-    _title_now = derive_title(st.session_state.get("script_draft", "")) or "Untitled"
-    _src_listing, _src_names = build_source_listing(_title_now, _selected_assets)
-    _total_sources = len(_src_names)
+                                # Thumbnail grid — 4 sütun
+                                cands_to_show = candidates[:8]
+                                n_cols = 4
+                                for row_start in range(0, len(cands_to_show), n_cols):
+                                    row = cands_to_show[row_start:row_start + n_cols]
+                                    grid_cs = st.columns(n_cols)
+                                    for j, cand in enumerate(row):
+                                        cand_idx = row_start + j
+                                        with grid_cs[j]:
+                                            try:
+                                                st.image(
+                                                    cand.get("thumb_url"),
+                                                    use_container_width=True,
+                                                )
+                                            except Exception:
+                                                st.caption("⚠ yüklenemedi")
+                                            src_short = {
+                                                "wikimedia": "🌐 wm",
+                                                "openverse": "🌍 ov",
+                                                "pixabay": "🎯 pix",
+                                                "pexels": "📸 pex",
+                                                "pollinations": "🤖 AI",
+                                                "manual": "✏ man",
+                                            }.get(cand.get("source", ""), "?")
+                                            license_short = (cand.get("license") or "")[:14]
+                                            st.markdown(
+                                                f'<div style="font-size:0.7rem; opacity:0.7; '
+                                                f'text-align:center; line-height:1.2; margin-top:-4px;">'
+                                                f'{src_short} · {license_short}</div>',
+                                                unsafe_allow_html=True,
+                                            )
+                                            st.button(
+                                                "Seç",
+                                                key=f"asset_pick_{aid}_{cand_idx}",
+                                                on_click=_cb_select_image,
+                                                args=(aid, cand_idx),
+                                                use_container_width=True,
+                                            )
 
-    # Eğer custom prompt boşsa ve script var ve "user edited" değilse, otomatik doldur
-    if (
-        st.session_state.get("script_draft", "").strip()
-        and not st.session_state.get("script_custom_prompt", "").strip()
-        and not st.session_state.get("script_custom_prompt_user_edited", False)
-    ):
-        st.session_state["script_custom_prompt"] = render_custom_prompt(
-            DEFAULT_CUSTOM_PROMPT_TEMPLATE, _title_now, _selected_assets
-        )
+                                # Manuel URL paste — adaylar varken de erişilebilir
+                                with st.expander("✏ Beğenmediysen: manuel URL yapıştır", expanded=False):
+                                    _q_for_external2 = (asset.get("query") or "").strip()
+                                    if _q_for_external2:
+                                        _g_url2 = "https://www.google.com/search?tbm=isch&q=" + urllib.parse.quote(_q_for_external2)
+                                        st.markdown(
+                                            f'<a href="{_g_url2}" target="_blank" '
+                                            f'style="font-size:0.78rem;">🔗 Google Images\'te aç</a>',
+                                            unsafe_allow_html=True,
+                                        )
+                                    _manual_key2 = f"asset_manual_url2_{aid}"
+                                    st.text_input(
+                                        "Görsel URL'i",
+                                        key=_manual_key2,
+                                        placeholder="https://example.com/image.jpg",
+                                    )
+                                    st.button(
+                                        "Bu URL'i kullan",
+                                        key=f"asset_manual_use2_{aid}",
+                                        on_click=_cb_use_manual_url,
+                                        args=(aid, _manual_key2),
+                                    )
 
-    if ui_step >= 3:
-        st.markdown("&nbsp;", unsafe_allow_html=True)
-        st.markdown(
-            '<div style="font-size:1.05rem; font-weight:700; margin-bottom:0.2rem;">'
-            '3️⃣ Cinematic Video</div>'
-            '<div style="font-size:0.8rem; opacity:0.7; margin-bottom:0.5rem;">'
-            'Custom Prompt NotebookLM\'in Customize → Custom prompt alanına '
-            'gidecek. Source listesi otomatik enumere edildi. Beğenmediysen '
-            'aşağıdaki text alanı edit edilebilir. Hazır olunca '
-            '<b>🚀 Video üret</b>.</div>',
-            unsafe_allow_html=True,
-        )
+        # ===== STEP 3: Cinematic Video (Custom Prompt + Submit) =====
+        # Source listesi her seçili görselin description+position bilgisiyle birlikte
+        # enumere edilir → NotebookLM hangi görseli script'in hangi anında göstereceğini bilir.
+        _assets_now = st.session_state.get("script_assets", []) or []
+        _selected_assets = [a for a in _assets_now if a.get("selected_image")]
+        _title_now = derive_title(st.session_state.get("script_draft", "")) or "Untitled"
+        _src_listing, _src_names = build_source_listing(_title_now, _selected_assets)
+        _total_sources = len(_src_names)
 
-        n_images = max(0, _total_sources - 1)
-        # Paket önizleme — neler upload edilecek
-        st.markdown(
-            f'<div style="font-size:0.85rem; padding:8px 12px; '
-            f'background:rgba(99,102,241,0.06); border-radius:6px; margin-bottom:8px;">'
-            f'<b>📦 NotebookLM\'e gidecek source\'lar ({_total_sources}):</b><br>'
-            f'<span style="font-size:0.78rem;">'
-            + "<br>".join(f"• <code>{n}</code>" for n in _src_names) +
-            f'</span>'
-            f'</div>',
-            unsafe_allow_html=True,
-        )
-
-        with st.expander("📋 Custom Prompt (edit edilebilir)", expanded=False):
-            st.caption(
-                "Bu metin NotebookLM'de Cinematic Customize → Custom prompt "
-                "alanına yapıştırılır. Source listesinin satırlarındaki 'show "
-                "when narration says: \"...\"' kısımları görsel-anlatım eşlemesini "
-                "yönlendirir."
-            )
-            st.info(
-                "🔒 NotebookLM source listesi (her job otomatik):\n"
-                "1. `<Title>_Script.txt` — Senaryon\n"
-                "2. `<Title>_LearningObjectives.txt` — _lo.docx/.txt/.md companion (varsa)\n"
-                "3. Narrative & Text-Free Execution Guide\n"
-                "4. Historical Accuracy & Identity Protocol\n"
-                "5. Student Safety & Visual Harmony Guide\n"
-                "6. The 80/20 Animation-Heavy Model\n"
-                "7. `_custom_prompt.txt` — Bu doküman (Role/Task/Constraints)\n"
-                "8..N. Görseller\n\n"
-                "Custom prompt **hem source olarak hem Cinematic Customize alanına** "
-                "gider — daha güçlü prime. Drive'da `senaryo1.docx` + `senaryo1_lo.docx` "
-                "var ise ikisi de yüklenir.",
-                icon="ℹ️",
-            )
-            with st.expander("👁 4 sabit guide'ı gör (read-only)"):
-                for filename, text in EXECUTION_GUIDE_FILES:
-                    st.markdown(f"**📄 {filename}**")
-                    st.code(text, language=None)
-
-            cs_p = st.columns([1.2, 4])
-            with cs_p[0]:
-                st.button(
-                    "🔄 Template'den doldur",
-                    key="btn_autofill_prompt",
-                    on_click=_cb_autofill_prompt,
-                    use_container_width=True,
-                    help="Default template + güncel source listesiyle yeniden doldur (manuel düzenlemen silinir)",
-                )
-            with cs_p[1]:
-                edited_flag = st.session_state.get("script_custom_prompt_user_edited", False)
-                st.caption(
-                    ("✏ Manuel düzenledin — auto-refresh kapalı." if edited_flag
-                     else "📝 Auto-render: source eklediğinde/sildiğinde template güncellenir.")
-                )
-
-            st.text_area(
-                "Custom Prompt (NotebookLM'e yapışacak)",
-                key="script_custom_prompt",
-                height=300,
-                on_change=_cb_prompt_edited,
-                help="Kendi role/constraint metnini yazabilirsin. "
-                     "{{SOURCES_LIST}} placeholder'ı template'de otomatik doldurulur.",
+        # Eğer custom prompt boşsa ve script var ve "user edited" değilse, otomatik doldur
+        if (
+            st.session_state.get("script_draft", "").strip()
+            and not st.session_state.get("script_custom_prompt", "").strip()
+            and not st.session_state.get("script_custom_prompt_user_edited", False)
+        ):
+            st.session_state["script_custom_prompt"] = render_custom_prompt(
+                DEFAULT_CUSTOM_PROMPT_TEMPLATE, _title_now, _selected_assets
             )
 
-    # ===== Submit button (ui_step >= 3) =====
-    if ui_step >= 3:
-        st.markdown("&nbsp;", unsafe_allow_html=True)
-        cs = st.columns([2, 1.4, 1.4])
-        with cs[0]:
+        if ui_step >= 3:
+            st.markdown("&nbsp;", unsafe_allow_html=True)
             st.markdown(
-                f'<div style="font-size:0.78rem; opacity:0.65; margin-top:8px;">'
-                f'Gönderen: <b>{_user_name()}</b> · Paket: '
-                f'<b>{_total_sources}</b> source</div>',
+                '<div style="font-size:1.05rem; font-weight:700; margin-bottom:0.2rem;">'
+                '3️⃣ Cinematic Video</div>'
+                '<div style="font-size:0.8rem; opacity:0.7; margin-bottom:0.5rem;">'
+                'Custom Prompt NotebookLM\'in Customize → Custom prompt alanına '
+                'gidecek. Source listesi otomatik enumere edildi. Beğenmediysen '
+                'aşağıdaki text alanı edit edilebilir. Hazır olunca '
+                '<b>🚀 Video üret</b>.</div>',
                 unsafe_allow_html=True,
             )
-        with cs[1]:
-            st.button(
-                "↩ Step 2'ye dön",
-                on_click=_cb_back_to_step,
-                args=(2,),
-                use_container_width=True,
-                key="btn_back_step2_from3",
+
+            n_images = max(0, _total_sources - 1)
+            # Paket önizleme — neler upload edilecek
+            st.markdown(
+                f'<div style="font-size:0.85rem; padding:8px 12px; '
+                f'background:rgba(99,102,241,0.06); border-radius:6px; margin-bottom:8px;">'
+                f'<b>📦 NotebookLM\'e gidecek source\'lar ({_total_sources}):</b><br>'
+                f'<span style="font-size:0.78rem;">'
+                + "<br>".join(f"• <code>{n}</code>" for n in _src_names) +
+                f'</span>'
+                f'</div>',
+                unsafe_allow_html=True,
             )
-        with cs[2]:
-            st.button(
-                "🚀 Video üret",
-                type="primary",
-                use_container_width=True,
-                key="submit_video",
-                on_click=_cb_submit,
-            )
+
+            with st.expander("📋 Custom Prompt (edit edilebilir)", expanded=False):
+                st.caption(
+                    "Bu metin NotebookLM'de Cinematic Customize → Custom prompt "
+                    "alanına yapıştırılır. Source listesinin satırlarındaki 'show "
+                    "when narration says: \"...\"' kısımları görsel-anlatım eşlemesini "
+                    "yönlendirir."
+                )
+                st.info(
+                    "🔒 NotebookLM source listesi (her job otomatik):\n"
+                    "1. `<Title>_Script.txt` — Senaryon\n"
+                    "2. `<Title>_LearningObjectives.txt` — _lo.docx/.txt/.md companion (varsa)\n"
+                    "3. Narrative & Text-Free Execution Guide\n"
+                    "4. Historical Accuracy & Identity Protocol\n"
+                    "5. Student Safety & Visual Harmony Guide\n"
+                    "6. The 80/20 Animation-Heavy Model\n"
+                    "7. `_custom_prompt.txt` — Bu doküman (Role/Task/Constraints)\n"
+                    "8..N. Görseller\n\n"
+                    "Custom prompt **hem source olarak hem Cinematic Customize alanına** "
+                    "gider — daha güçlü prime. Drive'da `senaryo1.docx` + `senaryo1_lo.docx` "
+                    "var ise ikisi de yüklenir.",
+                    icon="ℹ️",
+                )
+                with st.expander("👁 4 sabit guide'ı gör (read-only)"):
+                    for filename, text in EXECUTION_GUIDE_FILES:
+                        st.markdown(f"**📄 {filename}**")
+                        st.code(text, language=None)
+
+                cs_p = st.columns([1.2, 4])
+                with cs_p[0]:
+                    st.button(
+                        "🔄 Template'den doldur",
+                        key="btn_autofill_prompt",
+                        on_click=_cb_autofill_prompt,
+                        use_container_width=True,
+                        help="Default template + güncel source listesiyle yeniden doldur (manuel düzenlemen silinir)",
+                    )
+                with cs_p[1]:
+                    edited_flag = st.session_state.get("script_custom_prompt_user_edited", False)
+                    st.caption(
+                        ("✏ Manuel düzenledin — auto-refresh kapalı." if edited_flag
+                         else "📝 Auto-render: source eklediğinde/sildiğinde template güncellenir.")
+                    )
+
+                st.text_area(
+                    "Custom Prompt (NotebookLM'e yapışacak)",
+                    key="script_custom_prompt",
+                    height=300,
+                    on_change=_cb_prompt_edited,
+                    help="Kendi role/constraint metnini yazabilirsin. "
+                         "{{SOURCES_LIST}} placeholder'ı template'de otomatik doldurulur.",
+                )
+
+        # ===== Submit button (ui_step >= 3) =====
+        if ui_step >= 3:
+            st.markdown("&nbsp;", unsafe_allow_html=True)
+            cs = st.columns([2, 1.4, 1.4])
+            with cs[0]:
+                st.markdown(
+                    f'<div style="font-size:0.78rem; opacity:0.65; margin-top:8px;">'
+                    f'Gönderen: <b>{_user_name()}</b> · Paket: '
+                    f'<b>{_total_sources}</b> source</div>',
+                    unsafe_allow_html=True,
+                )
+            with cs[1]:
+                st.button(
+                    "↩ Step 2'ye dön",
+                    on_click=_cb_back_to_step,
+                    args=(2,),
+                    use_container_width=True,
+                    key="btn_back_step2_from3",
+                )
+            with cs[2]:
+                st.button(
+                    "🚀 Video üret",
+                    type="primary",
+                    use_container_width=True,
+                    key="submit_video",
+                    on_click=_cb_submit,
+                )
 
     # Mesajları göster (en son)
     if _msg:

@@ -504,6 +504,41 @@ def save_jobs(jobs: list[Job]) -> None:
     _atomic_write_json(JOBS_FILE, [asdict(j) for j in jobs])
 
 
+# ---------------------------------------------------------------------------
+# Atomic job mutation — 10+ eşzamanlı notebooklm-py thread'i jobs.json'a
+# kilitsiz read-modify-write yapıyordu → lost update (notebook_url kayboluyor,
+# "submitted" stuck job'lar). Process-wide threading.Lock ile RMW serialize.
+# Lock @st.cache_resource ile process boyunca tek instance (Streamlit modülü
+# her run'da re-exec ediyor → module-global lock paylaşılmaz).
+# ---------------------------------------------------------------------------
+import threading as _threading_for_lock  # noqa: E402
+
+
+@st.cache_resource
+def _jobs_lock() -> "_threading_for_lock.Lock":
+    return _threading_for_lock.Lock()
+
+
+def mutate_jobs(mutator) -> object:
+    """Atomic read-modify-write on jobs.json under process-wide lock.
+
+    mutator(jobs_list) — listeyi yerinde değiştirir; opsiyonel değer döndürür.
+    Tüm eşzamanlı job state güncellemeleri bunu kullanmalı ki lost update olmasın.
+
+    Örnek:
+        def _m(jobs):
+            for j in jobs:
+                if j.id == jid:
+                    j.status = "done"
+        mutate_jobs(_m)
+    """
+    with _jobs_lock():
+        jobs = load_jobs()
+        result = mutator(jobs)
+        save_jobs(jobs)
+        return result
+
+
 def load_batches() -> list[Batch]:
     raw = _read_json(BATCHES_FILE, [])
     out: list[Batch] = []
@@ -2880,14 +2915,14 @@ class Worker:
                     "notebook_url": "",  # zaten set edildi yukarıda
                 })
                 # notebooklm-py native MP4 download yapacak — harvest dispatcher
-                # bu job'a dokunmasın (paralel cookie-fetch'i önle).
+                # bu job'a dokunmasın (paralel cookie-fetch'i önle). Atomik.
                 try:
-                    jobs_all = load_jobs()
-                    for j in jobs_all:
-                        if j.id == job_id:
-                            j.harvest_status = "skip"
-                            break
-                    save_jobs(jobs_all)
+                    def _m_skip(jobs_all):
+                        for j in jobs_all:
+                            if j.id == job_id:
+                                j.harvest_status = "skip"
+                                break
+                    mutate_jobs(_m_skip)
                 except Exception:
                     pass
 
@@ -3010,15 +3045,15 @@ class Worker:
                         f"{e.stage}: {str(e)[:200]}"
                     )
                     return
-                # Diğer hatalar — sadece job failed
-                jobs_all = load_jobs()
-                for j in jobs_all:
-                    if j.id == job_id:
-                        j.status = "failed"
-                        j.error = f"{e.stage}: {str(e)[:280]}"
-                        j.finished_at = time.time()
-                        break
-                save_jobs(jobs_all)
+                # Diğer hatalar — sadece job failed (atomik)
+                def _m_fail(jobs_all, _e=e):
+                    for j in jobs_all:
+                        if j.id == job_id:
+                            j.status = "failed"
+                            j.error = f"{_e.stage}: {str(_e)[:280]}"
+                            j.finished_at = time.time()
+                            break
+                mutate_jobs(_m_fail)
                 return
 
             # 3. Başarı — Job güncelle
@@ -3031,22 +3066,22 @@ class Worker:
 
             # MP4 lokalde, video_local_path doldur + Azure upload (eğer enabled)
             local_mp4 = Path(result["local_mp4"])
-            jobs_all = load_jobs()
-            for j in jobs_all:
-                if j.id == job_id:
-                    j.notebook_url = result["notebook_url"]
-                    j.video_url = ""  # notebooklm-py local download, CDN URL yok
-                    try:
-                        j.video_local_path = str(
-                            local_mp4.resolve().relative_to(APP_DIR)
-                        )
-                    except (ValueError, OSError):
-                        j.video_local_path = str(local_mp4)
-                    j.harvest_status = "downloaded"
-                    j.status = "done"  # video hazır, harvest gerek yok
-                    j.finished_at = time.time()
-                    break
-            save_jobs(jobs_all)
+            try:
+                _vlp = str(local_mp4.resolve().relative_to(APP_DIR))
+            except (ValueError, OSError):
+                _vlp = str(local_mp4)
+
+            def _m_done(jobs_all):
+                for j in jobs_all:
+                    if j.id == job_id:
+                        j.notebook_url = result["notebook_url"]
+                        j.video_url = ""  # notebooklm-py local download, CDN URL yok
+                        j.video_local_path = _vlp
+                        j.harvest_status = "downloaded"
+                        j.status = "done"  # video hazır, harvest gerek yok
+                        j.finished_at = time.time()
+                        break
+            mutate_jobs(_m_done)
 
             # 4. Azure upload (best-effort, fail olursa job done kalır)
             if AZURE_ENABLED and local_mp4.exists():
@@ -3067,25 +3102,27 @@ class Worker:
                 ok, remote_url, err = upload_to_azure(
                     local_mp4, job_id, environment=_env_for_azure,
                 )
-                jobs2 = load_jobs()
-                _slack_job = None
-                for j in jobs2:
-                    if j.id == job_id:
-                        if ok:
-                            j.video_remote_url = remote_url
-                            j.harvest_status = "uploaded"
-                            _slack_job = j
-                        else:
-                            j.harvest_error = f"Azure upload failed: {err}"
-                        break
-                save_jobs(jobs2)
+                def _m_azure(jobs2):
+                    for j in jobs2:
+                        if j.id == job_id:
+                            if ok:
+                                j.video_remote_url = remote_url
+                                j.harvest_status = "uploaded"
+                                return {"title": j.title, "submitted_by": j.submitted_by,
+                                        "batch_id": j.batch_id}
+                            else:
+                                j.harvest_error = f"Azure upload failed: {err}"
+                            break
+                    return None
+                _slack_job = mutate_jobs(_m_azure)
                 # Per-video "Video hazır" sadece batch'siz (tek-script) job'larda.
                 # Batch job'lar için batch özeti (progress + oturum tamamlandı)
                 # bildirimleri var — 40 videoluk batch'te 40 ayrı mesaj olmasın.
-                if _slack_job and ok and not (_slack_job.batch_id or "").strip():
-                    _submitter = f" · gönderen: {_slack_job.submitted_by}" if _slack_job.submitted_by else ""
+                if _slack_job and ok and not (_slack_job.get("batch_id") or "").strip():
+                    _sb = _slack_job.get("submitted_by") or ""
+                    _submitter = f" · gönderen: {_sb}" if _sb else ""
                     send_slack_message(
-                        f"✅ *Video hazır:* <{remote_url}|{_slack_job.title[:120]}>"
+                        f"✅ *Video hazır:* <{remote_url}|{(_slack_job.get('title') or '')[:120]}>"
                         f"{_submitter}"
                     )
                 launcher_log(
@@ -3307,100 +3344,101 @@ class Worker:
                 pass
 
     def _apply_event(self, job_id: str, evt: dict) -> None:
-        etype = evt.get("type", "")
-        jobs = load_jobs()
-        target: Optional[Job] = None
-        for j in jobs:
-            if j.id == job_id:
-                target = j
-                break
-        if target is None:
-            return
-        if etype == "notebook_created":
-            url = evt.get("notebook_url", "")
-            if url:
-                target.notebook_url = url
-        elif etype == "quota_exceeded":
-            # Bu profilin kotası dolmuş — bugün için bir failed kayıt bırak ki
-            # _quota_blocked_today() bu profili pas geçsin.
-            #
-            # mid_flight=True (video_wait/video_download stage'i): gen başlamış,
-            # Google'da üretim devam ediyor. notebook_url'i koru, status="generating"
-            # bırak → stale-resume sweeper kurtarır.
-            # mid_flight=False (video_gen stage'i): gen başlamadı → job'u queued'a
-            # döndür, başka profile dispatch edilsin.
-            mid_flight = bool(evt.get("mid_flight", False))
-            quota_marker = Job(
-                id=uuid.uuid4().hex[:12],
-                title=f"[KOTA] {target.title[:50]}",
-                text="(quota detection marker)",
-                profile_id=target.profile_id,
-                profile_name=target.profile_name,
-                status="failed",
-                error="NotebookLM günlük Cinematic kotası dolmuş — yarın resetlenir.",
-                started_at=time.time(),
-                finished_at=time.time(),
-                submitted_by="system",
-            )
-            jobs.append(quota_marker)
-            # Slack: per-event spam yerine batch-level "kota duvarı" mesajı
-            # (_batch_monitor_round → _check_quota_wall) — tüm profiller
-            # bugün için bloklanınca 1× toplu bildirim. Burada sadece launcher.log.
-            if mid_flight:
-                # Gen başlamış, Google üretiyor — job'a dokunma, sadece profile blok.
-                launcher_log(
-                    f"Job {target.id} mid-flight quota ({target.profile_name}): "
-                    f"notebook_url korundu, stale-resume sweeper indirecek."
+        with _jobs_lock():
+            etype = evt.get("type", "")
+            jobs = load_jobs()
+            target: Optional[Job] = None
+            for j in jobs:
+                if j.id == job_id:
+                    target = j
+                    break
+            if target is None:
+                return
+            if etype == "notebook_created":
+                url = evt.get("notebook_url", "")
+                if url:
+                    target.notebook_url = url
+            elif etype == "quota_exceeded":
+                # Bu profilin kotası dolmuş — bugün için bir failed kayıt bırak ki
+                # _quota_blocked_today() bu profili pas geçsin.
+                #
+                # mid_flight=True (video_wait/video_download stage'i): gen başlamış,
+                # Google'da üretim devam ediyor. notebook_url'i koru, status="generating"
+                # bırak → stale-resume sweeper kurtarır.
+                # mid_flight=False (video_gen stage'i): gen başlamadı → job'u queued'a
+                # döndür, başka profile dispatch edilsin.
+                mid_flight = bool(evt.get("mid_flight", False))
+                quota_marker = Job(
+                    id=uuid.uuid4().hex[:12],
+                    title=f"[KOTA] {target.title[:50]}",
+                    text="(quota detection marker)",
+                    profile_id=target.profile_id,
+                    profile_name=target.profile_name,
+                    status="failed",
+                    error="NotebookLM günlük Cinematic kotası dolmuş — yarın resetlenir.",
+                    started_at=time.time(),
+                    finished_at=time.time(),
+                    submitted_by="system",
                 )
-            else:
-                launcher_log(
-                    f"Job {target.id} quota ({target.profile_name}): "
-                    f"queued'a alındı, başka profile dispatch edilecek."
-                )
-                # Asıl job'u queued'a geri al — Worker başka profile dene
-                target.status = "queued"
-                target.profile_id = ""
-                target.profile_name = ""
-                target.started_at = 0.0
-                target.finished_at = 0.0
-                target.notebook_url = ""  # eski profilin oluşturduğu notebook'u unut
-                target.pid = 0
-        elif etype in ("login_required_headless", "login_timeout"):
-            # Auth fail: merkez handler — requeue + init=False + Slack
-            # (idempotent transition: ilk düşüşte Slack, sonraki çağrılarda no-op).
-            # Handler kendi load_jobs/save_jobs yapar — burada erken return ile
-            # alttaki save_jobs(jobs)'un handler'ın yazdığını üzerine yazmasını
-            # engelliyoruz.
-            self._handle_auth_failure(
-                target.profile_id, target.profile_name, target.id,
-                f"login event: {etype}",
-            )
-            return
-        elif etype == "automation_complete":
-            # Eğer quota_exceeded başka event tarafından zaten queued'a alındıysa
-            # (kota auto-retry), bu event'i skip et — yoksa failed'e override eder.
-            if target.status == "queued":
-                pass  # already requeued, no-op
-            else:
-                url = evt.get("notebook_url", "") or target.notebook_url
-                target.notebook_url = url
-                if int(evt.get("exit_code", 1)) == 0:
-                    # Automator işini bitirdi (Generate tıklandı), ama NotebookLM
-                    # Cinematic videoyu 30-60dk'da üretiyor. status="generating"
-                    # olarak işaretle — harvest cycle bunu pick'leyip video URL'i
-                    # geldiğinde "done"a çevirecek.
-                    if url:
-                        target.status = "generating"
-                    else:
-                        target.status = "submitted"
+                jobs.append(quota_marker)
+                # Slack: per-event spam yerine batch-level "kota duvarı" mesajı
+                # (_batch_monitor_round → _check_quota_wall) — tüm profiller
+                # bugün için bloklanınca 1× toplu bildirim. Burada sadece launcher.log.
+                if mid_flight:
+                    # Gen başlamış, Google üretiyor — job'a dokunma, sadece profile blok.
+                    launcher_log(
+                        f"Job {target.id} mid-flight quota ({target.profile_name}): "
+                        f"notebook_url korundu, stale-resume sweeper indirecek."
+                    )
                 else:
-                    target.status = "failed"
-                    if not target.error:
-                        target.error = "automator exit_code != 0"
-                target.finished_at = time.time()
-        elif etype == "automation_error":
-            target.error = str(evt.get("error", ""))[:500]
-        save_jobs(jobs)
+                    launcher_log(
+                        f"Job {target.id} quota ({target.profile_name}): "
+                        f"queued'a alındı, başka profile dispatch edilecek."
+                    )
+                    # Asıl job'u queued'a geri al — Worker başka profile dene
+                    target.status = "queued"
+                    target.profile_id = ""
+                    target.profile_name = ""
+                    target.started_at = 0.0
+                    target.finished_at = 0.0
+                    target.notebook_url = ""  # eski profilin oluşturduğu notebook'u unut
+                    target.pid = 0
+            elif etype in ("login_required_headless", "login_timeout"):
+                # Auth fail: merkez handler — requeue + init=False + Slack
+                # (idempotent transition: ilk düşüşte Slack, sonraki çağrılarda no-op).
+                # Handler kendi load_jobs/save_jobs yapar — burada erken return ile
+                # alttaki save_jobs(jobs)'un handler'ın yazdığını üzerine yazmasını
+                # engelliyoruz.
+                self._handle_auth_failure(
+                    target.profile_id, target.profile_name, target.id,
+                    f"login event: {etype}",
+                )
+                return
+            elif etype == "automation_complete":
+                # Eğer quota_exceeded başka event tarafından zaten queued'a alındıysa
+                # (kota auto-retry), bu event'i skip et — yoksa failed'e override eder.
+                if target.status == "queued":
+                    pass  # already requeued, no-op
+                else:
+                    url = evt.get("notebook_url", "") or target.notebook_url
+                    target.notebook_url = url
+                    if int(evt.get("exit_code", 1)) == 0:
+                        # Automator işini bitirdi (Generate tıklandı), ama NotebookLM
+                        # Cinematic videoyu 30-60dk'da üretiyor. status="generating"
+                        # olarak işaretle — harvest cycle bunu pick'leyip video URL'i
+                        # geldiğinde "done"a çevirecek.
+                        if url:
+                            target.status = "generating"
+                        else:
+                            target.status = "submitted"
+                    else:
+                        target.status = "failed"
+                        if not target.error:
+                            target.error = "automator exit_code != 0"
+                    target.finished_at = time.time()
+            elif etype == "automation_error":
+                target.error = str(evt.get("error", ""))[:500]
+            save_jobs(jobs)
 
     def _reap_finished(self) -> None:
         """Subprocess'leri reap, kayıt güncellemesi gerek yoksa skip."""

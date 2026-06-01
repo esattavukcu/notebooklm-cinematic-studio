@@ -3866,9 +3866,18 @@ _CUSTOM_CSS = """
   --nlm-radius: 12px;
 }
 
-/* Genel container — daha geniş + biraz nefes */
+/* Streamlit default header bar (~3.75rem) — dark temada üstte koca siyah
+   boşluk yaratıyor. Şeffaf + ince yap, içerik yukarı çekilsin. Sidebar
+   toggle + menü hâlâ erişilebilir (height korunur, sadece arka plan şeffaf). */
+[data-testid="stHeader"] {
+  background: transparent !important;
+  height: 2.2rem !important;
+}
+[data-testid="stToolbar"] { right: 0.5rem; }
+
+/* Genel container — daha geniş + biraz nefes (üst boşluk minimal) */
 .block-container {
-  padding-top: 1.4rem !important;
+  padding-top: 0.6rem !important;
   padding-bottom: 4rem !important;
   max-width: 1400px !important;
 }

@@ -4770,25 +4770,39 @@ def render_user_view() -> None:
 
     # --- Environment routing: URL ?env=dev|prod ---
     env = current_env()
-    # Env badge + dev/prod switch link
+
+    # Auto-fallback: seçili env'de initialized profil yoksa AMA diğer env'de
+    # varsa, otomatik dolu env'e geç. Sticky "dev" session cache'i + boş env
+    # "hesap yok" confusion'ını çözer (kullanıcı manuel link tıklamak zorunda
+    # kalmaz). URL'de açık ?env= varsa ona saygı: sadece session cache fallback.
+    def _env_has_init(e: str) -> bool:
+        return any(
+            (p.environment or "prod").strip().lower() == e and p.initialized
+            for p in profiles_all
+        )
+    if not _env_has_init(env):
+        _other = "prod" if env == "dev" else "dev"
+        if _env_has_init(_other):
+            env = _other
+            st.session_state["_env"] = env
+
+    # Env badge + dev/prod switch link (TEK SATIR HTML — çok satırlı + girintili
+    # HTML'i Streamlit markdown kod-bloğu sanıp bozuyordu, "kesik" görünüm).
     _env_color = "#f59e0b" if env == "dev" else "#10b981"  # dev=turuncu, prod=yeşil
     _env_label = "🧪 DEV" if env == "dev" else "🚀 PROD"
     _other_env = "prod" if env == "dev" else "dev"
     _other_label = "🚀 PROD" if env == "dev" else "🧪 DEV"
     st.markdown(
-        f"""<div style="display:flex; align-items:center; gap:12px;
-              padding:8px 14px; background:{_env_color}15;
-              border-left:4px solid {_env_color};
-              border-radius:8px; margin-bottom:14px;">
-          <span style="font-size:1.1rem; font-weight:700; color:{_env_color};">
-            {_env_label}
-          </span>
-          <span style="opacity:0.6; font-size:0.85rem;">ortamı aktif</span>
-          <a href="?env={_other_env}" style="margin-left:auto;
-              font-size:0.85rem; text-decoration:none;
-              padding:4px 10px; background:#ffffff20;
-              border-radius:6px;">{_other_label} ortamına geç →</a>
-        </div>""",
+        f'<div style="display:flex; align-items:center; gap:12px; padding:10px 16px; '
+        f'background:{_env_color}15; border-left:4px solid {_env_color}; '
+        f'border-radius:8px; margin:4px 0 16px 0;">'
+        f'<span style="font-size:1.05rem; font-weight:700; color:{_env_color};">{_env_label}</span>'
+        f'<span style="opacity:0.6; font-size:0.85rem;">ortamı aktif</span>'
+        f'<a href="?env={_other_env}" target="_self" style="margin-left:auto; '
+        f'font-size:0.85rem; text-decoration:none; padding:4px 10px; '
+        f'background:#ffffff20; border-radius:6px; color:inherit;">'
+        f'{_other_label} ortamına geç →</a>'
+        f'</div>',
         unsafe_allow_html=True,
     )
 

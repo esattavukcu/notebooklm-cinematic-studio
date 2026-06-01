@@ -4982,6 +4982,68 @@ def render_user_view() -> None:
 
     hero("Senaryonu Gönder, Video Üretelim", status_line)
 
+    # ===== 📊 Hesap kotaları (bugün) — TÜM kullanıcılar görür =====
+    # Her hesabın günlük kota kullanımı. Kapasite planlaması için: kaç slot
+    # boş, hangi hesap dolu, hangi hesap kota-blocked / login gerekli.
+    _today_used = {}
+    for _j in jobs:
+        if _j.status not in ("done", "running", "generating", "submitted"):
+            continue
+        if (_j.title or "").startswith("[KOTA]"):
+            continue
+        _ts = _j.started_at or _j.created_at
+        if not _ts:
+            continue
+        try:
+            if datetime.fromtimestamp(_ts).date() != today:
+                continue
+        except (OSError, OverflowError, ValueError):
+            continue
+        _today_used[_j.profile_id] = _today_used.get(_j.profile_id, 0) + 1
+
+    _total_used = sum(
+        min(_today_used.get(p.id, 0), p.daily_limit or 99)
+        for p in initialized_profiles
+    )
+    _total_cap = sum((p.daily_limit or 0) for p in initialized_profiles)
+    _free = max(0, _total_cap - _total_used)
+    _qlabel = (
+        f"📊 Hesap kotaları · bugün {_total_used}/{_total_cap} kullanıldı"
+        f" · {_free} slot boş"
+    )
+    with st.expander(_qlabel, expanded=False):
+        if _total_cap:
+            st.progress(min(1.0, _total_used / _total_cap),
+                        text=f"{_total_used}/{_total_cap} slot kullanıldı (bugün)")
+        # env'deki TÜM profiller (initialized + login-gerekli) — isim sıralı
+        _qcols = st.columns(2)
+        _all_env_profiles = sorted(profiles, key=lambda x: x.name.lower())
+        for _i, _p in enumerate(_all_env_profiles):
+            _used = _today_used.get(_p.id, 0)
+            _lim = _p.daily_limit or 0
+            if not _p.initialized:
+                _icon, _txt = "🔑", "giriş gerekli"
+            elif _profile_blocked(_p.id):
+                _icon, _txt = "🛑", "kota dolu (bugün)"
+            elif _lim and _used >= _lim:
+                _icon, _txt = "🔴", f"{_used}/{_lim} dolu"
+            elif _used == 0:
+                _icon, _txt = "🟢", f"0/{_lim} boş"
+            else:
+                _icon, _txt = "🟡", f"{_used}/{_lim}"
+            _nm = _p.name if len(_p.name) <= 26 else _p.name[:25] + "…"
+            with _qcols[_i % 2]:
+                st.markdown(
+                    f"<div style='font-size:0.85rem; padding:2px 0;'>"
+                    f"{_icon} <b>{_nm}</b> — <span style='opacity:0.75;'>{_txt}</span></div>",
+                    unsafe_allow_html=True,
+                )
+        # Reset bilgisi
+        st.caption(
+            "ℹ️ Kotalar her gün ~03:00 (TR) sıfırlanır. Dolu hesaplar "
+            "yarın otomatik devam eder. 🔑 = admin giriş yapmalı."
+        )
+
     # ===== Phase 4: Revize Modal =====
     # Job history'deki '✏ Revize et' butonuna basılınca revize_target_id set
     # edilir; aşağıda render edilir.

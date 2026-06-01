@@ -4123,26 +4123,82 @@ def send_slack_message(text: str, blocks: list | None = None) -> bool:
 import secrets  # noqa: E402
 
 
-# Streamlit her sayfa render'ında app.py'yi yeniden exec ediyor → module-level
-# dict her seferinde sıfırlanıyor. @st.cache_resource ile bağlayıp Streamlit'in
-# process'i boyunca tek bir paylaşımlı dict tut.
+# Token store — DOSYA-BACKED (restart'a dayanıklı). Eskiden @st.cache_resource
+# process memory'deydi → her servis restart'ında (deploy) tüm session'lar
+# düşüyordu = "refresh'te logout". Şimdi data/.session_tokens.json'da tutulur.
+# Format: {token: {"auth": {...}, "expires": epoch_ts}}. 30 gün TTL.
+SESSION_TOKEN_FILE = DATA_DIR / ".session_tokens.json"
+SESSION_TOKEN_TTL_SEC = 30 * 24 * 3600  # 30 gün
+
+
 @st.cache_resource
-def _token_store() -> dict[str, dict]:
+def _token_store_mem() -> dict[str, dict]:
+    """Process-içi hızlı cache. Dosya ile senkron tutulur."""
     return {}
+
+
+def _load_token_file() -> dict[str, dict]:
+    try:
+        import json as _json
+        with SESSION_TOKEN_FILE.open(encoding="utf-8") as f:
+            return _json.load(f)
+    except (OSError, ValueError):
+        return {}
+
+
+def _save_token_file(store: dict[str, dict]) -> None:
+    try:
+        import json as _json
+        tmp = SESSION_TOKEN_FILE.with_suffix(".tmp")
+        with tmp.open("w", encoding="utf-8") as f:
+            _json.dump(store, f)
+        tmp.replace(SESSION_TOKEN_FILE)
+    except OSError:
+        pass
+
+
+def _prune_expired_tokens(store: dict[str, dict]) -> dict[str, dict]:
+    now = time.time()
+    return {t: v for t, v in store.items()
+            if isinstance(v, dict) and v.get("expires", 0) > now}
 
 
 def _issue_session_token(auth: dict) -> str:
     token = secrets.token_urlsafe(24)
-    _token_store()[token] = auth
+    entry = {"auth": auth, "expires": time.time() + SESSION_TOKEN_TTL_SEC}
+    # Memory + dosya ikisine de yaz
+    _token_store_mem()[token] = entry
+    store = _prune_expired_tokens(_load_token_file())
+    store[token] = entry
+    _save_token_file(store)
     return token
 
 
 def _lookup_session_token(token: str) -> Optional[dict]:
-    return _token_store().get(token) if token else None
+    if not token:
+        return None
+    now = time.time()
+    # Önce memory
+    entry = _token_store_mem().get(token)
+    if entry is None:
+        # Memory'de yok (restart sonrası) → dosyadan oku
+        store = _load_token_file()
+        entry = store.get(token)
+        if entry is not None:
+            _token_store_mem()[token] = entry  # memory'ye geri yükle
+    if not isinstance(entry, dict):
+        return None
+    if entry.get("expires", 0) <= now:
+        return None  # expired
+    return entry.get("auth")
 
 
 def _revoke_session_token(token: str) -> None:
-    _token_store().pop(token, None)
+    _token_store_mem().pop(token, None)
+    store = _load_token_file()
+    if token in store:
+        store.pop(token, None)
+        _save_token_file(store)
 
 
 def _restore_session_from_url() -> None:
@@ -4801,13 +4857,16 @@ def render_user_view() -> None:
     _env_label = "🧪 DEV" if env == "dev" else "🚀 PROD"
     _other_env = "prod" if env == "dev" else "dev"
     _other_label = "🚀 PROD" if env == "dev" else "🧪 DEV"
+    # Env link'i session token'ı (?t=) korumalı — yoksa env değişince logout.
+    _tok = st.session_state.get("session_token", "")
+    _env_href = f"?env={_other_env}" + (f"&t={_tok}" if _tok else "")
     st.markdown(
         f'<div style="display:flex; align-items:center; gap:12px; padding:10px 16px; '
         f'background:{_env_color}15; border-left:4px solid {_env_color}; '
         f'border-radius:8px; margin:4px 0 16px 0;">'
         f'<span style="font-size:1.05rem; font-weight:700; color:{_env_color};">{_env_label}</span>'
         f'<span style="opacity:0.6; font-size:0.85rem;">ortamı aktif</span>'
-        f'<a href="?env={_other_env}" target="_self" style="margin-left:auto; '
+        f'<a href="{_env_href}" target="_self" style="margin-left:auto; '
         f'font-size:0.85rem; text-decoration:none; padding:4px 10px; '
         f'background:#ffffff20; border-radius:6px; color:inherit;">'
         f'{_other_label} ortamına geç →</a>'
@@ -5476,10 +5535,10 @@ def render_user_view() -> None:
     # --- Tekli senaryo akışı: aç/kapa ---
     _show_single = st.toggle(
         "📝 Tekli senaryo oluştur",
-        value=st.session_state.get("show_single_flow", True),
+        value=st.session_state.get("show_single_flow", False),
         key="show_single_flow",
-        help="Tek script yapıştırıp video üret. Kapatırsan sadece "
-             "video listesi + Drive toplu görünür.",
+        help="Tek script yapıştırıp video üret. Genelde toplu (Drive) "
+             "kullanılıyor — varsayılan kapalı. Aç → 3-step akış görünür.",
     )
     if _show_single:
         # ===== 3-Step pipeline state =====

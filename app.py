@@ -6577,25 +6577,34 @@ def render_user_view() -> None:
     _single_jobs = [
         j for j in _visible_jobs if not (j.batch_id or "").strip()
     ]
-    # title → video URL (kapatılan/stopped satırlarda "Aç" linki için).
-    # Kapatılan iş HER ZAMAN en son batch'tedir → başlığının EN YÜKSEK
-    # versiyonuna linklenmeli. Böylece 16:44 kapalı → v2 (o başlıkların en
-    # yükseği), 17:06 kapalı → v3 (recovery v3'ü) otomatik doğru gelir.
-    # Versiyon dosya adından: _vN. → N, suffix yoksa → 1.
-    def _ver_of(url: str) -> int:
-        fn = url.split("?")[0].split("/")[-1]
-        m = re.search(r"_v(\d+)\.mp4$", fn)
-        return int(m.group(1)) if m else 1
-    _title_video_url = {}
-    _title_video_ver = {}
+    # Kapatılan/stopped işlerin "Aç" linki için: kendi video_remote_url'i yok,
+    # ama videosu başka bir kayıtta (recovery / başka versiyon) hazır.
+    # Hangi versiyona linklenmeli? Kapatılan işin created_at'i, aynı başlığın
+    # gerçek çıktıları arasında KAÇINCI jenerasyona denk geliyorsa o versiyona.
+    # Bu kural batch sırasına göre STABİL: 16:44 işi (16:44'te yaratıldı) hep
+    # 2., 17:06 işi (17:06) hep 3. sıraya düşer — daha sonra eklenen 23:02 (v4)
+    # batch'i created_at'i sonra olduğu için bu sırayı kaydırmaz.
+    # (NOT: kapatılan işe video_remote_url PINLEMEK yanlış olur — azure
+    #  versiyon rank'ını [bkz. azure_blob_basename_for_job sibling sayımı]
+    #  bozar. Bu yüzden link display anında çözülür.)
+    _title_outputs = {}  # title → [(created_at, url)] gerçek çıktılar, sıralı
     for j in jobs:
         if not j.video_remote_url:
             continue
         t = (j.title or "").strip()
-        v = _ver_of(j.video_remote_url)
-        if v >= _title_video_ver.get(t, 0):
-            _title_video_ver[t] = v
-            _title_video_url[t] = j.video_remote_url
+        _title_outputs.setdefault(t, []).append((j.created_at, j.video_remote_url))
+    for _t in _title_outputs:
+        _title_outputs[_t].sort(key=lambda x: x[0])
+
+    def _closed_job_url(j) -> str:
+        """Kapatılan iş için created_at-sıralı versiyon linkini döndür."""
+        outs = _title_outputs.get((j.title or "").strip(), [])
+        if not outs:
+            return ""
+        # created_at'i kendinden ÖNCE olan çıktı sayısı → jenerasyon sırası
+        rank = sum(1 for ca, _ in outs if ca < j.created_at) + 1
+        idx = min(rank, len(outs)) - 1  # taşarsa en sonuncuya (en yüksek) düş
+        return outs[idx][1]
 
     if _batch_groups:
         # En yeni batch üstte — batch'in created_at'i (yoksa job'ların max'ı)
@@ -6674,11 +6683,9 @@ def render_user_view() -> None:
                             unsafe_allow_html=True,
                         )
                     with jc[2]:
-                        # Kendi URL'i varsa onu, yoksa (kapatılan iş) aynı
-                        # başlığın mevcut videosunu göster.
-                        _row_url = j.video_remote_url or _title_video_url.get(
-                            (j.title or "").strip(), ""
-                        )
+                        # Kendi URL'i varsa onu, yoksa (kapatılan iş) created_at
+                        # sırasına göre doğru versiyonun linkini göster.
+                        _row_url = j.video_remote_url or _closed_job_url(j)
                         if _row_url:
                             st.markdown(
                                 f"<a href='{_row_url}' target='_blank' "

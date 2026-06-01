@@ -214,7 +214,14 @@ async def _submit_job_async(
         on_event("video_gen_started", task_id=task_id)
 
         # 5. Wait for completion (Cinematic: 30-40dk)
+        # Library'nin "artifact removed... may indicate quota/rate limit OR
+        # invalid notebook ID OR transient API issue" hatası MUĞLAK — bunu
+        # kesin quota sayıp gen'i terk etmek FALSE-POSITIVE yaratıyordu
+        # (Google videoyu aslında tamamlıyor). Bu yüzden wait/download hata
+        # verse bile aşağıda list_video ile GERÇEKTEN tamamlanmış video var mı
+        # kontrol edip indiriyoruz. Sadece hiç video yoksa hata fırlatıyoruz.
         on_event("video_waiting", timeout_sec=video_timeout_sec)
+        wait_err = None
         try:
             final = await c.artifacts.wait_for_completion(
                 nb_id, task_id,
@@ -222,46 +229,68 @@ async def _submit_job_async(
                 max_interval=60.0,
                 timeout=video_timeout_sec,
             )
+            if not getattr(final, "is_complete", False):
+                wait_err = f"is_complete=False (error={getattr(final, 'error', '?')})"
         except Exception as e:
-            raise NotebookLMClientError(
-                f"video wait: {type(e).__name__}: {e}",
-                stage="video_wait", cause=e,
-            )
-        if not getattr(final, "is_complete", False):
-            err = getattr(final, "error", "?")
-            raise NotebookLMClientError(
-                f"video gen failed: {err}", stage="video_wait",
-            )
-        on_event("video_ready", task_id=task_id,
-                 elapsed_sec=int(time.time() - t_start))
+            wait_err = f"{type(e).__name__}: {e}"
 
-        # 6. Download MP4
         download_dir = Path(__file__).parent / "data" / "downloads"
         download_dir.mkdir(parents=True, exist_ok=True)
         out_path = download_dir / f"{nb_id}.mp4"
-        on_event("video_downloading", path=str(out_path))
-        try:
-            saved = await c.artifacts.download_video(
-                nb_id, str(out_path), artifact_id=task_id,
-            )
-        except Exception as e:
+        downloaded_artifact = task_id
+
+        def _ok() -> bool:
+            return out_path.exists() and out_path.stat().st_size >= 10_000
+
+        # 6a. Normal yol — wait başarılıysa task_id ile indir
+        if wait_err is None:
+            on_event("video_downloading", path=str(out_path))
+            try:
+                await c.artifacts.download_video(
+                    nb_id, str(out_path), artifact_id=task_id,
+                )
+            except Exception as e:
+                wait_err = f"download: {type(e).__name__}: {e}"
+
+        # 6b. FALLBACK — wait veya download hata verdiyse: list_video ile
+        # gerçekten tamamlanmış (status=3 / is_complete) video var mı bak,
+        # varsa onu indir. Bu, muğlak hata + Google'ın tamamladığı durumu
+        # kurtarır (false-positive quota'yı önler).
+        if not _ok():
+            on_event("video_verify_via_list", reason=str(wait_err)[:120])
+            try:
+                vids = await c.artifacts.list_video(nb_id)
+                vids = list(vids) if vids else []
+                done_v = [
+                    v for v in vids
+                    if getattr(v, "status", None) == 3
+                    or getattr(v, "is_complete", False)
+                ]
+                if done_v:
+                    v = done_v[0]
+                    downloaded_artifact = getattr(v, "id", task_id)
+                    await c.artifacts.download_video(
+                        nb_id, str(out_path), artifact_id=downloaded_artifact,
+                    )
+                    if _ok():
+                        on_event("video_recovered", artifact_id=downloaded_artifact)
+            except Exception as e:
+                on_event("video_verify_failed", error=str(e)[:120])
+
+        # 6c. Hâlâ indirilemedi → gerçekten video yok (quota/fail).
+        if not _ok():
             raise NotebookLMClientError(
-                f"video download: {type(e).__name__}: {e}",
-                stage="video_download", cause=e,
+                f"video unavailable: {wait_err or 'no completed artifact'}",
+                stage="video_wait",
             )
-        # saved bazen path string, bazen None döner — out_path'i kontrol et
-        if not out_path.exists() or out_path.stat().st_size < 10_000:
-            raise NotebookLMClientError(
-                f"video download: dosya oluşmadı veya boş ({out_path})",
-                stage="video_download",
-            )
+
         on_event("video_downloaded", path=str(out_path),
                  size_mb=out_path.stat().st_size // (1024 * 1024))
 
         return {
             "notebook_id": nb_id,
             "notebook_url": nb_url,
-            "task_id": task_id,
+            "task_id": downloaded_artifact,
             "source_ids": source_ids,
             "local_mp4": str(out_path),
             "duration_sec": int(time.time() - t_start),

@@ -6578,19 +6578,24 @@ def render_user_view() -> None:
         j for j in _visible_jobs if not (j.batch_id or "").strip()
     ]
     # title → video URL (kapatılan/stopped satırlarda "Aç" linki için).
-    # 16:44 batch = v2 olduğu için, kapatılan işlerin linki _v2 versiyonuna
-    # gitmeli (v1/24.05'e değil). Bu yüzden _v2 varyantını tercih et;
-    # yoksa ilk bulunan.
+    # Kapatılan iş HER ZAMAN en son batch'tedir → başlığının EN YÜKSEK
+    # versiyonuna linklenmeli. Böylece 16:44 kapalı → v2 (o başlıkların en
+    # yükseği), 17:06 kapalı → v3 (recovery v3'ü) otomatik doğru gelir.
+    # Versiyon dosya adından: _vN. → N, suffix yoksa → 1.
+    def _ver_of(url: str) -> int:
+        fn = url.split("?")[0].split("/")[-1]
+        m = re.search(r"_v(\d+)\.mp4$", fn)
+        return int(m.group(1)) if m else 1
     _title_video_url = {}
+    _title_video_ver = {}
     for j in jobs:
         if not j.video_remote_url:
             continue
         t = (j.title or "").strip()
-        _fn = j.video_remote_url.split("?")[0].split("/")[-1]
-        if "_v2." in _fn:
-            _title_video_url[t] = j.video_remote_url  # v2'yi her zaman tercih et
-        else:
-            _title_video_url.setdefault(t, j.video_remote_url)
+        v = _ver_of(j.video_remote_url)
+        if v >= _title_video_ver.get(t, 0):
+            _title_video_ver[t] = v
+            _title_video_url[t] = j.video_remote_url
 
     if _batch_groups:
         # En yeni batch üstte — batch'in created_at'i (yoksa job'ların max'ı)

@@ -6409,31 +6409,124 @@ def render_user_view() -> None:
         )
 
     _visible_jobs = [j for j in jobs if not _is_superseded(j)]
-    all_jobs_sorted = sorted(
-        _visible_jobs, key=lambda j: j.created_at, reverse=True
-    )[:80]
 
-    # batch_id → Drive source URL haritası (kaynak linki göstermek için)
+    # batch_id → Batch objesi + Drive source URL haritası
     _batch_source = {}
+    _batch_by_id = {}
     try:
         for _b in load_batches():
+            _batch_by_id[_b.id] = _b
             src = (_b.source or "").strip()
             if src and src.lower() not in ("manuel", "manual"):
                 _batch_source[_b.id] = src
     except Exception:
-        _batch_source = {}
+        _batch_source, _batch_by_id = {}, {}
 
-    section_header(f"🎬 Tüm videolar", f"{len(_visible_jobs)} kayıt (herkes)")
+    # ===== 📁 TOPLU İŞLER (Batch) — Drive bulk takibi =====
+    # Her batch bir expander: başlıkta progress özeti, içinde her job'ın durumu.
+    # _env'e göre filtreli _visible_jobs'ı batch_id'ye göre grupla.
+    _STATUS_ICON = {
+        "done": "✅", "generating": "🎬", "running": "▶", "queued": "⏳",
+        "failed": "❌", "stopped": "⏹", "submitted": "📤",
+    }
+    _batch_groups = {}
+    _single_jobs = []
+    for j in _visible_jobs:
+        bid = (j.batch_id or "").strip()
+        if bid:
+            _batch_groups.setdefault(bid, []).append(j)
+        else:
+            _single_jobs.append(j)
 
-    if not all_jobs_sorted:
-        empty_state(
-            "📭",
-            "Henüz video yok",
-            "Yukarıya senaryonu yapıştır ve gönder.",
-        )
+    if _batch_groups:
+        # En yeni batch üstte — batch'in created_at'i (yoksa job'ların max'ı)
+        def _batch_sortkey(bid):
+            b = _batch_by_id.get(bid)
+            if b and getattr(b, "created_at", 0):
+                return b.created_at
+            return max((j.created_at for j in _batch_groups[bid]), default=0)
+
+        section_header("📁 Toplu işler (Drive)", f"{len(_batch_groups)} batch")
+        for bid in sorted(_batch_groups, key=_batch_sortkey, reverse=True):
+            bjobs = _batch_groups[bid]
+            b = _batch_by_id.get(bid)
+            bname = (b.name if b else None) or "Drive batch"
+            total = (b.total if b and b.total else len(bjobs))
+            n_done = sum(1 for j in bjobs if j.status == "done")
+            n_gen = sum(1 for j in bjobs if j.status in ("generating", "running"))
+            n_q = sum(1 for j in bjobs if j.status == "queued")
+            n_fail = sum(1 for j in bjobs if j.status == "failed")
+            # Expander başlığı — özet
+            head = (
+                f"📁 {bname}  ·  ✅ {n_done}/{total}"
+                + (f"  ·  🎬 {n_gen}" if n_gen else "")
+                + (f"  ·  ⏳ {n_q}" if n_q else "")
+                + (f"  ·  ❌ {n_fail}" if n_fail else "")
+            )
+            with st.expander(head, expanded=(n_done < total and n_gen + n_q > 0)):
+                # Progress bar
+                if total > 0:
+                    st.progress(min(1.0, n_done / total),
+                                text=f"{n_done}/{total} tamamlandı")
+                # Drive linki
+                _src = _batch_source.get(bid, "")
+                if _src:
+                    st.markdown(f"📎 [Drive klasörü]({_src})")
+                # Gönderen
+                _bsub = (b.submitted_by if b else "") or (bjobs[0].submitted_by if bjobs else "")
+                if _bsub:
+                    st.caption(f"👤 {_bsub}")
+                # Per-job kompakt satırlar (created_at sırası)
+                for j in sorted(bjobs, key=lambda x: x.created_at):
+                    icon = _STATUS_ICON.get(j.status, "•")
+                    jc = st.columns([0.4, 4.5, 1.6])
+                    with jc[0]:
+                        st.markdown(f"<div style='font-size:1.1rem;'>{icon}</div>",
+                                    unsafe_allow_html=True)
+                    with jc[1]:
+                        ttl = j.title if len(j.title) <= 60 else j.title[:59] + "…"
+                        # Status alt-metin (kısa)
+                        if j.status == "done":
+                            sub = "hazır"
+                        elif j.status in ("generating", "running"):
+                            sub = "üretiliyor…"
+                        elif j.status == "queued":
+                            sub = "sırada"
+                        elif j.status == "failed":
+                            sub = (j.error or "hata")[:50]
+                        else:
+                            sub = j.status
+                        st.markdown(
+                            f"<div style='font-size:0.85rem; font-weight:500; line-height:1.2;'>{ttl}</div>"
+                            f"<div style='font-size:0.7rem; opacity:0.6;'>{sub}</div>",
+                            unsafe_allow_html=True,
+                        )
+                    with jc[2]:
+                        if j.video_remote_url:
+                            st.markdown(
+                                f"<a href='{j.video_remote_url}' target='_blank' "
+                                f"style='font-size:0.78rem; text-decoration:none; "
+                                f"color:#10B981; font-weight:600;'>☁️ Aç</a>",
+                                unsafe_allow_html=True,
+                            )
+
+    # ===== 🎬 TEKİL VİDEOLAR (batch'siz gönderiler) =====
+    _singles_sorted = sorted(_single_jobs, key=lambda j: j.created_at,
+                             reverse=True)[:80]
+    section_header(f"🎬 Tekil videolar", f"{len(_single_jobs)} kayıt")
+
+    if not _singles_sorted:
+        if not _batch_groups:
+            empty_state(
+                "📭",
+                "Henüz video yok",
+                "Yukarıdan senaryo gönder veya Drive klasörü ekle.",
+            )
+        else:
+            st.caption("Tekil (batch'siz) gönderi yok — hepsi Drive toplu.")
     else:
         st.markdown('<div class="job-row-wrap">', unsafe_allow_html=True)
-        for j in all_jobs_sorted:
+        for j in _singles_sorted:
             mine = _belongs_to_me(j)
             with st.container(border=True):
                 cs = st.columns([1.3, 5, 1.5])

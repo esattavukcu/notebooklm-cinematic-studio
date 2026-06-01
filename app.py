@@ -6683,14 +6683,27 @@ def render_user_view() -> None:
                             unsafe_allow_html=True,
                         )
                     with jc[2]:
-                        # Kendi URL'i varsa onu, yoksa (kapatılan iş) created_at
-                        # sırasına göre doğru versiyonun linkini göster.
-                        _row_url = j.video_remote_url or _closed_job_url(j)
+                        # Link sadece gerçekten videosu olan işlerde:
+                        #  - done: kendi video_remote_url'i
+                        #  - stopped (kapatılan): videosu başka versiyonda hazır
+                        #    → created_at sırasına göre doğru versiyon linki
+                        # queued/running/generating işler HENÜZ kendi videolarını
+                        # üretmedi → "bekliyor" göster (eski versiyona linkleme!).
+                        _row_url = j.video_remote_url
+                        if not _row_url and j.status == "stopped":
+                            _row_url = _closed_job_url(j)
                         if _row_url:
                             st.markdown(
                                 f"<a href='{_row_url}' target='_blank' "
                                 f"style='font-size:0.78rem; text-decoration:none; "
                                 f"color:#10B981; font-weight:600;'>☁️ Aç</a>",
+                                unsafe_allow_html=True,
+                            )
+                        elif j.status in ("queued", "running", "generating",
+                                          "submitted"):
+                            st.markdown(
+                                "<span style='font-size:0.78rem; opacity:0.5;'>"
+                                "⏳ bekliyor</span>",
                                 unsafe_allow_html=True,
                             )
 

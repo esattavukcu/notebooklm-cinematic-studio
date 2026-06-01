@@ -6534,7 +6534,13 @@ def render_user_view() -> None:
             and (j.title or "").strip() in _titles_with_active
         )
 
-    _visible_jobs = [j for j in jobs if not _is_superseded(j)]
+    # [KOTA] marker'ları iç kota-takip kayıtları (quota_exceeded'da yaratılır,
+    # _quota_blocked_today kullanır) — kullanıcıya "video" gibi gösterilmez.
+    _visible_jobs = [
+        j for j in jobs
+        if not _is_superseded(j)
+        and not (j.title or "").startswith("[KOTA]")
+    ]
 
     # batch_id → Batch objesi + Drive source URL haritası
     _batch_source = {}
@@ -7342,15 +7348,19 @@ with tab_bulk:
 
 # -------------------- TAB 2: DURUM --------------------
 with tab_status:
-    jobs = load_jobs()
+    _all_jobs_raw = load_jobs()
+    # [KOTA] marker'ları iç kota-takip kayıtları — sayım/listeden çıkar
+    # (gerçek video değil; quota_hit_profiles tespiti _all_jobs_raw kullanır).
+    jobs = [j for j in _all_jobs_raw if not (j.title or "").startswith("[KOTA]")]
     counts = {"queued": 0, "running": 0, "done": 0, "submitted": 0, "failed": 0, "stopped": 0}
     for j in jobs:
         counts[j.status] = counts.get(j.status, 0) + 1
 
-    # Kota dolu uyarısı: bugün quota_exceeded yiyen profilleri belirgin göster
+    # Kota dolu uyarısı: bugün quota_exceeded yiyen profilleri belirgin göster.
+    # _all_jobs_raw kullan — [KOTA] marker'ları kota tespitinin ana kaynağı.
     today = date.today()
     quota_hit_profiles: dict[str, str] = {}  # profile_name -> last error
-    for j in jobs:
+    for j in _all_jobs_raw:
         if not j.error or "kota" not in j.error.lower() and "limit" not in j.error.lower():
             continue
         ts = j.finished_at or j.started_at or j.created_at

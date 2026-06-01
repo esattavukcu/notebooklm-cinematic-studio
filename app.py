@@ -6454,38 +6454,64 @@ with st.sidebar:
                 )
 
             # --- Lokal init (Mac/PC üstünde Playwright native window) ---
-            # VNC açmadan, kendi makinende Chromium aç. Hazır komutları + rsync
-            # önerisini göster, kullanıcı kopyalar çalıştırır, sonra 'Kontrol et'.
+            # ./deploy/login.sh (interactive, en kolay) veya ./deploy/push_auth.sh
+            # (auth.json varsa tek-tık) önerilir. Manuel rsync de gösterilir
+            # ama mkdir adımı eklenmiş (klasör yoksa fail eder).
             with st.expander("💻 Lokal makineden yenile (VNC gerekmez)"):
+                st.markdown(
+                    "**🥇 En kolay — `deploy/login.sh` (interaktif menü + auto-rsync + smoke):**",
+                )
+                st.code(
+                    "cd /path/to/notebooklm-cinematic-studio\n"
+                    "NLM_SSH_KEY=~/.ssh/dev-internal-00.pem ./deploy/login.sh",
+                    language="bash",
+                )
+                st.markdown(
+                    f"İnteraktif menüden `{p.name}` seç → Chromium açılır → "
+                    "login → Cmd+Q → otomatik rsync + smoke + initialized=True. "
+                    "**Bu seçenek hiçbir manuel adım gerektirmez.**"
+                )
+
+                st.markdown("---")
+                st.markdown(
+                    "**🥈 Auth.json zaten lokalde varsa — `push_auth.sh` (mkdir + rsync + smoke + init flip tek satırda):**"
+                )
+                st.code(
+                    f"./deploy/push_auth.sh {p.id}",
+                    language="bash",
+                )
+
+                st.markdown("---")
+                st.markdown(
+                    "**🛠 Tam manuel (debug/audit için) — 3 adım:**"
+                )
                 init_cmd = (
                     f".venv/bin/python notebooklm_automator.py --init "
                     f"--profile-dir chrome_profiles/{p.id} --authuser {p.authuser}"
                 )
-                st.markdown(
-                    "**1.** Repo dizinine git ve Chromium'u native aç:",
-                    unsafe_allow_html=True,
-                )
-                st.code(f"cd /path/to/notebooklm-cinematic-studio\n{init_cmd}", language="bash")
-                st.markdown(
-                    f"`{p.name}` hesabıyla giriş yap → NotebookLM ana sayfası → "
-                    "auth.json otomatik kaydedilir (Chromium'u kapatabilirsin).",
-                    unsafe_allow_html=True,
-                )
+                st.markdown("**1.** Chromium'u native aç + login:")
+                st.code(f"cd /path/to/notebooklm-cinematic-studio\n{init_cmd}",
+                        language="bash")
                 if LOCAL_INIT_SSH_HOST:
-                    rsync_cmd = (
-                        f"rsync -avz -e \"ssh -i {LOCAL_INIT_SSH_KEY}\" "
-                        f"chrome_profiles/{p.id}/auth.json "
-                        f"{LOCAL_INIT_SSH_HOST}:{LOCAL_INIT_REMOTE_PATH}/"
+                    # mkdir + rsync — klasör yoksa rsync fail etmesin
+                    rsync_block = (
+                        f"# Önce sunucuda klasörü hazırla (yoksa oluştur)\n"
+                        f"ssh -i {LOCAL_INIT_SSH_KEY} {LOCAL_INIT_SSH_HOST} \\\n"
+                        f"  'mkdir -p {LOCAL_INIT_REMOTE_PATH}/chrome_profiles/{p.id}'\n\n"
+                        f"# Sonra auth.json'u rsync ile gönder\n"
+                        f"rsync -avz -e \"ssh -i {LOCAL_INIT_SSH_KEY}\" \\\n"
+                        f"  chrome_profiles/{p.id}/auth.json \\\n"
+                        f"  {LOCAL_INIT_SSH_HOST}:{LOCAL_INIT_REMOTE_PATH}/"
                         f"chrome_profiles/{p.id}/auth.json"
                     )
-                    st.markdown("**2.** Auth.json'u server'a yolla:", unsafe_allow_html=True)
-                    st.code(rsync_cmd, language="bash")
+                    st.markdown("**2.** Klasör yarat + auth.json gönder:")
+                    st.code(rsync_block, language="bash")
                 else:
                     st.caption(
                         "ℹ️ `.env`'de `LOCAL_INIT_SSH_HOST=ubuntu@...` set edersen "
-                        "rsync komutu da hazır şekilde gösterilir."
+                        "mkdir + rsync komutları da hazır şekilde gösterilir."
                     )
-                st.markdown("**3.** Server'a ulaşınca aşağı bas — smoke test yapıp aktive eder:")
+                st.markdown("**3.** Aşağıdaki butona bas — smoke test + initialized=True:")
                 if st.button("✅ Auth.json'um hazır, kontrol et",
                              key=f"verify_local_{p.id}", use_container_width=True):
                     # Server-side smoke test

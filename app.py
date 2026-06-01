@@ -914,15 +914,63 @@ def _azure_prefix_for_env(env: str) -> str:
     return f"{base}/{e}"
 
 
+def _sanitize_blob_stem(title: str) -> str:
+    """Title → blob/dosya-güvenli stem (uzantısız). Boşluk → _, sadece
+    alfanumerik + . _ - kalır (Türkçe karakterler ASCII'ye çevrilir)."""
+    s = (title or "").strip()
+    # Türkçe karakterleri ASCII'ye indir (dosya adı portability)
+    _tr = {"ç": "c", "Ç": "C", "ğ": "g", "Ğ": "G", "ı": "i", "İ": "I",
+           "ö": "o", "Ö": "O", "ş": "s", "Ş": "S", "ü": "u", "Ü": "U"}
+    for k, v in _tr.items():
+        s = s.replace(k, v)
+    s = s.replace(" ", "_")
+    s = re.sub(r"[^A-Za-z0-9._-]", "", s)
+    s = re.sub(r"_+", "_", s).strip("_")
+    return s[:120] or "untitled"
+
+
+def azure_blob_basename_for_job(job_id: str,
+                                jobs: Optional[list] = None) -> str:
+    """Job için Azure blob stem'i (uzantısız) hesapla.
+
+    Title bazlı: 'Mebbty 6 Bty 6 1.6.6.2.0.2 En Discoverybit' →
+    'Mebbty_6_Bty_6_1.6.6.2.0.2_En_Discoverybit'.
+
+    Aynı title'da birden fazla gerçek çıktı (done veya video'su olan) varsa
+    her birine created_at sırasına göre _v1/_v2/_v3 eklenir; tek ise suffix yok.
+    Job bulunamazsa fallback olarak job_id döner.
+    """
+    if jobs is None:
+        jobs = load_jobs()
+    target = next((j for j in jobs if j.id == job_id), None)
+    if target is None:
+        return job_id
+    title = (target.title or "").strip()
+    stem = _sanitize_blob_stem(title)
+    # Aynı title'ın gerçek çıktıları (done ya da video'su olan)
+    siblings = [
+        j for j in jobs
+        if (j.title or "").strip() == title
+        and (j.status == "done" or j.video_remote_url or j.video_local_path)
+    ]
+    if len(siblings) <= 1:
+        return stem
+    siblings.sort(key=lambda j: j.created_at)
+    rank = next((i for i, j in enumerate(siblings, 1) if j.id == job_id),
+                len(siblings))
+    return f"{stem}_v{rank}"
+
+
 def upload_to_azure(local_path: Path, job_id: str,
-                    environment: str = "prod") -> tuple[bool, str, str]:
+                    environment: str = "prod",
+                    blob_basename: Optional[str] = None) -> tuple[bool, str, str]:
     """Returns (success, remote_url_or_empty, error_or_empty).
     SAS-based connection ise döndürdüğü URL'e SAS append'lenir →
     private container'da bile direkt browser'da oynatılabilir.
 
-    environment='dev'|'prod' → blob path 'videos/dev/<id>.mp4' veya
-    'videos/prod/<id>.mp4'. Dev ile prod ayrı klasörler, audit + cleanup
-    için.
+    environment='dev'|'prod' → blob path 'videos/<env>/<name>.mp4'.
+    blob_basename verilirse dosya adı o olur (title-bazlı, okunabilir);
+    None ise azure_blob_basename_for_job(job_id) ile title'dan türetilir.
     """
     if not AZURE_ENABLED:
         return False, "", "azure_disabled"
@@ -934,7 +982,10 @@ def upload_to_azure(local_path: Path, job_id: str,
 
     try:
         env_prefix = _azure_prefix_for_env(environment)
-        blob_name = f"{env_prefix}/{job_id}.mp4"
+        stem = blob_basename or azure_blob_basename_for_job(job_id)
+        if not stem:
+            stem = job_id
+        blob_name = f"{env_prefix}/{stem}.mp4"
         svc = BlobServiceClient.from_connection_string(AZURE_CONN)
         container = svc.get_container_client(AZURE_CONTAINER)
         # Container yoksa oluşturmaya çalış (yetkisi varsa). Yoksa next call fail eder.

@@ -6127,11 +6127,10 @@ def render_user_view() -> None:
     with st.expander("🗂️  Drive klasöründen toplu video üret (40+ docx'i otomatik işle)"):
         render_bulk_drive_section(key_prefix="usr")
 
-    # Senin son istekleri
+    # Tüm videolar — herkesin job'ları tek listede (paylaşımlı görünüm).
     st.markdown("&nbsp;", unsafe_allow_html=True)
     user = _user_name()
-    # Hem display_name hem username ile case-insensitive eşleşme — eski URL-based
-    # ?u=Mustafa job'ları ve yeni auth-based job'ları aynı user'a denk gelsin.
+    # Hem display_name hem username ile case-insensitive eşleşme — "sen" marker'ı için.
     auth = current_user() or {}
     user_lower = user.lower()
     username_lower = auth.get("username", "").lower()
@@ -6140,20 +6139,32 @@ def render_user_view() -> None:
         sb = (j.submitted_by or "").strip().lower()
         return sb == user_lower or sb == username_lower
 
-    my_jobs = [j for j in jobs if _belongs_to_me(j)]
-    my_jobs_sorted = sorted(my_jobs, key=lambda j: j.created_at, reverse=True)[:30]
+    # Bu env'in TÜM job'ları (jobs zaten env'e göre filtrelenmiş — render_user_view
+    # başında). Herkes hepsini görür; submit eden etiketle gösterilir.
+    all_jobs_sorted = sorted(jobs, key=lambda j: j.created_at, reverse=True)[:80]
 
-    section_header(f"📋 Senin son isteklerin", f"{len(my_jobs)} kayıt")
+    # batch_id → Drive source URL haritası (kaynak linki göstermek için)
+    _batch_source = {}
+    try:
+        for _b in load_batches():
+            src = (_b.source or "").strip()
+            if src and src.lower() not in ("manuel", "manual"):
+                _batch_source[_b.id] = src
+    except Exception:
+        _batch_source = {}
 
-    if not my_jobs_sorted:
+    section_header(f"🎬 Tüm videolar", f"{len(jobs)} kayıt (herkes)")
+
+    if not all_jobs_sorted:
         empty_state(
             "📭",
-            "Henüz video isteğin yok",
+            "Henüz video yok",
             "Yukarıya senaryonu yapıştır ve gönder.",
         )
     else:
         st.markdown('<div class="job-row-wrap">', unsafe_allow_html=True)
-        for j in my_jobs_sorted:
+        for j in all_jobs_sorted:
+            mine = _belongs_to_me(j)
             with st.container(border=True):
                 cs = st.columns([1.3, 5, 1.5])
                 with cs[0]:
@@ -6163,6 +6174,14 @@ def render_user_view() -> None:
                     st.markdown(
                         f'<div style="font-size:0.95rem; font-weight:600; line-height:1.3;" '
                         f'title="{j.title}">{title_short}</div>',
+                        unsafe_allow_html=True,
+                    )
+                    # Gönderen etiketi — kim oluşturdu (paylaşımlı görünüm için)
+                    _sb = (j.submitted_by or "").strip() or "?"
+                    _who = "👤 sen" if mine else f"👤 {_sb}"
+                    st.markdown(
+                        f'<div style="font-size:0.72rem; opacity:0.6; margin-top:1px;">'
+                        f'{_who}</div>',
                         unsafe_allow_html=True,
                     )
                     # Status'a göre alt-açıklama
@@ -6263,6 +6282,26 @@ def render_user_view() -> None:
                                       help="Bu videoyu source yapıp yeni bir Cinematic üret"):
                             st.session_state["revize_target_id"] = j.id
                             st.rerun()
+
+                # --- Kaynak metni + Drive linki (kart altı, full-width) ---
+                _drive_src = _batch_source.get(j.batch_id, "") if j.batch_id else ""
+                _txt = (j.text or "").strip()
+                if _drive_src or _txt:
+                    with st.expander("📄 Kaynak metni gör"):
+                        if _drive_src:
+                            st.markdown(
+                                f'📎 **Drive klasörü:** [{_drive_src[:70]}…]({_drive_src})'
+                                if len(_drive_src) > 70 else
+                                f'📎 **Drive klasörü:** [{_drive_src}]({_drive_src})'
+                            )
+                        if j.learning_objectives and j.learning_objectives.strip():
+                            st.markdown("**🎯 Learning Objectives:**")
+                            st.text(j.learning_objectives.strip()[:3000])
+                            st.markdown("**📝 Script:**")
+                        if _txt:
+                            st.text(_txt[:8000])
+                            if len(_txt) > 8000:
+                                st.caption(f"… (+{len(_txt) - 8000} karakter daha)")
         st.markdown('</div>', unsafe_allow_html=True)
 
     # Footer: logout

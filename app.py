@@ -6577,12 +6577,20 @@ def render_user_view() -> None:
     _single_jobs = [
         j for j in _visible_jobs if not (j.batch_id or "").strip()
     ]
-    # title → mevcut bir video URL'si (kapatılan/stopped satırlarda "Aç" linki
-    # için — videosu başka kayıtta olan işler de açılabilsin).
+    # title → video URL (kapatılan/stopped satırlarda "Aç" linki için).
+    # 16:44 batch = v2 olduğu için, kapatılan işlerin linki _v2 versiyonuna
+    # gitmeli (v1/24.05'e değil). Bu yüzden _v2 varyantını tercih et;
+    # yoksa ilk bulunan.
     _title_video_url = {}
     for j in jobs:
-        if j.video_remote_url:
-            _title_video_url.setdefault((j.title or "").strip(), j.video_remote_url)
+        if not j.video_remote_url:
+            continue
+        t = (j.title or "").strip()
+        _fn = j.video_remote_url.split("?")[0].split("/")[-1]
+        if "_v2." in _fn:
+            _title_video_url[t] = j.video_remote_url  # v2'yi her zaman tercih et
+        else:
+            _title_video_url.setdefault(t, j.video_remote_url)
 
     if _batch_groups:
         # En yeni batch üstte — batch'in created_at'i (yoksa job'ların max'ı)

@@ -166,6 +166,12 @@ AUTH_HEALTH_CHECK_INTERVAL_SEC = int(os.environ.get(
 AUTH_HEALTH_PROBE_TIMEOUT_SEC = 25  # smoke_test per profile timeout
 JOB_LOG_TAIL_LINES = 400
 
+# Daily özet (günsonu Slack raporu) — günde 1×, belirtilen UTC saatte.
+# Default 17:00 UTC = 20:00 İstanbul (gün sonu). Son gönderim tarihi
+# data/.last_daily_summary dosyasında tutulur (restart-safe, double-send yok).
+DAILY_SUMMARY_HOUR_UTC = int(os.environ.get("DAILY_SUMMARY_HOUR_UTC", "17"))
+DAILY_SUMMARY_STATE_FILE = DATA_DIR / ".last_daily_summary"
+
 # Harvest module config — env var ile override edilebilir.
 # NotebookLM video üretimi gerçekte 60-90 dk sürüyor (READMEdeki "25-60dk"
 # bilgi yanıltıcı). Default'ları gerçek deneyimle hizaladık:
@@ -1869,9 +1875,104 @@ class Worker:
                 if time.time() - last_auth_health_check >= AUTH_HEALTH_CHECK_INTERVAL_SEC:
                     self._auth_health_check_round()
                     last_auth_health_check = time.time()
+                # Günsonu özet — günde 1×, DAILY_SUMMARY_HOUR_UTC saatinde
+                self._daily_summary_round()
             except Exception as e:
                 launcher_log(f"dispatch error: {e!r}")
             self._stop_evt.wait(DISPATCH_INTERVAL_SEC)
+
+    def _daily_summary_round(self) -> None:
+        """Günde 1× Slack özet raporu (DAILY_SUMMARY_HOUR_UTC saatinde).
+
+        İçerik: bugün üretilen video, fail, kota-block profil, env dağılımı.
+        Son gönderim tarihi data/.last_daily_summary'de tutulur → restart-safe,
+        aynı gün iki kez göndermez.
+        """
+        if not SLACK_ENABLED:
+            return
+        now = datetime.now()  # server UTC
+        if now.hour < DAILY_SUMMARY_HOUR_UTC:
+            return  # henüz vakti gelmedi
+        today_str = now.strftime("%Y-%m-%d")
+        # Son gönderim tarihini oku
+        try:
+            last = DAILY_SUMMARY_STATE_FILE.read_text(encoding="utf-8").strip()
+        except (OSError, FileNotFoundError):
+            last = ""
+        if last == today_str:
+            return  # bugün zaten gönderildi
+
+        # Bugünün istatistiği
+        jobs = load_jobs()
+        today = now.date()
+
+        def _is_today(j: Job) -> bool:
+            ts = j.started_at or j.created_at
+            if not ts:
+                return False
+            try:
+                return datetime.fromtimestamp(ts).date() == today
+            except (OSError, OverflowError, ValueError):
+                return False
+
+        today_jobs = [j for j in jobs if _is_today(j)]
+        done = [j for j in today_jobs if j.status == "done"]
+        failed = [j for j in today_jobs
+                  if j.status == "failed"
+                  and not (j.title or "").startswith("[KOTA]")]
+        # Env dağılımı (done)
+        env_done = {}
+        for j in done:
+            e = (j.environment or "prod")
+            env_done[e] = env_done.get(e, 0) + 1
+        env_line = " · ".join(f"{e}: {n}" for e, n in sorted(env_done.items())) or "—"
+
+        # Kota-block profiller (son 8h)
+        try:
+            cutoff = time.time() - QUOTA_BLOCK_HOURS * 3600
+            quota_profiles = set()
+            for j in jobs:
+                if not j.error:
+                    continue
+                el = j.error.lower()
+                if "kota" not in el and "limit" not in el:
+                    continue
+                ts = j.finished_at or j.started_at or j.created_at
+                if ts and ts > cutoff and j.profile_name:
+                    quota_profiles.add(j.profile_name)
+        except Exception:
+            quota_profiles = set()
+
+        # Expired (initialized=False) profiller
+        try:
+            expired = [p.name for p in load_profiles() if not p.initialized]
+        except Exception:
+            expired = []
+
+        lines = [
+            f"📅 *Günsonu Özet — {today_str}*",
+            f"✅ Üretilen video: *{len(done)}*  ❌ Hatalı: *{len(failed)}*",
+            f"🌍 Env: {env_line}",
+        ]
+        if quota_profiles:
+            lines.append(f"🛑 Kota dolu profiller: {', '.join(sorted(quota_profiles))}")
+        if expired:
+            lines.append(
+                f"🔑 Login gereken profiller: {', '.join(expired)} "
+                f"→ `./deploy/login.sh`"
+            )
+        if failed:
+            fl = "\n".join(f"  • {j.title[:55]}" for j in failed[:5])
+            extra = f" (+{len(failed)-5})" if len(failed) > 5 else ""
+            lines.append(f"*Hatalılar{extra}:*\n{fl}")
+
+        send_slack_message("\n".join(lines))
+        try:
+            DAILY_SUMMARY_STATE_FILE.write_text(today_str, encoding="utf-8")
+        except OSError:
+            pass
+        launcher_log(f"Daily summary gönderildi: {today_str} "
+                     f"(done={len(done)}, failed={len(failed)})")
 
     def _batch_monitor_round(self) -> None:
         """Batch (toplu import oturumu) yaşam döngüsünü izler, Slack bildirimleri gönderir.
@@ -2952,7 +3053,10 @@ class Worker:
                             j.harvest_error = f"Azure upload failed: {err}"
                         break
                 save_jobs(jobs2)
-                if _slack_job:
+                # Per-video "Video hazır" sadece batch'siz (tek-script) job'larda.
+                # Batch job'lar için batch özeti (progress + oturum tamamlandı)
+                # bildirimleri var — 40 videoluk batch'te 40 ayrı mesaj olmasın.
+                if _slack_job and ok and not (_slack_job.batch_id or "").strip():
                     _submitter = f" · gönderen: {_slack_job.submitted_by}" if _slack_job.submitted_by else ""
                     send_slack_message(
                         f"✅ *Video hazır:* <{remote_url}|{_slack_job.title[:120]}>"
@@ -3612,7 +3716,9 @@ class Worker:
                             _slack_job = j
                             break
                     save_jobs(jobs)
-                    if _slack_job:
+                    # Per-video bildirim sadece batch'siz job'larda (bkz.
+                    # _run_job_via_notebooklm'deki aynı kural).
+                    if _slack_job and not (_slack_job.batch_id or "").strip():
                         _submitter = (
                             f" · gönderen: {_slack_job.submitted_by}"
                             if _slack_job.submitted_by else ""
@@ -6996,7 +7102,22 @@ with tab_status:
     else:
         st.caption("ℹ️ Azure kapalı (`AZURE_STORAGE_CONNECTION_STRING` env var set edilmedi)")
     if SLACK_ENABLED:
-        st.caption("🔔 Slack bildirimleri aktif")
+        _sc = st.columns([3, 1])
+        with _sc[0]:
+            st.caption(
+                "🔔 Slack bildirimleri aktif · per-video (tek-script), batch "
+                "özeti, auth alert, günsonu rapor"
+            )
+        with _sc[1]:
+            if st.button("📨 Test mesajı", key="slack_test", use_container_width=True):
+                ok = send_slack_message(
+                    f"📨 *Test bildirimi* — admin panelden gönderildi "
+                    f"({datetime.now().strftime('%H:%M')})"
+                )
+                if ok:
+                    st.toast("Slack test mesajı gönderildi ✓", icon="📨")
+                else:
+                    st.toast("Slack gönderilemedi — webhook'u kontrol et", icon="⚠️")
     else:
         st.caption("🔕 Slack kapalı (`SLACK_WEBHOOK_URL` env var set edilmedi)")
 

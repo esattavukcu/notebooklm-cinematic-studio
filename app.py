@@ -6561,14 +6561,28 @@ def render_user_view() -> None:
         "done": "✅", "generating": "🎬", "running": "▶", "queued": "⏳",
         "failed": "❌", "stopped": "⏹", "submitted": "📤",
     }
+    # Batch gruplaması: TÜM batch job'ları ([KOTA] hariç) — dedup UYGULAMA.
+    # Kullanıcı batch içinde her işin akıbetini görsün (done + stopped/closed +
+    # failed dahil). Aksi halde kapatılan/superseded işler gizlenip "9/13 ama
+    # 9 satır" gibi kafa karıştıran görünüm oluyordu.
+    _env_jobs_no_kota = [
+        j for j in jobs if not (j.title or "").startswith("[KOTA]")
+    ]
     _batch_groups = {}
-    _single_jobs = []
-    for j in _visible_jobs:
+    for j in _env_jobs_no_kota:
         bid = (j.batch_id or "").strip()
         if bid:
             _batch_groups.setdefault(bid, []).append(j)
-        else:
-            _single_jobs.append(j)
+    # Tekil (batch'siz) liste: dedup uygula (flat görünüm temiz kalsın)
+    _single_jobs = [
+        j for j in _visible_jobs if not (j.batch_id or "").strip()
+    ]
+    # title → mevcut bir video URL'si (kapatılan/stopped satırlarda "Aç" linki
+    # için — videosu başka kayıtta olan işler de açılabilsin).
+    _title_video_url = {}
+    for j in jobs:
+        if j.video_remote_url:
+            _title_video_url.setdefault((j.title or "").strip(), j.video_remote_url)
 
     if _batch_groups:
         # En yeni batch üstte — batch'in created_at'i (yoksa job'ların max'ı)
@@ -6588,18 +6602,25 @@ def render_user_view() -> None:
             n_gen = sum(1 for j in bjobs if j.status in ("generating", "running"))
             n_q = sum(1 for j in bjobs if j.status == "queued")
             n_fail = sum(1 for j in bjobs if j.status == "failed")
+            n_closed = sum(1 for j in bjobs if j.status == "stopped")
+            # "Tamamlanmış" = done + kapatılan (videosu başka versiyonda var).
+            # Kapatılanlar da o başlık için hazır sayılır → progress'e dahil.
+            n_handled = n_done + n_closed
             # Expander başlığı — özet
             head = (
                 f"📁 {bname}  ·  ✅ {n_done}/{total}"
+                + (f"  ·  ⏹ {n_closed} kapalı" if n_closed else "")
                 + (f"  ·  🎬 {n_gen}" if n_gen else "")
                 + (f"  ·  ⏳ {n_q}" if n_q else "")
                 + (f"  ·  ❌ {n_fail}" if n_fail else "")
             )
-            with st.expander(head, expanded=(n_done < total and n_gen + n_q > 0)):
-                # Progress bar
+            with st.expander(head, expanded=(n_handled < total and n_gen + n_q > 0)):
+                # Progress bar — done + kapatılan (hepsi o başlık için hazır)
                 if total > 0:
-                    st.progress(min(1.0, n_done / total),
-                                text=f"{n_done}/{total} tamamlandı")
+                    _ptxt = f"{n_done}/{total} üretildi"
+                    if n_closed:
+                        _ptxt += f" · {n_closed} zaten mevcuttu"
+                    st.progress(min(1.0, n_handled / total), text=_ptxt)
                 # Drive linki
                 _src = _batch_source.get(bid, "")
                 if _src:
@@ -6626,6 +6647,12 @@ def render_user_view() -> None:
                             sub = "sırada"
                         elif j.status == "failed":
                             sub = (j.error or "hata")[:50]
+                        elif j.status == "stopped":
+                            _e = (j.error or "").lower()
+                            if "zaten" in _e or "mevcut" in _e or "recovery" in _e:
+                                sub = "✓ video başka versiyonda hazır"
+                            else:
+                                sub = "durduruldu"
                         else:
                             sub = j.status
                         st.markdown(
@@ -6634,9 +6661,14 @@ def render_user_view() -> None:
                             unsafe_allow_html=True,
                         )
                     with jc[2]:
-                        if j.video_remote_url:
+                        # Kendi URL'i varsa onu, yoksa (kapatılan iş) aynı
+                        # başlığın mevcut videosunu göster.
+                        _row_url = j.video_remote_url or _title_video_url.get(
+                            (j.title or "").strip(), ""
+                        )
+                        if _row_url:
                             st.markdown(
-                                f"<a href='{j.video_remote_url}' target='_blank' "
+                                f"<a href='{_row_url}' target='_blank' "
                                 f"style='font-size:0.78rem; text-decoration:none; "
                                 f"color:#10B981; font-weight:600;'>☁️ Aç</a>",
                                 unsafe_allow_html=True,

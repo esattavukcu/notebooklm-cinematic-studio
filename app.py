@@ -856,14 +856,40 @@ def _pid_alive(pid: int) -> bool:
 
 
 def cleanup_stale_jobs() -> int:
+    """Streamlit/servis restart sonrası "running" kalan job'ları temizle.
+
+    İKİ farklı job tipi var:
+    - Subprocess (legacy tmc/nlm + Playwright): j.pid > 0. PID ölüyse stale.
+    - Thread-based (notebooklm-py): pid=0 (subprocess yok, thread'de koşar).
+      running→generating geçişi saniyeler sürdüğü için pid=0'ı ANINDA ölü
+      saymak FALSE POSITIVE yaratıyordu ("Process kayboldu" — notebook bile
+      yaratılmış job'lar failed işaretleniyordu). pid=0 job sadece çok uzun
+      (15dk+) "running" kaldıysa stale say.
+    """
     jobs = load_jobs()
     changed = 0
+    now = time.time()
+    STALE_THREAD_SEC = 15 * 60
     for j in jobs:
-        if j.status == "running" and not _pid_alive(j.pid):
-            j.status = "failed"
-            j.error = j.error or "Process kayboldu (stale state)"
-            j.finished_at = time.time()
-            changed += 1
+        if j.status != "running":
+            continue
+        if j.pid and j.pid > 0:
+            # Subprocess job — PID ölüyse stale (eski davranış)
+            if not _pid_alive(j.pid):
+                j.status = "failed"
+                j.error = j.error or "Process kayboldu (stale state)"
+                j.finished_at = time.time()
+                changed += 1
+        else:
+            # Thread-based notebooklm-py job (pid=0). Normalde running→generating
+            # saniyeler içinde geçer. 15dk+ running kaldıysa thread gerçekten
+            # öldü (restart) → stale. Kısa pencerede dokunma.
+            age = now - (j.started_at or j.created_at)
+            if age > STALE_THREAD_SEC:
+                j.status = "failed"
+                j.error = j.error or "Thread kayboldu (15dk+ running, stale)"
+                j.finished_at = time.time()
+                changed += 1
     if changed:
         save_jobs(jobs)
     return changed

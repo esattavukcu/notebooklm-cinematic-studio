@@ -2495,6 +2495,12 @@ class Worker:
                 continue
             if j.status not in COUNTED_STATUSES:
                 continue
+            # [KOTA] markerları (failed statü) üretilmiş video değil, yalnız
+            # kota-takip kaydı — daily_limit'i TÜKETMEMELİ. Aksi halde gece
+            # kota-fail'leri günlük limiti doldurup 8h-blok açıldıktan sonra
+            # bile dispatch'i bloklar (panel ile çelişir: panel [KOTA] dışlar).
+            if (j.title or "").startswith("[KOTA]"):
+                continue
             ts = j.started_at or j.created_at
             try:
                 d = datetime.fromtimestamp(ts).date()
@@ -4976,7 +4982,7 @@ def render_user_view() -> None:
     if no_profile:
         status_line = "Yönetici hesap eklemeli"
     elif all_blocked:
-        status_line = "Tüm hesaplar bugün kotaya doldu — yarın resetlenir"
+        status_line = "Tüm hesaplar kotaya doldu — ~8 saatte bir otomatik yeniden denenir"
     else:
         status_line = f"{len(available_profiles)} hesap hazır · bugün {today_total} video tetiklendi"
 
@@ -5038,10 +5044,14 @@ def render_user_view() -> None:
                     f"{_icon} <b>{_nm}</b> — <span style='opacity:0.75;'>{_txt}</span></div>",
                     unsafe_allow_html=True,
                 )
-        # Reset bilgisi
+        # Reset bilgisi — NotebookLM Cinematic kotasının sabit reset saati YOK
+        # (ampirik: Pasifik gece yarısında bile dolu çıkabiliyor, rolling gibi).
+        # Sistem dolu hesabı ~8 saatte bir otomatik tekrar dener; kota açılınca
+        # kendiliğinden üretime devam eder.
         st.caption(
-            "ℹ️ Kotalar her gün ~03:00 (TR) sıfırlanır. Dolu hesaplar "
-            "yarın otomatik devam eder. 🔑 = admin giriş yapmalı."
+            "ℹ️ NotebookLM kotasının sabit reset saati yok (düzensiz/rolling). "
+            "Dolu hesaplar ~8 saatte bir otomatik yeniden denenir; kota "
+            "açıldığında üretim kendiliğinden devam eder. 🔑 = admin giriş yapmalı."
         )
 
     # ===== Phase 4: Revize Modal =====

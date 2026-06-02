@@ -2511,7 +2511,17 @@ class Worker:
         return n
 
     def _busy_count_for(self, jobs: list[Job], profile_id: str) -> int:
-        return sum(1 for j in jobs if j.profile_id == profile_id and j.status == "running")
+        # In-flight = running + generating + submitted (HEPSİ slot işgal eder).
+        # ÖNCEDEN sadece "running" sayılıyordu → iş "running"dan "generating"e
+        # geçince busy=0 görünüyor, dispatcher aynı hesaba bir tane daha
+        # gönderiyordu → max_concurrent=1 olsa bile BURST (8 iş aynı anda
+        # submit → 2-core sunucu load 38). Artık generating de sayılır →
+        # max_concurrent gerçekten uygulanır, eşzamanlı submit sınırlanır.
+        return sum(
+            1 for j in jobs
+            if j.profile_id == profile_id
+            and j.status in ("running", "generating", "submitted")
+        )
 
     def _quota_blocked_today(self, jobs: list[Job], profile_id: str) -> bool:
         """NotebookLM kota dolu mesajı son N saat içinde yiyen profil — pas geç.

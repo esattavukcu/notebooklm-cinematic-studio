@@ -144,6 +144,12 @@ if DEFAULT_ENV not in ALLOWED_ENVS:
     DEFAULT_ENV = "dev"
 
 DISPATCH_INTERVAL_SEC = 2.0
+# GLOBAL eşzamanlı-submission limiti (TÜM hesaplar toplamı). 2-core sunucu
+# aynı anda çok "submission" (Chromium aç + notebook+source upload + create-video)
+# kaldırmıyor — 8 paralel submit load'u 38'e çıkarmıştı. "running" statüsü =
+# aktif submission fazı; generating (Google'da render, yük ~0) sayılmaz. Yani
+# çok video AYNI ANDA generating olabilir ama AYNI ANDA ≤N tanesi submit edilir.
+GLOBAL_MAX_SUBMITTING = int(os.environ.get("GLOBAL_MAX_SUBMITTING", "2"))
 # Profil NotebookLM kota hatası yedikten sonra kaç saat block kalır?
 # Google'ın gerçek reset zamanı Pacific time (~07-08:00 UTC) — bizim UTC date
 # rollover ile uyumsuz. 8h block + self-correct retry: max 8h overshoot,
@@ -2579,8 +2585,17 @@ class Worker:
         envs_with_profile = set(
             (p.environment or "prod").strip().lower() for p in profiles
         )
+        # GLOBAL submission throttle: şu an kaç iş aktif submit ediliyor?
+        # ("running"/"submitted" = heavy Chromium fazı; generating sayılmaz.)
+        # Bu round'da yeni launch ettikçe sayacı artır; limit dolunca dur →
+        # kalan kuyruk sonraki round'larda (her 2sn) kademeli akar.
+        submitting_now = sum(
+            1 for j in jobs if j.status in ("running", "submitted")
+        )
         any_dispatched = False
         for job in list(queued):
+            if submitting_now >= GLOBAL_MAX_SUBMITTING:
+                break  # global submission limiti — gerisi sonraki round'da
             job_env = (job.environment or "prod").strip().lower()
             if job_env not in ALLOWED_ENVS:
                 job_env = "prod"
@@ -2611,6 +2626,7 @@ class Worker:
             target_profile = matching[0]
             self._launch_job(job, target_profile)
             slot_map[target_profile.id] -= 1
+            submitting_now += 1  # global submission sayacı
             target_profile.last_used = time.time()
             any_dispatched = True
 

@@ -144,11 +144,28 @@ if DEFAULT_ENV not in ALLOWED_ENVS:
     DEFAULT_ENV = "dev"
 
 DISPATCH_INTERVAL_SEC = 2.0
-# Profil NotebookLM kota hatası yedikten sonra kaç saat block kalır?
-# Google'ın gerçek reset zamanı Pacific time (~07-08:00 UTC) — bizim UTC date
-# rollover ile uyumsuz. 8h block + self-correct retry: max 8h overshoot,
-# gerçek reset zamanını otomatik bulur.
+# Profil NotebookLM kota hatası yedikten sonra kaç saat block kalır? (FALLBACK)
+# Asıl mantık _last_pacific_reset_ts() ile Pacific gece yarısına hizalı; bu
+# değer sadece zoneinfo bulunamazsa devreye girer.
 QUOTA_BLOCK_HOURS = float(os.environ.get("QUOTA_BLOCK_HOURS", "8"))
+
+
+def _last_pacific_reset_ts() -> float:
+    """NotebookLM kota günü Pacific time'da döner; en son Pacific gece yarısının
+    (America/Los_Angeles 00:00) unix timestamp'i. Kota hatası bu andan SONRA
+    olduysa profil o Pacific-günü için kotalı demektir; bir sonraki Pacific gece
+    yarısında (Google reset) otomatik açılır. DST'yi zoneinfo halleder.
+    zoneinfo yoksa son QUOTA_BLOCK_HOURS saati döndür (eski davranış).
+    """
+    try:
+        from zoneinfo import ZoneInfo
+        from datetime import timedelta
+        pt = ZoneInfo("America/Los_Angeles")
+        now_pt = datetime.now(timezone.utc).astimezone(pt)
+        midnight_pt = now_pt.replace(hour=0, minute=0, second=0, microsecond=0)
+        return midnight_pt.astimezone(timezone.utc).timestamp()
+    except Exception:
+        return time.time() - QUOTA_BLOCK_HOURS * 3600
 
 # Stale "generating" job auto-resume parametreleri (notebooklm-py path için).
 # Server restart → thread öldü → MP4 indirilemedi senaryosu için sweeper.
@@ -2488,19 +2505,24 @@ class Worker:
             )
 
     def _today_count_for(self, jobs: list[Job], profile_id: str) -> int:
-        today = date.today()
+        """Bu profilin bu Pacific-kota-gününde ürettiği/üretmekte olduğu gerçek
+        video sayısı (daily_limit için). [KOTA] markerları ve failed işler
+        SAYILMAZ — onlar üretilmiş video değil, yalnız kota-takip kaydı; aksi
+        halde gece kota-fail'leri daily_limit'i tüketip reset sonrası dispatch'i
+        bloklardı. Pencere Pacific reset'ine hizalı (panel sayımıyla birebir).
+        """
+        cutoff = _last_pacific_reset_ts()
         n = 0
         for j in jobs:
             if j.profile_id != profile_id:
                 continue
-            if j.status not in COUNTED_STATUSES:
+            # Sadece gerçek üretim: done + in-flight (failed/[KOTA] hariç)
+            if j.status not in ("done", "running", "generating", "submitted"):
+                continue
+            if (j.title or "").startswith("[KOTA]"):
                 continue
             ts = j.started_at or j.created_at
-            try:
-                d = datetime.fromtimestamp(ts).date()
-            except (OSError, OverflowError, ValueError):
-                continue
-            if d == today:
+            if ts and ts >= cutoff:
                 n += 1
         return n
 
@@ -2508,16 +2530,14 @@ class Worker:
         return sum(1 for j in jobs if j.profile_id == profile_id and j.status == "running")
 
     def _quota_blocked_today(self, jobs: list[Job], profile_id: str) -> bool:
-        """NotebookLM kota dolu mesajı son N saat içinde yiyen profil — pas geç.
+        """Profil bu Pacific-kota-gününde kota hatası yediyse pas geç.
 
-        Önceden 'bugün UTC date' check'i vardı. Sorun: NotebookLM kota reset'i
-        Pacific time (~07-08:00 UTC) iken bizim UTC date 00:00'da rollover
-        oluyordu → 00:00 UTC'de retry, Google hâlâ kotalı, empirical fail
-        → 1 gün kayıp. Şimdi son 8 saat içinde kota hatası yedikse blokla;
-        8 saatte bir self-correctively retry → Google reset'e otomatik denk
-        gelir, max 8 saat overshoot.
+        NotebookLM kota reset'i Pacific gece yarısında (PDT'de 07:00 UTC =
+        10:00 TR). Profil son Pacific reset'inden SONRA kota hatası yediyse o
+        gün için kotalı → bir sonraki Pacific gece yarısında otomatik açılır
+        (Google reset'iyle TAM hizalı, erken-retry / 8h-sarkma yok).
         """
-        cutoff = time.time() - QUOTA_BLOCK_HOURS * 3600
+        cutoff = _last_pacific_reset_ts()
         for j in jobs:
             if j.profile_id != profile_id:
                 continue
@@ -2527,7 +2547,7 @@ class Worker:
             if "kota" not in err_lower and "limit" not in err_lower:
                 continue
             ts = j.finished_at or j.started_at or j.created_at
-            if ts > cutoff:
+            if ts >= cutoff:
                 return True
         return False
 
@@ -4944,19 +4964,25 @@ def render_user_view() -> None:
     jobs = [j for j in jobs_all
             if (j.environment or "prod").strip().lower() == env]
 
-    # Aktif hesap sayısı + bugün üretilen toplam
+    # Aktif hesap sayısı + bu Pacific-kota-gününde üretilen toplam.
+    # NotebookLM kotası Pacific gece yarısında (~10:00 TR) resetlenir; sayım da
+    # buna hizalı olmalı ki "yeni TR günü ama kota yok" karışıklığı olmasın.
+    # [KOTA]/failed sayılmaz (gerçek video değil — dispatcher ile birebir).
     initialized_profiles = [p for p in profiles if p.initialized]
+    _pac_cutoff = _last_pacific_reset_ts()
     today_total = sum(
         1 for j in jobs
-        if j.status in COUNTED_STATUSES and j.started_at
-        and datetime.fromtimestamp(j.started_at).date() == today
+        if j.status in ("done", "running", "generating", "submitted")
+        and not (j.title or "").startswith("[KOTA]")
+        and (j.started_at or j.created_at)
+        and (j.started_at or j.created_at) >= _pac_cutoff
     )
 
     # Kullanılabilir hesap var mı? (Kota dolu olanlar hariç)
-    # Time-based block: son QUOTA_BLOCK_HOURS saat içinde kota hatası yediyse pas
-    # geç (UTC date rollover yerine; Google'ın Pacific reset'iyle uyumlu).
+    # Pacific-reset-aligned block: profil bu Pacific-kota-gününde kota hatası
+    # yediyse pas geç; sonraki Pacific gece yarısında (Google reset) açılır.
     def _profile_blocked(pid: str) -> bool:
-        cutoff = time.time() - QUOTA_BLOCK_HOURS * 3600
+        cutoff = _last_pacific_reset_ts()
         for j in jobs:
             if j.profile_id != pid or not j.error:
                 continue
@@ -4964,7 +4990,7 @@ def render_user_view() -> None:
             if "kota" not in err and "limit" not in err:
                 continue
             ts = j.finished_at or j.started_at or j.created_at
-            if ts > cutoff:
+            if ts >= cutoff:
                 return True
         return False
 
@@ -4992,12 +5018,7 @@ def render_user_view() -> None:
         if (_j.title or "").startswith("[KOTA]"):
             continue
         _ts = _j.started_at or _j.created_at
-        if not _ts:
-            continue
-        try:
-            if datetime.fromtimestamp(_ts).date() != today:
-                continue
-        except (OSError, OverflowError, ValueError):
+        if not _ts or _ts < _pac_cutoff:
             continue
         _today_used[_j.profile_id] = _today_used.get(_j.profile_id, 0) + 1
 
@@ -5038,10 +5059,23 @@ def render_user_view() -> None:
                     f"{_icon} <b>{_nm}</b> — <span style='opacity:0.75;'>{_txt}</span></div>",
                     unsafe_allow_html=True,
                 )
-        # Reset bilgisi
+        # Reset bilgisi — NotebookLM kotası Pacific gece yarısında resetlenir.
+        # Gerçek sonraki reset zamanını TR olarak hesapla (DST otomatik).
+        _reset_str = "Pasifik gece yarısı (~10:00 TR)"
+        try:
+            from zoneinfo import ZoneInfo as _ZI
+            from datetime import timedelta as _td
+            _pt = _ZI("America/Los_Angeles"); _tr = _ZI("Europe/Istanbul")
+            _now_pt = datetime.now(timezone.utc).astimezone(_pt)
+            _next = (_now_pt.replace(hour=0, minute=0, second=0, microsecond=0)
+                     + _td(days=1)).astimezone(_tr)
+            _reset_str = f"~{_next.strftime('%H:%M')} TR (Pasifik gece yarısı)"
+        except Exception:
+            pass
         st.caption(
-            "ℹ️ Kotalar her gün ~03:00 (TR) sıfırlanır. Dolu hesaplar "
-            "yarın otomatik devam eder. 🔑 = admin giriş yapmalı."
+            f"ℹ️ NotebookLM kotası **{_reset_str}** resetlenir (TR gece yarısı "
+            "değil!). Dolu hesaplar reset olunca otomatik devam eder. "
+            "🔑 = admin giriş yapmalı."
         )
 
     # ===== Phase 4: Revize Modal =====

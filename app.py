@@ -2552,6 +2552,60 @@ class Worker:
         if not queued:
             return
 
+        # === ADIM B: DEDUP / RESUME GUARD (duplicate notebook önle) ===
+        # Kök sebep: notebook+video yapmış bir iş (false-[KOTA] / restart'ta ölen
+        # thread) re-queue olup TEKRAR dispatch edilince 2. notebook yaratılıyor
+        # (aynı başlık birden çok hesapta üretiliyor). Fix:
+        #  (1) İş zaten notebook_url'e sahipse → fresh submit DEĞİL, resume'a
+        #      yönlendir (generating+skip → stale-resume sweeper indirir).
+        #  (2) Aynı (title, batch) başka iş zaten üretiyor/ürettiyse → skip
+        #      (batch-aware: farklı batch = farklı versiyon, dokunma).
+        _producing = set()
+        for j in jobs:
+            if (j.video_remote_url or "").strip() or j.status in (
+                "done", "generating", "running", "submitted"
+            ):
+                _producing.add(((j.title or "").strip(), (j.batch_id or "")))
+        _resume_ids, _skip_ids = [], []
+        for j in queued:
+            if (j.notebook_url or "").strip():
+                _resume_ids.append(j.id)
+            elif ((j.title or "").strip(), (j.batch_id or "")) in _producing:
+                _skip_ids.append(j.id)
+        if _resume_ids or _skip_ids:
+            _ri, _si = set(_resume_ids), set(_skip_ids)
+
+            def _dedup(js):
+                for x in js:
+                    if x.status != "queued":
+                        continue
+                    if x.id in _ri:
+                        x.status = "generating"
+                        x.harvest_status = "skip"
+                        x.harvest_attempts = 0
+                        x.next_harvest_at = 0
+                    elif x.id in _si:
+                        x.status = "stopped"
+                        x.error = ("dedup: aynı başlık bu batch'te zaten "
+                                   "üretildi/üretiliyor")
+                return js
+
+            mutate_jobs(_dedup)
+            if _resume_ids:
+                launcher_log(
+                    f"Step B dedup: {len(_resume_ids)} iş notebook_url'lü → "
+                    f"resume'a yönlendirildi (fresh dispatch yok)"
+                )
+            if _skip_ids:
+                launcher_log(
+                    f"Step B dedup: {len(_skip_ids)} iş skip (aynı başlık "
+                    f"zaten üretiliyor)"
+                )
+            jobs = load_jobs()
+            queued = [j for j in jobs if j.status == "queued"]
+            if not queued:
+                return
+
         # Profil başına slot hesapla
         slot_map: dict[str, int] = {}
         for p in profiles:

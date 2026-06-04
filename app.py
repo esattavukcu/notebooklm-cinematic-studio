@@ -695,14 +695,15 @@ def delete_style_guide(filename: str) -> bool:
 # ---------------------------------------------------------------------------
 DEFAULT_CUSTOM_PROMPT_TEMPLATE = """Role: You are a specialized Educational Video Producer.
 
-Task: Generate a cinematic video overview based on the provided Script and the Execution Guide.
+Task: Generate a cinematic video overview based on the provided Script and Learning Objectives.
 
 Core Constraints (STRICT ADHERENCE REQUIRED):
 1. Zero-Text Visuals: Absolutely no text, labels, or logos in the frame. Use visual metaphors or color-coding only.
-2. Historical & Identity Fidelity: Use the Historical Accuracy & Identity Protocol (in Execution Guide) to ensure correct ethnicity, age, and real-world image integration.
-3. Visual Harmony & Safety: Apply the Student Safety Guide (in Execution Guide) — high-key lighting, soft geometry, and lifted shadows. Avoid "AI slop" or fractal-like textures.
+2. Verbatim Narration: The audio must follow the provided script exactly; do not summarize, add intros, or include concluding remarks.
+3. Historical & Identity Fidelity: Use the Historical Accuracy & Identity Protocol to ensure correct ethnicity, age, and real-world image integration.
 4. Compositional Logic: Follow the Spatial Simplicity Rule. Isolate one central subject per scene with significant white space to maintain clarity.
-5. Style Ratio: 80/20 Animation-Heavy Model — 80% minimalist sketch / paper-cut-out, 20% realistic visuals. Do not mix photos and illustrations in a single frame.
+5. Style Ratio: [Fully Realistic Style] — Ensure no hybrid clutter; do not mix photos and illustrations in a single frame.
+6. Video Length: Video must be under 3 minutes long UNDER ALL CIRCUMSTANCES!
 
 Required Sources for this Task:
 {{SOURCES_LIST}}"""
@@ -743,10 +744,9 @@ def build_source_listing(script_title: str, assets: list,
       [2] <Title>_LearningObjectives.txt (opsiyonel — _lo.docx companion)
       [3] Narrative & Text-Free Execution Guide
       [4] Historical Accuracy & Identity Protocol
-      [5] Student Safety & Visual Harmony Guide
-      [6] The 80/20 Animation-Heavy Model
-      [7] _custom_prompt.txt (this Task Brief)
-      [8..N] Selected images
+      [5] Fully Realistic Style
+      [6] _custom_prompt.txt (this Task Brief)
+      [7..N] Selected images
 
     Image'lar için description + position eklenir → NotebookLM her görseli
     script'in hangi anında göstereceğini bilir.
@@ -770,20 +770,18 @@ def build_source_listing(script_title: str, assets: list,
         )
         names.append(lo_name)
 
-    # Sources 3-6: 4 ayrı execution guide protokolü (sabit, her job'a)
+    # Sources 3-5: 3 ayrı execution guide protokolü (sabit, her job'a)
     lines.append("Source 3: Narrative & Text-Free Execution Guide")
     names.append("_Narrative_TextFree_Guide")
     lines.append("Source 4: Historical Accuracy & Identity Protocol")
     names.append("_HistoricalAccuracy_Identity")
-    lines.append("Source 5: Student Safety & Visual Harmony Guide")
-    names.append("_StudentSafety_VisualHarmony")
-    lines.append("Source 6: The 80/20 Animation-Heavy Model")
-    names.append("_AnimationHeavy_80_20")
+    lines.append("Source 5: Fully Realistic Style")
+    names.append("_FullyRealistic_Style")
 
-    # Source 7: Task Brief (this prompt — Role/Task/Constraints; uploaded as source
+    # Source 6: Task Brief (this prompt — Role/Task/Constraints; uploaded as source
     # so NotebookLM can reference it directly, redundancy with Customize field)
     lines.append(
-        "Source 7: Task Brief (this document) — "
+        "Source 6: Task Brief (this document) — "
         "Role/Task/Constraints/Required Sources."
     )
     names.append("_custom_prompt")
@@ -821,7 +819,7 @@ def render_custom_prompt(template: str, script_title: str,
 # ---------------------------------------------------------------------------
 EXEC_GUIDE_NARRATIVE_TEXT_FREE = """Narrative & Text-Free Execution Guide
 
-Narration: The audio must go with similar examples to the original script or video, but must also be unique in it's own visuals design.
+Verbatim Narration: The audio must follow the provided script exactly; do not summarize, add intros, or include concluding remarks.
 Zero-Text Policy: Absolutely no letters, numbers, labels, or titles are permitted in the frame.
 Symbolic Replacement: Use color-coded icons, focal shifts, or zooms to highlight specific parts of a subject instead of using text labels.
 Language Barrier: Do not generate any text overlays to ensure the video is ready for immediate localization."""
@@ -835,30 +833,22 @@ Strategic Placement: These authentic images should be timed to coincide with the
 Stylistic Continuity Visual Bridge: The "Illustrated/Animated" versions of a subject must maintain recognizable visual features consistent with real-life person.
 Safety-Adjusted History Visual Correction: Primary source images that are naturally dark, high-contrast, or grainy must be adjusted to align with High-Key lighting standards. Lift shadows to ensure the image is clear and non-threatening for a student audience."""
 
-EXEC_GUIDE_STUDENT_SAFETY = """Student Safety & Visual Harmony Guide
+EXEC_GUIDE_REALISTIC_STYLE = """Fully Realistic Style Guide
 
-Soft Geometry: Prioritize rounded forms and curvilinear geometry; avoid jagged edges, or needle-like structures.
-High-Key Lighting: Use bright lighting with lifted shadows to ensure no "dark voids" or threatening atmospheres exist.
-Texture Control: Surfaces must be clean and continuous; avoid "high-frequency" details like scales, tiny bumps, or branching fractal patterns.
-Anti-Clutter (Non-Tangle): Do not allow crossing lines, or chaotic textures to appear on screen.
-Compositional Safety: Maintain a medium focal length and ensure a clear "exit point" in the background to prevent a feeling of claustrophobia."""
+Photorealistic Style: Apply a Photorealistic, Cinematic style as the absolute baseline for all standard scenes across any topic. Visuals must look like high-definition, documentary photography or professional, real-world documentary footage. Ensure a welcoming atmosphere using continuous camera motion, bright high-key lighting with lifted shadows, and a clear background exit point.
+Real-World Texture Allowance: To maintain true documentary realism, this default style is entirely exempt from texture-smoothing and geometry-flattening restrictions, allowing for the natural rendering of real-world textures, complex environments, and authentic details."""
 
-EXEC_GUIDE_ANIMATION_80_20 = """The 80/20 Animation-Heavy Model
-
-Style: 80% minimalist "sketch" style and "paper cut-out" animation styles, with 20% realistic visuals.
-No Hybrid Clutter: Do not mix a photo and an illustration in the same frame; keep them as distinct scenes.
-Dynamic Flow: Every scene must have motion (e.g., wide pans or macro photography) to avoid "static" talking heads."""
-
-# Source numaralandırması user'ın template'ine uygun:
+# Source numaralandırması content ekibinin güncel template'ine uygun (3 sabit guide):
 # Source 3: Narrative & Text-Free Execution Guide
 # Source 4: Historical Accuracy & Identity Protocol
-# Source 5: Student Safety & Visual Harmony Guide
-# Source 6: The 80/20 Animation-Heavy Model
+# Source 5: Fully Realistic Style
+# (NOT: Student Safety & Visual Harmony + 80/20 Animation-Heavy kaldırıldı —
+#  content ekibi "fully realistic" yönüne geçti; safety guide realistic visuals'ı
+#  engelliyordu.)
 EXECUTION_GUIDE_FILES: list[tuple[str, str]] = [
     ("_03_Narrative_TextFree_Guide.txt", EXEC_GUIDE_NARRATIVE_TEXT_FREE),
     ("_04_HistoricalAccuracy_Identity.txt", EXEC_GUIDE_HISTORICAL_ACCURACY),
-    ("_05_StudentSafety_VisualHarmony.txt", EXEC_GUIDE_STUDENT_SAFETY),
-    ("_06_AnimationHeavy_80_20.txt", EXEC_GUIDE_ANIMATION_80_20),
+    ("_05_FullyRealistic_Style.txt", EXEC_GUIDE_REALISTIC_STYLE),
 ]
 
 # Backward-compat: bazı yerler hâlâ EXECUTION_GUIDE_PROMPT'a refer ediyor olabilir
@@ -2964,10 +2954,9 @@ class Worker:
             #    [2] <Title>_LearningObjectives.txt (varsa, _lo.docx companion)
             #    [3] Narrative & Text-Free Execution Guide
             #    [4] Historical Accuracy & Identity Protocol
-            #    [5] Student Safety & Visual Harmony Guide
-            #    [6] The 80/20 Animation-Heavy Model
-            #    [7] _custom_prompt.txt (Role/Task/Constraints)
-            #    [8..N] Image'ler
+            #    [5] Fully Realistic Style
+            #    [6] _custom_prompt.txt (Role/Task/Constraints)
+            #    [7..N] Image'ler
             source_paths: list[Path] = []
             if script_path and script_path.exists():
                 source_paths.append(script_path)
@@ -4427,8 +4416,8 @@ def render_style_guides_ui(key_prefix: str = "sg",
         )
     st.markdown(
         '<div style="font-size:0.85rem; opacity:0.78; margin-bottom:0.6rem;">'
-        '⚙ Buraya yüklediğin dosyalar (Identity Protocol, Visual Harmony Guide, '
-        '80/20 Model, Narrative Execution Guide gibi) <b>her job\'da</b> '
+        '⚙ Buraya yüklediğin dosyalar (Identity Protocol, Fully Realistic Style, '
+        'Narrative Execution Guide gibi) <b>her job\'da</b> '
         'NotebookLM\'e Add sources akışıyla yüklenir ve Custom Prompt\'tan '
         'isimleriyle referanslanır.<br>'
         'Kabul edilen tipler: PDF, TXT, MD, DOCX, image (JPG/PNG/...), audio (MP3/M4A). '
@@ -4567,7 +4556,7 @@ def render_bulk_drive_section(*, key_prefix: str = "blk") -> None:
         .replace(
             "{{SOURCES_LIST}}",
             "Source 1: Execution Guide — STRICT visual rules "
-            "(Text-Free / 80-20 Animation / Student Safety / Historical Accuracy). "
+            "(Text-Free / Fully Realistic Style / Historical Accuracy). "
             "Apply these rules to EVERY scene.\n"
             "Source 2: <Script filename> — verbatim narration content.",
         )
@@ -4584,8 +4573,8 @@ def render_bulk_drive_section(*, key_prefix: str = "blk") -> None:
     st.info(
         "🔒 Her job için NotebookLM'e otomatik yüklenen source'lar:\n"
         "  • **Script** + **Learning Objectives** (`<name>_lo.<ext>` companion varsa)\n"
-        "  • **4 ayrı sabit guide** (Narrative & Text-Free / History / "
-        "Student Safety / 80-20 Animation)\n"
+        "  • **3 ayrı sabit guide** (Narrative & Text-Free / "
+        "Historical Accuracy / Fully Realistic Style)\n"
         "  • **Custom Prompt** (Role/Task/Constraints)\n"
         "  • Görseller\n\n"
         "Drive klasöründe `senaryo1.docx` + `senaryo1_lo.docx` (veya .txt/.md) "
@@ -6410,10 +6399,9 @@ def render_user_view() -> None:
                     "2. `<Title>_LearningObjectives.txt` — _lo.docx/.txt/.md companion (varsa)\n"
                     "3. Narrative & Text-Free Execution Guide\n"
                     "4. Historical Accuracy & Identity Protocol\n"
-                    "5. Student Safety & Visual Harmony Guide\n"
-                    "6. The 80/20 Animation-Heavy Model\n"
-                    "7. `_custom_prompt.txt` — Bu doküman (Role/Task/Constraints)\n"
-                    "8..N. Görseller\n\n"
+                    "5. Fully Realistic Style\n"
+                    "6. `_custom_prompt.txt` — Bu doküman (Role/Task/Constraints)\n"
+                    "7..N. Görseller\n\n"
                     "Custom prompt **hem source olarak hem Cinematic Customize alanına** "
                     "gider — daha güçlü prime. Drive'da `senaryo1.docx` + `senaryo1_lo.docx` "
                     "var ise ikisi de yüklenir.",

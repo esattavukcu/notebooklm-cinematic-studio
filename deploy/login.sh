@@ -25,7 +25,7 @@ set -euo pipefail
 
 # ---- Config ----------------------------------------------------------------
 SSH_KEY="${NLM_SSH_KEY:-$HOME/Downloads/dev-internal-00.pem}"
-SSH_HOST="${NLM_HOST:-ubuntu@ec2-35-156-158-86.eu-central-1.compute.amazonaws.com}"
+SSH_HOST="${NLM_HOST:-ubuntu@63.185.221.230}"
 REMOTE_REPO="${NLM_REMOTE_REPO:-/home/ubuntu/notebooklm-cinematic-studio}"
 
 # ---- Pre-flight ------------------------------------------------------------

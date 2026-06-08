@@ -167,10 +167,19 @@ async def _submit_job_async(
                 stage="source_add",
             )
 
-        # 3. Sources'ın processing'i bitmesini bekle
+        # 3. Sources'ın processing'i bitmesini bekle.
+        # NOT: wait_for_sources imzası (notebook_id, source_ids, timeout=...) —
+        # source_ids ZORUNLU pozisyonel (0.6.0 + 0.7.1 aynı). Eskiden geçilmiyordu
+        # → her çağrı TypeError → bekleme TAMAMEN atlanıyordu (gen, source'lar
+        # processing bitmeden başlayabiliyordu). Artık source_ids geçiliyor →
+        # source'lar gerçekten hazır olana kadar beklenir → daha güvenilir gen.
+        # Timeout/processing-fail → SourceTimeoutError → aşağıdaki except yakalar,
+        # best-effort devam (eski davranış korunur).
         on_event("sources_waiting", count=len(source_ids))
         try:
-            await c.sources.wait_for_sources(nb_id, timeout=source_wait_timeout)
+            await c.sources.wait_for_sources(
+                nb_id, source_ids, timeout=source_wait_timeout,
+            )
         except Exception as e:
             # Timeout veya bazıları işlenemedi → yine de devam et
             on_event("sources_wait_partial", error=str(e)[:200])

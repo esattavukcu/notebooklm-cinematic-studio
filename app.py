@@ -3073,6 +3073,12 @@ class Worker:
                         "quota", "rate limit", "rate-limit", "rate_limit",
                         "daily limit", "limit reached", "exceeded",
                         "too many requests", "429",
+                        # Cinematic günlük kota tükenince Google bazen "kota dolu"
+                        # yerine ArtifactFeatureUnavailableError: "Cinematic video
+                        # generation is unavailable" döner → bunu da kota say (yoksa
+                        # hard-fail + re-dispatch loop). Hedefli: generic 503
+                        # "service unavailable" over-match etmesin diye spesifik.
+                        "featureunavailable", "generation is unavailable",
                     ))
                 )
                 if is_quota:

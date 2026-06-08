@@ -404,17 +404,28 @@ async def _resume_download_async(
                 f"Gen başlamadı veya silinmiş.",
                 stage="resume_list",
             )
-        # En son artifact (newest first kabul)
-        target = videos[0]
+        # Tamamlanmış (ArtifactStatus.COMPLETED=3) artifact'ı tercih et; yoksa
+        # en yeni (videos[0]). ÖNCEDEN sadece videos[0] alınıp string-status
+        # kontrol ediliyordu → status int=3 (COMPLETED) tanınmıyordu → bitmiş
+        # video "generating" sanılıp harvest edilemiyordu (kayıp video!).
+        def _is_done(v) -> bool:
+            if getattr(v, "is_complete", False):
+                return True
+            st = getattr(v, "status", None)
+            try:
+                if int(st) == 3:  # ArtifactStatus.COMPLETED
+                    return True
+            except (TypeError, ValueError):
+                pass
+            return str(st).lower() in (
+                "ready", "complete", "done", "completed", "success",
+            )
+
+        completed = [v for v in videos if _is_done(v)]
+        target = completed[0] if completed else videos[0]
         artifact_id = target.id
 
-        # Hazır mı? status field int veya str olabilir (library enum).
-        is_ready = bool(getattr(target, "is_complete", False))
-        if not is_ready:
-            _st = getattr(target, "status", "")
-            _st_str = str(_st).lower() if _st is not None else ""
-            if _st_str in ("ready", "complete", "done", "completed", "success"):
-                is_ready = True
+        is_ready = _is_done(target)
         if not is_ready and wait_if_processing:
             try:
                 final = await c.artifacts.wait_for_completion(

@@ -14,7 +14,7 @@ google-genai>=0.5,<2
 # NotebookLM submit + video download: teng-lin/notebooklm-py.
 # tmc/nlm Go CLI + Playwright harvest cycle'ını değiştirdi.
 # Mevcut chrome_profiles/<id>/auth.json'ı doğrudan kullanır.
-notebooklm-py>=0.6,<1
+notebooklm-py>=0.7.1,<1
 
 # Bulk import (admin "Drive Toplu" sekmesi):
 # - gdown: public Drive klasöründen API key'siz dosya indirme

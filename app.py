@@ -837,7 +837,9 @@ Safety-Adjusted History Visual Correction: Primary source images that are natura
 EXEC_GUIDE_REALISTIC_STYLE = """Fully Realistic Style Guide
 
 Photorealistic Style: Apply a Photorealistic, Cinematic style as the absolute baseline for all standard scenes across any topic. Visuals must look like high-definition, documentary photography or professional, real-world documentary footage. Ensure a welcoming atmosphere using continuous camera motion, bright high-key lighting with lifted shadows, and a clear background exit point.
-Real-World Texture Allowance: To maintain true documentary realism, this default style is entirely exempt from texture-smoothing and geometry-flattening restrictions, allowing for the natural rendering of real-world textures, complex environments, and authentic details."""
+Real-World Texture Allowance: To maintain true documentary realism, allow for the natural rendering of real-world textures, complex environments, and authentic details.
+Visual Safety Baseline: Avoid frightening, horror-themed, or overtly scary imagery. Do not use visual styles reminiscent of thrillers, horror movies, or dark fantasy. Stick to standard, neutral documentary framing and avoid creepy, highly distorted, or intimidating camera angles.
+Realistic Environments: Ground all scenes in normal, recognizable, everyday real-world settings. Do not use stylized, giant, cavernous, or empty futuristic architecture that looks like a sci-fi prison, abstract maze, or dystopian bunker. Keep indoor spaces naturally proportioned and realistically lit."""
 
 # Source numaralandırması content ekibinin güncel template'ine uygun (3 sabit guide):
 # Source 3: Narrative & Text-Free Execution Guide
@@ -4006,174 +4008,175 @@ st.set_page_config(
 # ---------------------------------------------------------------------------
 _CUSTOM_CSS = """
 <style>
+@import url('https://fonts.googleapis.com/css2?family=Poppins:wght@400;500;600;700&display=swap');
+
 :root {
-  --nlm-primary: #6366F1;
-  --nlm-primary-dark: #4F46E5;
-  --nlm-bg-elev: rgba(0,0,0,0.03);
-  --nlm-border: rgba(0,0,0,0.08);
-  --nlm-radius: 12px;
+  /* ===== Twin Design System tokens (app.twinscience.com) ===== */
+  --twin-primary-50:#F5EEFE; --twin-primary-100:#EADCFD; --twin-primary-200:#D4B8FB;
+  --twin-primary-400:#A463F0; --twin-primary-500:#8B30E8; --twin-primary-600:#7A1FD4;
+  --twin-primary-700:#6418B0; --twin-primary-900:#3A1366;
+  --twin-grape-500:#7A2B96; --twin-grape-tint:#F3E4F8;
+  --twin-blue-500:#2563EB; --twin-blue-600:#1D4FD0; --twin-blue-tint:#E0EAFE;
+  --twin-green-500:#16893E; --twin-green-600:#11722F; --twin-green-tint:#DCFAE6;
+  --twin-red-500:#EF4444; --twin-red-600:#DC2626; --twin-red-tint:#FEE4E2;
+  --twin-orange-500:#F97316; --twin-orange-tint:#FFEAD5;
+  --twin-amber-400:#FBBF24; --twin-amber-tint:#FEF3C7;
+  --twin-pink-500:#EC4899; --twin-pink-tint:#FCE7F3;
+  --twin-ink:#1E1B2E; --twin-text:#423E54; --twin-text-muted:#6B7280; --twin-text-faint:#9CA3AF;
+  --twin-border:#ECEBF0; --twin-surface:#FFFFFF; --twin-bg:#FAF9FE; --twin-bg-alt:#F4F2FB;
+  --twin-gradient-hero:linear-gradient(120deg,#EDE4FB 0%,#F6E9F9 60%,#F3E8FB 100%);
+  --twin-gradient-brand:linear-gradient(135deg,#8B30E8 0%,#A463F0 100%);
+  --twin-shadow-xs:0 1px 2px rgba(30,27,46,.06); --twin-shadow-sm:0 2px 6px rgba(30,27,46,.06);
+  --twin-shadow-md:0 4px 14px rgba(30,27,46,.08); --twin-shadow-focus:0 0 0 3px rgba(139,48,232,.30);
+  --twin-ease:cubic-bezier(.4,0,.2,1);
+  /* legacy alias'lar → Twin (eski var(--nlm-*) referansları otomatik Twin olsun) */
+  --nlm-primary:#8B30E8; --nlm-primary-dark:#7A1FD4;
+  --nlm-bg-elev:#F4F2FB; --nlm-border:#ECEBF0; --nlm-radius:12px;
 }
 
-/* Streamlit default header bar (~3.75rem) — dark temada üstte koca siyah
-   boşluk yaratıyor. Şeffaf + ince yap, içerik yukarı çekilsin. Sidebar
-   toggle + menü hâlâ erişilebilir (height korunur, sadece arka plan şeffaf). */
-[data-testid="stHeader"] {
-  background: transparent !important;
-  height: 2.2rem !important;
+/* Poppins — geometrik yuvarlak, Twin'in dili */
+html, body, .stApp, [class*="css"], button, input, textarea, select,
+[data-testid="stMarkdownContainer"], [data-baseweb] {
+  font-family:'Poppins','Inter','Segoe UI',system-ui,-apple-system,sans-serif !important;
 }
+.stApp { background: var(--twin-bg); }
+h1,h2,h3,h4 { color: var(--twin-ink) !important; letter-spacing:-.01em; }
+
+[data-testid="stHeader"] { background: transparent !important; height: 2.2rem !important; }
 [data-testid="stToolbar"] { right: 0.5rem; }
-
-/* Genel container — daha geniş + biraz nefes (üst boşluk minimal) */
 .block-container {
-  padding-top: 0.6rem !important;
-  padding-bottom: 4rem !important;
-  max-width: 1400px !important;
+  padding-top: 0.6rem !important; padding-bottom: 4rem !important; max-width: 1400px !important;
 }
 
-/* Hero başlık */
+/* Hero — Twin soft lavanta banner */
 .app-hero {
-  padding: 1.1rem 1.4rem;
-  border-radius: var(--nlm-radius);
-  background: linear-gradient(135deg, #1F2937 0%, #312E81 60%, #6366F1 130%);
-  color: #fff;
-  margin: 0 0 1.2rem 0;
-  box-shadow: 0 6px 24px rgba(99,102,241,0.18);
+  padding: 1.3rem 1.5rem; border-radius: 16px;
+  background: var(--twin-gradient-hero);
+  border: 1px solid var(--twin-border);
+  margin: 0 0 1.2rem 0; box-shadow: var(--twin-shadow-sm);
 }
 .app-hero h1 {
-  margin: 0; padding: 0; line-height: 1.2;
-  font-size: 1.55rem; font-weight: 700; letter-spacing: -0.01em;
+  margin: 0; line-height: 1.2; font-size: 1.6rem; font-weight: 700;
+  color: var(--twin-primary-700) !important; letter-spacing: -0.01em;
 }
-.app-hero p {
-  margin: 0.35rem 0 0 0; opacity: 0.85; font-size: 0.92rem; font-weight: 400;
-}
+.app-hero p { margin: 0.4rem 0 0 0; color: var(--twin-text-muted); font-size: 0.92rem; font-weight: 400; }
 
 /* Section header */
 .section-h {
   display: flex; align-items: center; gap: 0.55rem;
-  font-size: 1.1rem; font-weight: 600; letter-spacing: -0.01em;
-  margin: 0.4rem 0 0.6rem 0;
+  font-size: 1.12rem; font-weight: 700; color: var(--twin-ink); margin: 0.4rem 0 0.6rem 0;
 }
-.section-h .section-sub {
-  font-size: 0.82rem; font-weight: 400; opacity: 0.7; margin-left: auto;
-}
+.section-h .section-sub { font-size: 0.82rem; font-weight: 500; color: var(--twin-text-muted); margin-left: auto; }
 
-/* Status pill */
+/* Status pill — Twin tint'leri */
 .pill {
-  display: inline-block;
-  padding: 3px 10px;
-  border-radius: 999px;
-  font-size: 0.74rem;
-  font-weight: 600;
-  letter-spacing: 0.02em;
-  border: 1px solid transparent;
-  white-space: nowrap;
-  vertical-align: middle;
+  display: inline-block; padding: 3px 11px; border-radius: 9999px;
+  font-size: 0.74rem; font-weight: 600; border: 1px solid transparent;
+  white-space: nowrap; vertical-align: middle;
 }
-.pill-queued     { background: #FEF3C7; color: #92400E; border-color: #FBBF24; }
-.pill-running    { background: #DBEAFE; color: #1E3A8A; border-color: #60A5FA; }
-.pill-generating { background: #EDE9FE; color: #5B21B6; border-color: #A78BFA; }
-.pill-done       { background: #D1FAE5; color: #065F46; border-color: #34D399; }
-.pill-submitted  { background: #E0E7FF; color: #3730A3; border-color: #818CF8; }
-.pill-failed     { background: #FEE2E2; color: #991B1B; border-color: #F87171; }
-.pill-stopped    { background: #E5E7EB; color: #374151; border-color: #9CA3AF; }
+.pill-queued     { background: var(--twin-amber-tint);   color: #9A6B00; }
+.pill-running    { background: var(--twin-blue-tint);    color: var(--twin-blue-600); }
+.pill-generating { background: var(--twin-primary-50);   color: var(--twin-primary-700); }
+.pill-done       { background: var(--twin-green-tint);   color: var(--twin-green-600); }
+.pill-submitted  { background: var(--twin-primary-100);  color: var(--twin-primary-700); }
+.pill-failed     { background: var(--twin-red-tint);     color: var(--twin-red-600); }
+.pill-stopped    { background: var(--twin-bg-alt);       color: var(--twin-text-muted); }
 
-@media (prefers-color-scheme: dark) {
-  .pill-queued     { background: rgba(251,191,36,0.18); color: #FCD34D; }
-  .pill-running    { background: rgba(96,165,250,0.18); color: #93C5FD; }
-  .pill-generating { background: rgba(167,139,250,0.20); color: #C4B5FD; }
-  .pill-done       { background: rgba(52,211,153,0.18); color: #6EE7B7; }
-  .pill-submitted  { background: rgba(129,140,248,0.18); color: #A5B4FC; }
-  .pill-failed     { background: rgba(248,113,113,0.18); color: #FCA5A5; }
-  .pill-stopped    { background: rgba(156,163,175,0.20); color: #D1D5DB; }
+/* Buttons — Twin (primary mor, secondary beyaz, radius 12) */
+.stButton button, .stDownloadButton button, .stFormSubmitButton button {
+  border-radius: 12px !important; font-weight: 600 !important;
+  font-family:'Poppins',sans-serif !important; transition: all 0.14s var(--twin-ease) !important;
 }
+.stButton button:active { transform: translateY(1px); }
+.stButton button[kind="primary"], button[data-testid="baseButton-primary"],
+.stFormSubmitButton button[kind="primary"] {
+  background: var(--twin-primary-500) !important; border: 0 !important; color: #fff !important;
+}
+.stButton button[kind="primary"]:hover, button[data-testid="baseButton-primary"]:hover {
+  background: var(--twin-primary-600) !important; box-shadow: var(--twin-shadow-md) !important;
+}
+.stButton button[kind="secondary"], button[data-testid="baseButton-secondary"] {
+  background: #fff !important; border: 1px solid var(--twin-border) !important; color: var(--twin-ink) !important;
+}
+.stButton button[kind="secondary"]:hover { background: var(--twin-bg-alt) !important; border-color: var(--twin-primary-200) !important; }
+.stButton button:focus-visible { box-shadow: var(--twin-shadow-focus) !important; }
+
+/* Inputs — Twin */
+.stTextInput input, .stTextArea textarea, .stNumberInput input,
+[data-baseweb="input"] input, [data-baseweb="textarea"] textarea, [data-baseweb="select"] > div {
+  border-radius: 8px !important; border: 1px solid var(--twin-border) !important;
+}
+.stTextInput input:focus, .stTextArea textarea:focus, .stNumberInput input:focus {
+  border-color: var(--twin-primary-500) !important; box-shadow: var(--twin-shadow-focus) !important;
+}
+
+/* Sidebar — beyaz panel */
+section[data-testid="stSidebar"] { background: var(--twin-surface) !important; border-right: 1px solid var(--twin-border); }
+section[data-testid="stSidebar"] [data-testid="stVerticalBlockBorderWrapper"] { border-radius: 12px !important; }
+
+/* Expander — Twin kart */
+[data-testid="stExpander"] {
+  border: 1px solid var(--twin-border) !important; border-radius: 12px !important;
+  background: var(--twin-surface) !important; box-shadow: var(--twin-shadow-xs);
+}
+[data-testid="stExpander"] summary { font-weight: 600; color: var(--twin-ink); }
+[data-testid="stExpander"] summary:hover { color: var(--twin-primary-600); }
+
+/* Progress bar → mor */
+.stProgress > div > div > div > div { background: var(--twin-primary-500) !important; }
+[data-testid="stProgress"] [role="progressbar"] > div { background: var(--twin-primary-500) !important; }
+
+/* Metric'ler */
+[data-testid="stMetricValue"] { font-size: 1.7rem !important; font-weight: 700 !important; color: var(--twin-ink) !important; }
+[data-testid="stMetricLabel"] { font-weight: 500 !important; color: var(--twin-text-muted) !important; }
+
+/* Tab başlıkları */
+button[data-baseweb="tab"] { font-weight: 600 !important; padding: 0.6rem 1.1rem !important; }
+button[data-baseweb="tab"][aria-selected="true"] { color: var(--twin-primary-600) !important; }
+[data-baseweb="tab-highlight"] { background: var(--twin-primary-500) !important; }
+
+/* Linkler → mor */
+a, a:visited { color: var(--twin-primary-600); }
+a:hover { color: var(--twin-primary-700); }
 
 /* Job satırı */
 .job-row-wrap [data-testid="stHorizontalBlock"] {
-  padding: 0.55rem 0.4rem;
-  border-bottom: 1px solid var(--nlm-border);
-  border-radius: 6px;
-  transition: background 0.12s ease;
+  padding: 0.55rem 0.4rem; border-bottom: 1px solid var(--twin-border);
+  border-radius: 8px; transition: background 0.12s ease;
 }
-.job-row-wrap [data-testid="stHorizontalBlock"]:hover {
-  background: var(--nlm-bg-elev);
-}
-
-/* Profil kartı sidebar — biraz daha kompakt */
-section[data-testid="stSidebar"] [data-testid="stVerticalBlockBorderWrapper"] {
-  border-radius: 10px !important;
-}
-
-/* Metric'ler biraz daha büyük */
-[data-testid="stMetricValue"] {
-  font-size: 1.7rem !important;
-  font-weight: 700 !important;
-}
-[data-testid="stMetricLabel"] {
-  font-weight: 500 !important;
-  opacity: 0.85;
-}
-
-/* Tab başlıkları daha rahat */
-button[data-baseweb="tab"] {
-  font-weight: 600 !important;
-  padding: 0.6rem 1.1rem !important;
-}
-
-/* Buton tıklamaları biraz daha rahat hissetsin */
-.stButton button {
-  border-radius: 8px !important;
-  font-weight: 500;
-  transition: transform 0.06s ease;
-}
-.stButton button:active {
-  transform: translateY(1px);
-}
+.job-row-wrap [data-testid="stHorizontalBlock"]:hover { background: var(--twin-bg-alt); }
 
 /* Empty state */
 .empty-state {
-  text-align: center;
-  padding: 2.5rem 1rem;
-  border: 2px dashed var(--nlm-border);
-  border-radius: var(--nlm-radius);
-  opacity: 0.75;
+  text-align: center; padding: 2.5rem 1rem; border: 2px dashed var(--twin-border);
+  border-radius: 16px; color: var(--twin-text-muted);
 }
 .empty-state .es-icon { font-size: 2.2rem; margin-bottom: 0.4rem; }
-.empty-state .es-title { font-weight: 600; margin-bottom: 0.25rem; }
-.empty-state .es-sub { font-size: 0.85rem; opacity: 0.8; }
+.empty-state .es-title { font-weight: 600; color: var(--twin-ink); margin-bottom: 0.25rem; }
+.empty-state .es-sub { font-size: 0.85rem; color: var(--twin-text-muted); }
 
-/* Notebook URL kısaltma */
 .url-truncate {
   display: inline-block; max-width: 100%; overflow: hidden;
   text-overflow: ellipsis; white-space: nowrap; vertical-align: bottom;
 }
+.sidebar-section {
+  font-size: 0.78rem; text-transform: uppercase; letter-spacing: 0.06em;
+  font-weight: 600; color: var(--twin-text-faint); margin: 0.7rem 0 0.4rem 0;
+}
 
-/* RESPONSIVE: dar ekranda kolon stack'le */
+/* RESPONSIVE */
 @media (max-width: 900px) {
-  .app-hero h1 { font-size: 1.25rem; }
+  .app-hero h1 { font-size: 1.3rem; }
   .app-hero p  { font-size: 0.82rem; }
-  /* Job tablosundaki başlık satırını gizle, kart görünümü */
   .job-header { display: none !important; }
   .block-container { padding-left: 0.8rem !important; padding-right: 0.8rem !important; }
 }
 @media (max-width: 720px) {
-  /* Streamlit kolonlarını alt alta diz */
-  div[data-testid="stHorizontalBlock"] {
-    flex-wrap: wrap !important;
-    gap: 0.4rem !important;
-  }
+  div[data-testid="stHorizontalBlock"] { flex-wrap: wrap !important; gap: 0.4rem !important; }
   div[data-testid="stHorizontalBlock"] > div[data-testid="stColumn"] {
-    flex: 1 1 100% !important;
-    width: 100% !important;
-    min-width: unset !important;
+    flex: 1 1 100% !important; width: 100% !important; min-width: unset !important;
   }
-  /* Metric'ler 2'şerli grid'e */
   [data-testid="stMetric"] { padding: 0.4rem 0.6rem; }
-}
-
-/* Sidebar başlıkları */
-.sidebar-section {
-  font-size: 0.78rem; text-transform: uppercase; letter-spacing: 0.06em;
-  font-weight: 600; opacity: 0.65; margin: 0.7rem 0 0.4rem 0;
 }
 </style>
 """
@@ -6815,24 +6818,24 @@ def render_user_view() -> None:
                         if _url:
                             _chips.append(
                                 f"<a href='{_url}' target='_blank' style='{_CHIP_BASE}"
-                                f"background:rgba(16,185,129,0.16); color:#10B981; "
+                                f"background:rgba(22,137,62,0.14); color:#16893E; "
                                 f"text-decoration:none;'>v{_i} ▶</a>")
                         elif j.status in ("generating", "running"):
                             _chips.append(
-                                f"<span style='{_CHIP_BASE}background:rgba(59,130,246,0.16); "
-                                f"color:#3B82F6;'>v{_i} 🎬</span>")
+                                f"<span style='{_CHIP_BASE}background:rgba(37,99,235,0.14); "
+                                f"color:#2563EB;'>v{_i} 🎬</span>")
                         elif j.status in ("queued", "submitted"):
                             _chips.append(
-                                f"<span style='{_CHIP_BASE}background:rgba(148,163,184,0.16); "
-                                f"color:#94A3B8;'>v{_i} ⏳</span>")
+                                f"<span style='{_CHIP_BASE}background:rgba(251,191,36,0.18); "
+                                f"color:#9A6B00;'>v{_i} ⏳</span>")
                         elif j.status == "failed":
                             _chips.append(
-                                f"<span style='{_CHIP_BASE}background:rgba(239,68,68,0.16); "
-                                f"color:#EF4444;'>v{_i} ❌</span>")
+                                f"<span style='{_CHIP_BASE}background:rgba(239,68,68,0.14); "
+                                f"color:#DC2626;'>v{_i} ❌</span>")
                         else:
                             _chips.append(
-                                f"<span style='{_CHIP_BASE}background:rgba(148,163,184,0.12); "
-                                f"color:#94A3B8;'>v{_i} •</span>")
+                                f"<span style='{_CHIP_BASE}background:rgba(148,163,184,0.16); "
+                                f"color:#6B7280;'>v{_i} •</span>")
                     _ttl = _t if len(_t) <= 60 else _t[:59] + "…"
                     _badge = "✅" if (_n_ok == _n_tot and _n_tot > 0) else ""
                     st.markdown(

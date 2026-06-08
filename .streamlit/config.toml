@@ -1,0 +1,9 @@
+# Twin Design System teması — tüm Twin uygulamaları aynı tasarım dilini konuşsun.
+# Kaynak: app.twinscience.com (Twin Science Educator Platform).
+[theme]
+base = "light"
+primaryColor = "#8B30E8"              # Twin Purple — butonlar, aktif durum, linkler
+backgroundColor = "#FAF9FE"           # lavanta app zemini
+secondaryBackgroundColor = "#FFFFFF"  # kartlar, sidebar, inputlar
+textColor = "#1E1B2E"                 # ink — başlıklar/güçlü metin
+font = "sans serif"                   # Poppins CSS ile yükleniyor (_CUSTOM_CSS)

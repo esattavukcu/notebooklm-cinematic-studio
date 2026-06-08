@@ -5,6 +5,9 @@ __pycache__/
 *.pyo
 .DS_Store
 .env
+.env.zip
+.env.bak*
+*.zip          # secret yedekleri (.env.zip vb.) yanlışlıkla commit edilmesin
 data/
 chrome_profiles/
 launcher.log

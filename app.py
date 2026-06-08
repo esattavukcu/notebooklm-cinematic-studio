@@ -5114,10 +5114,22 @@ def render_user_view() -> None:
         for p in initialized_profiles
     )
     _total_cap = sum((p.daily_limit or 0) for p in initialized_profiles)
-    _free = max(0, _total_cap - _total_used)
+    # Boş slot = SADECE kota-bloklanmamış hesapların kalan limiti. Bloklu hesabın
+    # kalan limiti bugün KULLANILAMAZ (8h-blok) → "boş" sayma. Önceden _total_cap
+    # - _total_used idi → bloklu hesapların kalanını da boş sayıyordu (ör. Ultra
+    # 20-6=14 hayalet slot → yanıltıcı "27 slot boş"; gerçekte sadece ~3 müsait).
+    _blocked_ids = {p.id for p in initialized_profiles if _profile_blocked(p.id)}
+    _free = sum(
+        max(0, (p.daily_limit or 0)
+            - min(_today_used.get(p.id, 0), p.daily_limit or 99))
+        for p in initialized_profiles
+        if p.id not in _blocked_ids
+    )
+    _n_blocked = len(_blocked_ids)
     _qlabel = (
         f"📊 Hesap kotaları · bugün {_total_used}/{_total_cap} kullanıldı"
-        f" · {_free} slot boş"
+        f" · {_free} slot müsait"
+        + (f" · 🛑 {_n_blocked} bloklu" if _n_blocked else "")
     )
     with st.expander(_qlabel, expanded=False):
         if _total_cap:

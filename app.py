@@ -315,6 +315,7 @@ class Job:
     created_at: float = field(default_factory=time.time)
     submitted_by: str = ""           # Kullanıcının kendi adı (user view session_state'inden)
     batch_id: str = ""               # Toplu import batch'i (boş = tek job)
+    version: int = 0                 # Bulk import versiyon no (1..N); 0 = legacy/tekil
     # Audit trail — script iteration geçmişi (Phase A)
     original_script: str = ""        # Kullanıcının ilk yapıştırdığı versiyon (AI iterasyonundan önce)
     iterations: list = field(default_factory=list)  # [{script, feedback, model, ts}, ...]
@@ -2565,12 +2566,14 @@ class Worker:
             if (j.video_remote_url or "").strip() or j.status in (
                 "done", "generating", "running", "submitted"
             ):
-                _producing.add(((j.title or "").strip(), (j.batch_id or "")))
+                _producing.add(((j.title or "").strip(), (j.batch_id or ""),
+                                getattr(j, "version", 0)))
         _resume_ids, _skip_ids = [], []
         for j in queued:
             if (j.notebook_url or "").strip():
                 _resume_ids.append(j.id)
-            elif ((j.title or "").strip(), (j.batch_id or "")) in _producing:
+            elif ((j.title or "").strip(), (j.batch_id or ""),
+                  getattr(j, "version", 0)) in _producing:
                 _skip_ids.append(j.id)
         if _resume_ids or _skip_ids:
             _ri, _si = set(_resume_ids), set(_skip_ids)
@@ -4601,6 +4604,15 @@ def render_bulk_drive_section(*, key_prefix: str = "blk") -> None:
         placeholder="https://drive.google.com/drive/folders/1AbCdEf...",
     )
 
+    # Kaç versiyon: her dosya bu kadar kez üretilir (v1..vN). Aynı script +
+    # guide ile N ayrı Cinematic çıktı → farklı varyasyonlar. Hepsi TEK batch'te,
+    # job.version=1..N (Step B versiyon-farkındalıklı dedup ile durdurulmaz).
+    versions_key = f"{key_prefix}_bulk_versions"
+    n_versions = int(st.number_input(
+        "Kaç versiyon üretilsin? (her dosya bu kadar kez → v1..vN)",
+        min_value=1, max_value=8, value=1, step=1, key=versions_key,
+    ))
+
     # Drive Toplu default: tek bir script + guide kullanıldığında {{SOURCES_LIST}}
     # bulk submit anında render edilemiyor (asset listesi yok). Statik versiyon —
     # NotebookLM template'i yine kuralları source'tan okur, sadece prompt'ta
@@ -4790,12 +4802,17 @@ def render_bulk_drive_section(*, key_prefix: str = "blk") -> None:
 
         _profs_init = [p for p in load_profiles() if p.initialized]
         _daily_cap = sum(max(p.daily_limit or 0, 0) for p in _profs_init) or 9
-        _days = max(1, -(-n_selected // _daily_cap))
+        _total_jobs = n_selected * n_versions
+        _days = max(1, -(-_total_jobs // _daily_cap))
+        _ver_note = (
+            f" × **{n_versions} versiyon** = **{_total_jobs} job**"
+            if n_versions > 1 else ""
+        )
         st.caption(
             f"📅 Kapasite: {len(_profs_init)} profil × "
             f"{(_daily_cap // len(_profs_init)) if _profs_init else 0}/gün "
             f"= **{_daily_cap} job/gün** → **~{_days} gün**'de biter "
-            f"({n_selected} seçili dosya için)"
+            f"({n_selected} seçili dosya{_ver_note})"
         )
 
     # ---- Submit handler ----
@@ -4900,33 +4917,41 @@ def render_bulk_drive_section(*, key_prefix: str = "blk") -> None:
             if result:
                 existing = load_jobs()
                 created_jobs: list = []
-                # Batch oluştur — tüm job'lar aynı oturuma bağlı
+                # Batch oluştur — tüm job'lar (tüm versiyonlar) aynı oturuma bağlı
                 _batch_id = uuid.uuid4().hex[:12]
+                _n_files = len(result["created"])
+                _ver_suffix = f" ({n_versions} versiyon)" if n_versions > 1 else ""
                 _batch_name = (
-                    f"Drive · {datetime.now().strftime('%d.%m %H:%M')}"
+                    f"Drive · {datetime.now().strftime('%d.%m %H:%M')}{_ver_suffix}"
                 )
+                # Her dosya için N versiyon: version=1..N, hepsi TEK batch'te.
+                # v1 orijinal id'yi kullanır; v2..vN yeni uuid + hafif artan
+                # created_at (created_at-rank = version sırası garanti → azure
+                # _v1.._vN isimlendirmesi ve _closed_job_url ile tutarlı).
                 for jd in result["created"]:
-                    try:
-                        j = Job(
-                            id=jd["id"],
-                            title=jd["title"],
-                            text=jd["text"],
-                            profile_id="",
-                            profile_name="",
-                            status=jd["status"],
-                            submitted_by=jd["submitted_by"],
-                            created_at=jd["created_at"],
-                            custom_prompt=jd["custom_prompt"],
-                            learning_objectives=jd.get("learning_objectives", ""),
-                            environment=jd.get("environment", "prod"),
-                            batch_id=_batch_id,
-                        )
-                        j.assets = []
-                        created_jobs.append(j)
-                    except Exception as e:
-                        result["errors"].append(
-                            (jd.get("title", "?"), f"Job dataclass error: {e}")
-                        )
+                    for _v in range(1, n_versions + 1):
+                        try:
+                            j = Job(
+                                id=(jd["id"] if _v == 1 else uuid.uuid4().hex[:12]),
+                                title=jd["title"],
+                                text=jd["text"],
+                                profile_id="",
+                                profile_name="",
+                                status=jd["status"],
+                                submitted_by=jd["submitted_by"],
+                                created_at=jd["created_at"] + (_v - 1) * 0.001,
+                                custom_prompt=jd["custom_prompt"],
+                                learning_objectives=jd.get("learning_objectives", ""),
+                                environment=jd.get("environment", "prod"),
+                                batch_id=_batch_id,
+                                version=_v,
+                            )
+                            j.assets = []
+                            created_jobs.append(j)
+                        except Exception as e:
+                            result["errors"].append(
+                                (jd.get("title", "?"), f"Job dataclass error: {e}")
+                            )
                 existing.extend(created_jobs)
                 save_jobs(existing)
                 # Batch kaydet
@@ -4940,18 +4965,26 @@ def render_bulk_drive_section(*, key_prefix: str = "blk") -> None:
                 _existing_batches = load_batches()
                 _existing_batches.append(_batch)
                 save_batches(_existing_batches)
-                # Slack: toplu ekleme bildirimi
+                # Slack: toplu ekleme bildirimi (TEK mesaj — N versiyon dahil)
+                _ver_line = (
+                    f"🎞 {_n_files} dosya × {n_versions} versiyon\n"
+                    if n_versions > 1 else ""
+                )
                 send_slack_message(
                     f"📥 *{len(created_jobs)} proje kuyruğa eklendi*\n"
                     f"📁 {_batch_name}\n"
+                    f"{_ver_line}"
                     f"📎 {drive_url}\n"
                     f"⏳ Tümü sırada — işleme alınmayı bekliyor"
                 )
                 progress_box.empty()
+                _ver_ok = (
+                    f" ({_n_files} dosya × {n_versions} versiyon)"
+                    if n_versions > 1 else ""
+                )
                 st.success(
-                    f"✅ {len(created_jobs)} job kuyruğa eklendi "
-                    f"(toplam {result['total_files']} dosya, "
-                    f"{len(result['errors'])} hatalı)."
+                    f"✅ {len(created_jobs)} job kuyruğa eklendi{_ver_ok} "
+                    f"({len(result['errors'])} hatalı)."
                 )
                 if result["errors"]:
                     with st.expander(f"⚠ Hatalı dosyalar ({len(result['errors'])})"):
@@ -6685,105 +6718,113 @@ def render_user_view() -> None:
         return outs[idx][1]
 
     if _batch_groups:
-        # En yeni batch üstte — batch'in created_at'i (yoksa job'ların max'ı)
-        def _batch_sortkey(bid):
-            b = _batch_by_id.get(bid)
-            if b and getattr(b, "created_at", 0):
-                return b.created_at
-            return max((j.created_at for j in _batch_groups[bid]), default=0)
+        # === 2 SEVİYE GRUPLAMA: DRIVE KLASÖRÜ → KAYNAK VİDEO → VERSİYON ÇİPLERİ ===
+        # Üst seviye: hangi Drive klasöründen geldiği (batch source URL) — kullanıcı
+        # hangi linke bağlı olduğunu görsün. Alt seviye: o klasördeki her kaynak
+        # video (=title) + TÜM versiyonları (v1..vN, created_at sırası).
+        # Üretilirken canlı: done=▶ tıkla-aç / generating=🎬 / queued=⏳ / failed=❌.
+        def _esc(s: str) -> str:
+            return (s or "").replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
 
-        section_header("📁 Toplu işler (Drive)", f"{len(_batch_groups)} batch")
-        for bid in sorted(_batch_groups, key=_batch_sortkey, reverse=True):
-            bjobs = _batch_groups[bid]
-            b = _batch_by_id.get(bid)
-            bname = (b.name if b else None) or "Drive batch"
-            total = (b.total if b and b.total else len(bjobs))
-            n_done = sum(1 for j in bjobs if j.status == "done")
-            n_gen = sum(1 for j in bjobs if j.status in ("generating", "running"))
-            n_q = sum(1 for j in bjobs if j.status == "queued")
-            n_fail = sum(1 for j in bjobs if j.status == "failed")
-            n_closed = sum(1 for j in bjobs if j.status == "stopped")
-            # "Tamamlanmış" = done + kapatılan (videosu başka versiyonda var).
-            # Kapatılanlar da o başlık için hazır sayılır → progress'e dahil.
-            n_handled = n_done + n_closed
-            # Expander başlığı — özet
-            head = (
-                f"📁 {bname}  ·  ✅ {n_done}/{total}"
-                + (f"  ·  ⏹ {n_closed} kapalı" if n_closed else "")
-                + (f"  ·  🎬 {n_gen}" if n_gen else "")
-                + (f"  ·  ⏳ {n_q}" if n_q else "")
-                + (f"  ·  ❌ {n_fail}" if n_fail else "")
-            )
-            with st.expander(head, expanded=(n_handled < total and n_gen + n_q > 0)):
-                # Progress bar — done + kapatılan (hepsi o başlık için hazır)
-                if total > 0:
-                    _ptxt = f"{n_done}/{total} üretildi"
-                    if n_closed:
-                        _ptxt += f" · {n_closed} zaten mevcuttu"
-                    st.progress(min(1.0, n_handled / total), text=_ptxt)
-                # Drive linki
-                _src = _batch_source.get(bid, "")
+        # Drive folder ID'ye göre grupla — aynı klasör farklı URL string'iyle
+        # (trailing slash / ?usp=sharing / bare-id) girilmiş olsa bile TEK grupta
+        # birleşsin. fkey = folder ID; her grup temsili tam URL'i de tutar (link).
+        def _folder_key(src):
+            _mm = re.search(r"/folders/([A-Za-z0-9_-]+)", src or "")
+            return _mm.group(1) if _mm else (src or "").strip()
+
+        _by_folder: dict[str, dict] = {}  # fkey -> {"url": str, "titles": {t: [jobs]}}
+        for _bjobs in _batch_groups.values():
+            for _j in _bjobs:
+                _src = (_batch_source.get((_j.batch_id or "").strip(), "") or "").strip()
+                _fk = _folder_key(_src)
+                _ent = _by_folder.setdefault(_fk, {"url": _src, "titles": {}})
+                if _src and not _ent["url"]:
+                    _ent["url"] = _src
+                _ent["titles"].setdefault((_j.title or "").strip(), []).append(_j)
+
+        def _fold_recency(fk):
+            return max((j.created_at for tj in _by_folder[fk]["titles"].values()
+                        for j in tj), default=0)
+        _fold_order = sorted(_by_folder, key=_fold_recency, reverse=True)
+        _total_videos = sum(len(e["titles"]) for e in _by_folder.values())
+        section_header("🎬 Toplu videolar (Drive klasörüne göre)",
+                       f"{len(_fold_order)} klasör · {_total_videos} video")
+
+        _CHIP_BASE = ("display:inline-block; margin:2px 5px 2px 0; padding:3px 9px;"
+                      "border-radius:10px; font-size:0.78rem; font-weight:600;")
+
+        for _fk in _fold_order:
+            _ent = _by_folder[_fk]
+            _src = _ent["url"]
+            _titles = _ent["titles"]
+            _all_jobs = [j for tj in _titles.values() for j in tj]
+            _f_tot = len(_all_jobs)
+            _f_done = sum(1 for j in _all_jobs
+                          if j.status == "done" or (j.video_remote_url or "").strip())
+            _f_gen = sum(1 for j in _all_jobs if j.status in ("generating", "running"))
+            _f_q = sum(1 for j in _all_jobs if j.status in ("queued", "submitted"))
+            # Klasör etiketi: Drive folder ID — kullanıcı tanısın
+            if not _fk:
+                _flabel = "kaynak belirtilmemiş"
+            elif "/" in _fk or _fk.startswith("http"):
+                _flabel = _fk[:30] + ("…" if len(_fk) > 30 else "")
+            else:
+                _flabel = _fk[:16] + ("…" if len(_fk) > 16 else "")
+            _fhead = (f"📁 {_flabel}  ·  {len(_titles)} video  ·  ✅ {_f_done}/{_f_tot}"
+                      + (f"  ·  🎬 {_f_gen}" if _f_gen else "")
+                      + (f"  ·  ⏳ {_f_q}" if _f_q else ""))
+            # Aktif iş olan klasör açık başlar; tamamen bitmiş klasör kapalı
+            with st.expander(_fhead, expanded=(_f_gen + _f_q > 0)):
                 if _src:
-                    st.markdown(f"📎 [Drive klasörü]({_src})")
-                # Gönderen
-                _bsub = (b.submitted_by if b else "") or (bjobs[0].submitted_by if bjobs else "")
-                if _bsub:
-                    st.caption(f"👤 {_bsub}")
-                # Per-job kompakt satırlar (created_at sırası)
-                for j in sorted(bjobs, key=lambda x: x.created_at):
-                    icon = _STATUS_ICON.get(j.status, "•")
-                    jc = st.columns([0.4, 4.5, 1.6])
-                    with jc[0]:
-                        st.markdown(f"<div style='font-size:1.1rem;'>{icon}</div>",
-                                    unsafe_allow_html=True)
-                    with jc[1]:
-                        ttl = j.title if len(j.title) <= 60 else j.title[:59] + "…"
-                        # Status alt-metin (kısa)
-                        if j.status == "done":
-                            sub = "hazır"
+                    st.markdown(
+                        f"📎 <a href='{_src}' target='_blank' "
+                        f"style='font-size:0.8rem; word-break:break-all;'>"
+                        f"{_esc(_src)}</a>", unsafe_allow_html=True)
+                _title_order = sorted(
+                    _titles, key=lambda t: max((j.created_at for j in _titles[t]),
+                                               default=0), reverse=True)
+                for _t in _title_order:
+                    _vjobs = sorted(_titles[_t], key=lambda x: x.created_at)
+                    _n_tot = len(_vjobs)
+                    _n_ok = sum(1 for j in _vjobs
+                                if j.status == "done" or (j.video_remote_url or "").strip())
+                    _chips = []
+                    for _i, j in enumerate(_vjobs, 1):
+                        _url = j.video_remote_url
+                        if not _url and j.status == "stopped":
+                            _url = _closed_job_url(j)
+                        if _url:
+                            _chips.append(
+                                f"<a href='{_url}' target='_blank' style='{_CHIP_BASE}"
+                                f"background:rgba(16,185,129,0.16); color:#10B981; "
+                                f"text-decoration:none;'>v{_i} ▶</a>")
                         elif j.status in ("generating", "running"):
-                            sub = "üretiliyor…"
-                        elif j.status == "queued":
-                            sub = "sırada"
+                            _chips.append(
+                                f"<span style='{_CHIP_BASE}background:rgba(59,130,246,0.16); "
+                                f"color:#3B82F6;'>v{_i} 🎬</span>")
+                        elif j.status in ("queued", "submitted"):
+                            _chips.append(
+                                f"<span style='{_CHIP_BASE}background:rgba(148,163,184,0.16); "
+                                f"color:#94A3B8;'>v{_i} ⏳</span>")
                         elif j.status == "failed":
-                            sub = (j.error or "hata")[:50]
-                        elif j.status == "stopped":
-                            _e = (j.error or "").lower()
-                            if "zaten" in _e or "mevcut" in _e or "recovery" in _e:
-                                sub = "✓ video başka versiyonda hazır"
-                            else:
-                                sub = "durduruldu"
+                            _chips.append(
+                                f"<span style='{_CHIP_BASE}background:rgba(239,68,68,0.16); "
+                                f"color:#EF4444;'>v{_i} ❌</span>")
                         else:
-                            sub = j.status
-                        st.markdown(
-                            f"<div style='font-size:0.85rem; font-weight:500; line-height:1.2;'>{ttl}</div>"
-                            f"<div style='font-size:0.7rem; opacity:0.6;'>{sub}</div>",
-                            unsafe_allow_html=True,
-                        )
-                    with jc[2]:
-                        # Link sadece gerçekten videosu olan işlerde:
-                        #  - done: kendi video_remote_url'i
-                        #  - stopped (kapatılan): videosu başka versiyonda hazır
-                        #    → created_at sırasına göre doğru versiyon linki
-                        # queued/running/generating işler HENÜZ kendi videolarını
-                        # üretmedi → "bekliyor" göster (eski versiyona linkleme!).
-                        _row_url = j.video_remote_url
-                        if not _row_url and j.status == "stopped":
-                            _row_url = _closed_job_url(j)
-                        if _row_url:
-                            st.markdown(
-                                f"<a href='{_row_url}' target='_blank' "
-                                f"style='font-size:0.78rem; text-decoration:none; "
-                                f"color:#10B981; font-weight:600;'>☁️ Aç</a>",
-                                unsafe_allow_html=True,
-                            )
-                        elif j.status in ("queued", "running", "generating",
-                                          "submitted"):
-                            st.markdown(
-                                "<span style='font-size:0.78rem; opacity:0.5;'>"
-                                "⏳ bekliyor</span>",
-                                unsafe_allow_html=True,
-                            )
+                            _chips.append(
+                                f"<span style='{_CHIP_BASE}background:rgba(148,163,184,0.12); "
+                                f"color:#94A3B8;'>v{_i} •</span>")
+                    _ttl = _t if len(_t) <= 60 else _t[:59] + "…"
+                    _badge = "✅" if (_n_ok == _n_tot and _n_tot > 0) else ""
+                    st.markdown(
+                        f"<div style='display:flex; justify-content:space-between; "
+                        f"align-items:baseline; margin:9px 0 1px 0;'>"
+                        f"<span style='font-size:0.88rem; font-weight:600;'>📹 {_esc(_ttl)}</span>"
+                        f"<span style='font-size:0.78rem; opacity:0.7; white-space:nowrap;'>"
+                        f"{_n_ok}/{_n_tot} {_badge}</span></div>"
+                        f"<div style='line-height:1.9;'>{''.join(_chips)}</div>",
+                        unsafe_allow_html=True)
 
     # ===== 🎬 TEKİL VİDEOLAR (batch'siz gönderiler) =====
     _singles_sorted = sorted(_single_jobs, key=lambda j: j.created_at,
@@ -8143,6 +8184,15 @@ _any_init_active = any(
     for _p in load_profiles()
 )
 jobs_now = load_jobs()
-if not _any_init_active and any(j.status == "running" for j in jobs_now):
-    time.sleep(4)
-    st.rerun()
+if not _any_init_active:
+    _active_now = any(j.status in ("running", "submitted") for j in jobs_now)
+    _generating_now = any(j.status == "generating" for j in jobs_now)
+    if _active_now:
+        time.sleep(4)
+        st.rerun()
+    elif _generating_now:
+        # Uzun Cinematic gen sırasında da yenile → versiyon çipleri canlı
+        # güncellensin (🎬→▶). running'den uzun interval (t3 CPU-credit için
+        # ölçülü; GENERATING_REFRESH_SEC env ile ayarlanabilir).
+        time.sleep(max(8, int(os.environ.get("GENERATING_REFRESH_SEC", "15"))))
+        st.rerun()

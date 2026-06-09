@@ -16,6 +16,7 @@ Architecture özeti:
 from __future__ import annotations
 
 import csv
+import html
 import io
 import json
 import os
@@ -497,8 +498,56 @@ def save_drafts(drafts: list[Draft]) -> None:
     _atomic_write_json(DRAFTS_FILE, [asdict(d) for d in drafts])
 
 
+def _jobs_backup_path() -> Path:
+    return JOBS_FILE.with_name(JOBS_FILE.name + ".bak")
+
+
+def _load_jobs_raw() -> list:
+    """jobs.json'u oku. BOZULMA (parse hatası) → jobs.json.bak'tan kurtar + alarm.
+    Atomik yazım partial-write'ı zaten önler; bu disk-bozulması / manuel-edit gibi
+    nadir durumlar için son kalkan. Kurtarma olmadan bozuk dosya sessizce [] döner,
+    sonraki save onu kalıcılaştırır (veri kaybı) — bunu engeller."""
+    with _FILE_LOCK:
+        if not JOBS_FILE.exists():
+            return []
+        try:
+            data = json.loads(JOBS_FILE.read_text(encoding="utf-8"))
+            if isinstance(data, list):
+                return data
+        except (json.JSONDecodeError, OSError) as e:
+            bak = _jobs_backup_path()
+            try:
+                if bak.exists():
+                    data = json.loads(bak.read_text(encoding="utf-8"))
+                    if isinstance(data, list):
+                        try:
+                            JOBS_FILE.replace(
+                                JOBS_FILE.with_name(
+                                    f"{JOBS_FILE.name}.corrupt.{int(time.time())}"))
+                        except OSError:
+                            pass
+                        _atomic_write_json(JOBS_FILE, data)
+                        try:
+                            launcher_log(
+                                f"⚠ jobs.json BOZUK ({e}) → .bak'tan kurtarıldı "
+                                f"({len(data)} iş)")
+                            send_slack_message(
+                                f"🚨 *jobs.json bozulmuştu* — backup'tan kurtarıldı "
+                                f"({len(data)} iş). Bozuk dosya .corrupt olarak saklandı.")
+                        except Exception:
+                            pass
+                        return data
+            except (json.JSONDecodeError, OSError):
+                pass
+            try:
+                launcher_log(f"⚠ jobs.json BOZUK ve .bak kurtarılamadı: {e}")
+            except Exception:
+                pass
+        return []
+
+
 def load_jobs() -> list[Job]:
-    raw = _read_json(JOBS_FILE, [])
+    raw = _load_jobs_raw()
     out: list[Job] = []
     for j in raw:
         try:
@@ -509,7 +558,15 @@ def load_jobs() -> list[Job]:
 
 
 def save_jobs(jobs: list[Job]) -> None:
-    _atomic_write_json(JOBS_FILE, [asdict(j) for j in jobs])
+    payload = [asdict(j) for j in jobs]
+    _atomic_write_json(JOBS_FILE, payload)
+    # Son-iyi backup — BOŞ listeyle iyi backup'ı ezme (bozuk-load→[]→save zincirinde
+    # .bak korunsun ki kurtarma çalışsın).
+    if payload:
+        try:
+            _atomic_write_json(_jobs_backup_path(), payload)
+        except Exception:
+            pass
 
 
 # ---------------------------------------------------------------------------
@@ -545,6 +602,31 @@ def mutate_jobs(mutator) -> object:
         result = mutator(jobs)
         save_jobs(jobs)
         return result
+
+
+def _requeue_job(job_id: str) -> None:
+    """Failed bir işi kuyruğa geri al (admin '🔄 Tekrar dene' butonu — SSH yerine).
+    profile/error/notebook/timestamp + retry sayaçları temizlenir → dispatcher
+    sağlıklı bir hesaba yeniden gönderir. Atomik (mutate_jobs) → race yok."""
+    def _m(jobs):
+        for j in jobs:
+            if j.id == job_id:
+                j.status = "queued"
+                j.profile_id = ""
+                j.profile_name = ""
+                j.notebook_url = ""
+                j.error = ""
+                j.started_at = 0.0
+                j.finished_at = 0.0
+                j.pid = 0
+                j.harvest_status = "pending"
+                j.harvest_attempts = 0
+                j.next_harvest_at = 0.0
+                j.auth_retry_count = 0
+                break
+        return jobs
+
+    mutate_jobs(_m)
 
 
 def load_batches() -> list[Batch]:
@@ -940,6 +1022,11 @@ def launcher_log(msg: str) -> None:
     line = f"[{datetime.now().isoformat(timespec='seconds')}] {msg}\n"
     with _log_lock:
         try:
+            # Rotasyon: >5MB → launcher.log.1'e taşı (tek yedek), taze dosya başlat.
+            # Sınırsız büyümeyi önler (eskiden append-only → GB'lara çıkabiliyordu).
+            if (LAUNCHER_LOG.exists()
+                    and LAUNCHER_LOG.stat().st_size > 5 * 1024 * 1024):
+                LAUNCHER_LOG.replace(LAUNCHER_LOG.with_name(LAUNCHER_LOG.name + ".1"))
             with LAUNCHER_LOG.open("a", encoding="utf-8") as f:
                 f.write(line)
         except OSError:
@@ -979,6 +1066,13 @@ def _azure_prefix_for_env(env: str) -> str:
     if e not in ALLOWED_ENVS:
         e = "prod"
     return f"{base}/{e}"
+
+
+def _esc(s) -> str:
+    """HTML escape — kullanıcı içeriğini (job başlığı/Drive dosya adı, gönderen,
+    display_name) unsafe_allow_html render'larında XSS'e karşı korur. quote=True
+    olduğu için title="..." gibi attribute context'lerinde de güvenli."""
+    return html.escape(str(s) if s is not None else "")
 
 
 def _sanitize_blob_stem(title: str) -> str:
@@ -1870,6 +1964,31 @@ class Worker:
             self._thread.start()
             launcher_log("Worker thread başladı.")
 
+    def ensure_alive(self) -> None:
+        """Worker thread sessizce ölmüşse (cache_resource singleton ölü thread'i
+        tutar) yeniden başlat + Slack alarm. Her render'da çağrılır → kuyruğun
+        sessizce donmasını (worker öldü ama UI 'queued' gösteriyor) önler.
+        60sn throttle: anında tekrar ölürse spam-restart yapmaz."""
+        try:
+            if self._thread.is_alive():
+                return
+            now = time.time()
+            if now - getattr(self, "_last_restart", 0.0) < 60:
+                return
+            self._last_restart = now
+            launcher_log("⚠ Worker thread ÖLÜ bulundu — yeniden başlatılıyor.")
+            try:
+                send_slack_message(
+                    "🚨 *Worker thread ölmüştü* — otomatik yeniden başlatıldı. "
+                    "Kuyruk bir süre donmuş olabilir; durumu kontrol et.")
+            except Exception:
+                pass
+            self._thread = threading.Thread(
+                target=self._loop, name="nbworker", daemon=True)
+            self._thread.start()
+        except Exception as e:
+            launcher_log(f"ensure_alive error: {e!r}")
+
     def stop(self) -> None:
         self._stop_evt.set()
 
@@ -1913,6 +2032,11 @@ class Worker:
         # Auth health check ilk round'da çalışmasın — server boot anında
         # initialize henüz tamamlanmamış olabilir. İlk full interval'dan sonra ilk.
         last_auth_health_check = time.time()
+        # Boot'ta bir kez: yüklenmiş MP4 backlog'unu temizle (disk sızıntısı).
+        try:
+            self._cleanup_uploaded_mp4s()
+        except Exception as e:
+            launcher_log(f"startup mp4 cleanup error: {e!r}")
         while not self._stop_evt.is_set():
             try:
                 self._auto_init_check()
@@ -1935,6 +2059,7 @@ class Worker:
                 # SUBMIT'TEN ÖNCE keşfet + Slack alert (1. job ziyanını önler)
                 if time.time() - last_auth_health_check >= AUTH_HEALTH_CHECK_INTERVAL_SEC:
                     self._auth_health_check_round()
+                    self._cleanup_uploaded_mp4s()
                     last_auth_health_check = time.time()
                 # Günsonu özet — günde 1×, DAILY_SUMMARY_HOUR_UTC saatinde
                 self._daily_summary_round()
@@ -2195,6 +2320,7 @@ class Worker:
         jobs = load_jobs()
         now = time.time()
         candidates: list[Job] = []
+        exhausted: list = []  # attempts>=MAX, hâlâ 'generating'de stuck → terminal (2A)
         for j in jobs:
             if j.status != "generating":
                 continue
@@ -2212,10 +2338,39 @@ class Worker:
             if age < STALE_RESUME_MIN_AGE_SEC:
                 continue
             if j.harvest_attempts >= STALE_RESUME_MAX_ATTEMPTS:
+                exhausted.append(j.id)
                 continue
             if j.next_harvest_at and j.next_harvest_at > now:
                 continue
             candidates.append(j)
+
+        # 2A: MAX deneme tükenmiş + hâlâ "generating"de takılı işleri TERMINAL
+        # (failed) yap. Eskiden sonsuza dek "generating"de kalıp manuel müdahale
+        # gerektiriyorlardı (bugün elle düzelttik). status=3-fix'li resume 3
+        # denemede video çekemediyse notebook'ta tamamlanmış video yoktur → failed.
+        # Admin'de ❌ + requeue butonu görünür (auth-pattern ise B auto-requeue alır).
+        if exhausted:
+            _ex = set(exhausted)
+
+            def _term(js):
+                n = 0
+                for j in js:
+                    if j.id in _ex and j.status == "generating":
+                        j.status = "failed"
+                        j.harvest_status = "expired"
+                        if not (j.error or "").strip():
+                            j.error = ("stale-resume tükendi "
+                                       "(3 deneme, tamamlanmış video yok)")
+                        if not j.finished_at:
+                            j.finished_at = time.time()
+                        n += 1
+                return n
+
+            _n = mutate_jobs(_term)
+            if _n:
+                launcher_log(
+                    f"Stale-resume: {_n} tükenen iş failed yapıldı "
+                    f"(artık 'generating'de sonsuz takılı kalmıyor)")
 
         if not candidates:
             return
@@ -2247,6 +2402,42 @@ class Worker:
         )
         self._resume_threads[target.id] = t
         t.start()
+
+    def _cleanup_uploaded_mp4s(self) -> None:
+        """Azure'a yüklenmiş job'ların lokal MP4'lerini sil — disk sızıntısı önler.
+        done + video_remote_url + video_local_path var → dosyayı sil + alanı temizle.
+        Saatlik (auth-health kadansı) + boot'ta çalışır; mevcut backlog'u da temizler."""
+        jobs = load_jobs()
+        targets: list = []
+        for j in jobs:
+            if (j.status == "done" and (j.video_remote_url or "").strip()
+                    and (j.video_local_path or "").strip()):
+                p = APP_DIR / j.video_local_path
+                if p.exists() and p.suffix == ".mp4":
+                    targets.append((j.id, p))
+        if not targets:
+            return
+        freed = 0
+        cleaned: set = set()
+        for jid, p in targets:
+            try:
+                sz = p.stat().st_size
+                p.unlink()
+                freed += sz
+                cleaned.add(jid)
+            except OSError:
+                pass
+        if cleaned:
+            def _m(js):
+                for j in js:
+                    if j.id in cleaned:
+                        j.video_local_path = ""
+                return js
+
+            mutate_jobs(_m)
+            launcher_log(
+                f"MP4 cleanup: {len(cleaned)} lokal dosya silindi "
+                f"({freed // 1024 // 1024}MB boşaltıldı)")
 
     def _run_stale_resume(self, job_id: str, attempt: int) -> None:
         """resume_via_notebooklm thread wrapper. Log + state cleanup."""
@@ -4245,6 +4436,7 @@ st.markdown(_CUSTOM_CSS, unsafe_allow_html=True)
 
 # Worker'ı modül yüklemesinde başlat
 worker = get_worker()
+worker.ensure_alive()  # 2D: her render'da thread canlı mı kontrol et, ölmüşse restart+alarm
 
 
 # ---------------------------------------------------------------------------
@@ -6805,9 +6997,6 @@ def render_user_view() -> None:
         # hangi linke bağlı olduğunu görsün. Alt seviye: o klasördeki her kaynak
         # video (=title) + TÜM versiyonları (v1..vN, created_at sırası).
         # Üretilirken canlı: done=▶ tıkla-aç / generating=🎬 / queued=⏳ / failed=❌.
-        def _esc(s: str) -> str:
-            return (s or "").replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
-
         # Drive folder ID'ye göre grupla — aynı klasör farklı URL string'iyle
         # (trailing slash / ?usp=sharing / bare-id) girilmiş olsa bile TEK grupta
         # birleşsin. fkey = folder ID; her grup temsili tam URL'i de tutar (link).
@@ -6934,12 +7123,12 @@ def render_user_view() -> None:
                     title_short = j.title if len(j.title) <= 80 else j.title[:79] + "…"
                     st.markdown(
                         f'<div style="font-size:0.95rem; font-weight:600; line-height:1.3;" '
-                        f'title="{j.title}">{title_short}</div>',
+                        f'title="{_esc(j.title)}">{_esc(title_short)}</div>',
                         unsafe_allow_html=True,
                     )
                     # Gönderen etiketi — kim oluşturdu (paylaşımlı görünüm için)
                     _sb = (j.submitted_by or "").strip() or "?"
-                    _who = "👤 sen" if mine else f"👤 {_sb}"
+                    _who = "👤 sen" if mine else f"👤 {_esc(_sb)}"
                     st.markdown(
                         f'<div style="font-size:0.72rem; opacity:0.6; margin-top:1px;">'
                         f'{_who}</div>',
@@ -7832,7 +8021,7 @@ with tab_status:
             # cs[2]: BAŞLIK
             title_short = j.title if len(j.title) <= 90 else j.title[:89] + "…"
             cs[2].markdown(
-                f'<div style="font-size:0.92rem; line-height:1.35;" title="{j.title}">{title_short}</div>',
+                f'<div style="font-size:0.92rem; line-height:1.35;" title="{_esc(j.title)}">{_esc(title_short)}</div>',
                 unsafe_allow_html=True,
             )
             # cs[3]: PROFİL / GÖNDEREN
@@ -7842,7 +8031,7 @@ with tab_status:
             submitter = j.submitted_by or ""
             submitter_html = (
                 f'<div style="font-size:0.74rem; opacity:0.65; margin-top:2px;">'
-                f'gönderen: <b>{submitter}</b></div>'
+                f'gönderen: <b>{_esc(submitter)}</b></div>'
             ) if submitter else ""
             cs[3].markdown(
                 f'<div style="font-size:0.85rem; opacity:0.85;" title="{j.profile_name}">{profile_short}</div>'
@@ -8040,6 +8229,13 @@ with tab_status:
                     if st.button("🛑 Durdur", key=f"stop_{j.id}", help="Bu job'ı durdur", use_container_width=True):
                         worker.stop_job(j.id)
                         st.toast("Durdurma sinyali gönderildi.", icon="🛑")
+                if j.status == "failed":
+                    if st.button("🔄 Tekrar dene", key=f"requeue_{j.id}",
+                                 help="Bu işi kuyruğa geri al — sağlıklı bir hesaba yeniden gönderilir",
+                                 use_container_width=True):
+                        _requeue_job(j.id)
+                        st.toast("Kuyruğa geri alındı.", icon="🔄")
+                        st.rerun()
         st.markdown('</div>', unsafe_allow_html=True)
 
     if counts.get("running", 0) > 0 or counts.get("generating", 0) > 0:
@@ -8165,8 +8361,8 @@ with tab_users:
             cs = st.columns([2.5, 1, 2, 1, 1])
             with cs[0]:
                 st.markdown(
-                    f'<div style="font-weight:600;">{u.display_name or u.username}</div>'
-                    f'<div style="font-size:0.78rem; opacity:0.7;">@{u.username}</div>',
+                    f'<div style="font-weight:600;">{_esc(u.display_name or u.username)}</div>'
+                    f'<div style="font-size:0.78rem; opacity:0.7;">@{_esc(u.username)}</div>',
                     unsafe_allow_html=True,
                 )
             with cs[1]:

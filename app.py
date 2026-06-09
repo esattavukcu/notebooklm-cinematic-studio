@@ -316,6 +316,7 @@ class Job:
     submitted_by: str = ""           # Kullanıcının kendi adı (user view session_state'inden)
     batch_id: str = ""               # Toplu import batch'i (boş = tek job)
     version: int = 0                 # Bulk import versiyon no (1..N); 0 = legacy/tekil
+    auth_retry_count: int = 0        # Auth-fail blip sonrası otomatik re-queue sayısı (bounded <3)
     # Audit trail — script iteration geçmişi (Phase A)
     original_script: str = ""        # Kullanıcının ilk yapıştırdığı versiyon (AI iterasyonundan önce)
     iterations: list = field(default_factory=list)  # [{script, feedback, model, ts}, ...]
@@ -2478,12 +2479,72 @@ class Worker:
                     f"(transient varsayıldı): {msg[:140]}"
                 )
                 continue
+            # TOLERANT: tek fail, residential proxy IP rotasyonu blip'i olabilir
+            # (IP döner → o an refresh "yeni IP" diye reddedilir, sonraki stabil
+            # IP'de düzelir). Hemen ölü işaretleme — kısa bekleyip TEKRAR smoke et;
+            # ikisi de fail ederse gerçekten ölü. İlk fail transient ise re-smoke
+            # OK gelir → gereksiz init=False + re-login uyarısı engellenir.
+            time.sleep(5)
+            try:
+                ok2, _msg2 = _nlm_smoke(p.id)
+            except Exception:
+                ok2 = True  # exception → transient varsay, ölü işaretleme
+            if ok2:
+                launcher_log(
+                    f"Auth health: {p.name} ilk smoke FAIL ama re-smoke OK "
+                    f"→ transient blip (IP rotasyonu); init=True korundu."
+                )
+                continue
             if self._mark_profile_expired(p.id, p.name, reason=msg[:240]):
                 flagged += 1
         if flagged:
             launcher_log(
                 f"Auth health check bitti: {flagged}/{len(initialized)} profile "
                 f"expired olarak mark edildi"
+            )
+
+        # Auth-fail blip'inde HARD-fail olmuş (re-queue edilmeyip "failed" kalmış)
+        # işleri otomatik kurtar: auth-pattern hatalı, SON 24 saatte düşmüş,
+        # auth_retry_count<3 olan failed işleri queue'ya geri al → dispatcher
+        # sağlıklı bir hesaba yeniden gönderir. Bounded sayaç sonsuz loop önler.
+        _cut = time.time() - 24 * 3600
+        _rq = {"n": 0}
+
+        def _auth_requeue(jobs_all):
+            for j in jobs_all:
+                if j.status != "failed":
+                    continue
+                if getattr(j, "auth_retry_count", 0) >= 3:
+                    continue
+                if (j.title or "").startswith("[KOTA]"):
+                    continue
+                if (j.video_remote_url or "").strip():
+                    continue
+                ts = j.finished_at or j.started_at or j.created_at
+                if not ts or ts < _cut:
+                    continue
+                if not is_auth_failure("", j.error or ""):
+                    continue
+                j.status = "queued"
+                j.profile_id = ""
+                j.profile_name = ""
+                j.notebook_url = ""
+                j.error = ""
+                j.started_at = 0.0
+                j.finished_at = 0.0
+                j.pid = 0
+                j.harvest_status = "pending"
+                j.harvest_attempts = 0
+                j.next_harvest_at = 0.0
+                j.auth_retry_count = getattr(j, "auth_retry_count", 0) + 1
+                _rq["n"] += 1
+            return jobs_all
+
+        mutate_jobs(_auth_requeue)
+        if _rq["n"]:
+            launcher_log(
+                f"Auth-fail auto-requeue: {_rq['n']} iş queue'ya geri alındı "
+                f"(transient blip kurtarma, bounded auth_retry_count<3)"
             )
 
     def _today_count_for(self, jobs: list[Job], profile_id: str) -> int:

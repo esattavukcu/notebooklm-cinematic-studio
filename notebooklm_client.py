@@ -97,7 +97,7 @@ async def _submit_job_async(
     on_event: Callable[..., None],
     *,
     language: str = "tr",
-    video_timeout_sec: float = 3600.0,  # 1h — Cinematic Veo 3 30-40dk
+    video_timeout_sec: float = 7200.0,  # 2h — Cinematic 30-40dk normal, ama 60-90dk uzayabiliyor
     source_wait_timeout: float = 180.0,
 ) -> dict[str, Any]:
     """Full pipeline: create notebook + upload sources + generate cinematic
@@ -196,9 +196,14 @@ async def _submit_job_async(
                 instructions=(custom_prompt or None),
             )
         except Exception as e:
-            # Bazı hesaplarda 'Cinematic' Ultra subscription gerektirir → fallback
+            # Bazı hesaplarda 'Cinematic' Ultra subscription gerektirir → fallback.
+            # ESKİDEN bare "403" da fallback tetikliyordu — ama 403 genelde
+            # auth-expired/kota demek; o durumda sessizce STANDART (Explainer)
+            # video üretip bir generation harcıyorduk (yanlış ürün + kota israfı).
+            # Artık sadece açık subscription/ultra sinyalinde fallback; diğer 403'ler
+            # raise → auth/kota handler doğru şekilde yakalar.
             err_msg = str(e).lower()
-            if "ultra" in err_msg or "subscription" in err_msg or "403" in err_msg:
+            if "ultra" in err_msg or "subscription" in err_msg:
                 on_event("cinematic_unavailable_fallback_to_standard")
                 try:
                     from notebooklm import VideoFormat, VideoStyle
@@ -318,7 +323,7 @@ def submit_job(
     *,
     profiles_dir: Optional[Path] = None,
     language: str = "tr",
-    video_timeout_sec: float = 3600.0,
+    video_timeout_sec: float = 7200.0,  # 2h (bkz. run_full_pipeline)
 ) -> dict[str, Any]:
     """Sync wrapper — Worker thread'inde çağrılır. asyncio.run ile coroutine
     çalıştırır, tek bir event loop instance kullanılır."""

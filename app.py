@@ -447,7 +447,14 @@ def ensure_seed_admin() -> None:
     Username: 'admin'."""
     if USERS_FILE.exists():
         return
-    seed_pw = os.environ.get("ADMIN_PASSWORD", "").strip() or "changeme"
+    seed_pw = os.environ.get("ADMIN_PASSWORD", "").strip()
+    auto_generated = False
+    if not seed_pw:
+        # GÜVENLİK: 'changeme' gibi bilinen bir default ASLA kullanma (herkesçe
+        # tahmin edilebilir admin = anında devralma). ADMIN_PASSWORD env yoksa
+        # rastgele güçlü şifre üret + log/Slack'e BİR kez yaz (admin alsın diye).
+        seed_pw = secrets.token_urlsafe(18)
+        auto_generated = True
     seed = User(
         username="admin",
         password_hash=hash_password(seed_pw),
@@ -455,11 +462,20 @@ def ensure_seed_admin() -> None:
         display_name="Admin",
     )
     save_users([seed])
-    if seed_pw == "changeme":
+    if auto_generated:
         launcher_log(
-            "⚠ Default admin oluşturuldu (username=admin, password=changeme). "
-            ".env'ye ADMIN_PASSWORD koyup bu mesajdan kurtul."
+            f"⚠ ADMIN_PASSWORD env YOK — rastgele admin şifresi üretildi: "
+            f"{seed_pw}  (username=admin). .env'ye ADMIN_PASSWORD koyup yeniden "
+            f"başlat → kalıcı şifre."
         )
+        try:
+            send_slack_message(
+                f"🔐 *Default admin oluşturuldu* (ADMIN_PASSWORD env yoktu).\n"
+                f"username: `admin`\nşifre: `{seed_pw}`\n"
+                f"_.env'ye ADMIN_PASSWORD ekleyip yeniden başlat._"
+            )
+        except Exception:
+            pass
     else:
         launcher_log("Default admin oluşturuldu (username=admin, ADMIN_PASSWORD env'den).")
 
@@ -510,39 +526,54 @@ def _load_jobs_raw() -> list:
     with _FILE_LOCK:
         if not JOBS_FILE.exists():
             return []
+        # Parse + tip kontrolü. İKİSİ de fail-mode: (a) JSON parse hatası,
+        # (b) geçerli JSON ama liste değil (manuel-edit bir dict bırakmış olabilir).
+        # Eskiden (b) durumu except'e düşmediği için .bak'a bakmadan [] dönüyordu
+        # (sessiz veri kaybı). Şimdi ikisi de kurtarma path'ine gider.
+        why = ""
         try:
             data = json.loads(JOBS_FILE.read_text(encoding="utf-8"))
             if isinstance(data, list):
                 return data
+            why = f"liste değil ({type(data).__name__})"
         except (json.JSONDecodeError, OSError) as e:
-            bak = _jobs_backup_path()
-            try:
-                if bak.exists():
-                    data = json.loads(bak.read_text(encoding="utf-8"))
-                    if isinstance(data, list):
-                        try:
-                            JOBS_FILE.replace(
-                                JOBS_FILE.with_name(
-                                    f"{JOBS_FILE.name}.corrupt.{int(time.time())}"))
-                        except OSError:
-                            pass
-                        _atomic_write_json(JOBS_FILE, data)
-                        try:
-                            launcher_log(
-                                f"⚠ jobs.json BOZUK ({e}) → .bak'tan kurtarıldı "
-                                f"({len(data)} iş)")
-                            send_slack_message(
-                                f"🚨 *jobs.json bozulmuştu* — backup'tan kurtarıldı "
-                                f"({len(data)} iş). Bozuk dosya .corrupt olarak saklandı.")
-                        except Exception:
-                            pass
-                        return data
-            except (json.JSONDecodeError, OSError):
-                pass
-            try:
-                launcher_log(f"⚠ jobs.json BOZUK ve .bak kurtarılamadı: {e}")
-            except Exception:
-                pass
+            why = f"parse hatası: {e}"
+
+        # --- Kurtarma: bozuk dosyayı her durumda .corrupt'a sakla (forensic),
+        # sonra .bak'tan geri yükle. ---
+        corrupt_dst = JOBS_FILE.with_name(f"{JOBS_FILE.name}.corrupt.{int(time.time())}")
+        try:
+            JOBS_FILE.replace(corrupt_dst)
+        except OSError:
+            corrupt_dst = None
+        bak = _jobs_backup_path()
+        try:
+            if bak.exists():
+                data = json.loads(bak.read_text(encoding="utf-8"))
+                if isinstance(data, list):
+                    _atomic_write_json(JOBS_FILE, data)
+                    try:
+                        launcher_log(
+                            f"⚠ jobs.json BOZUK ({why}) → .bak'tan kurtarıldı "
+                            f"({len(data)} iş)")
+                        send_slack_message(
+                            f"🚨 *jobs.json bozulmuştu* — backup'tan kurtarıldı "
+                            f"({len(data)} iş). Bozuk dosya .corrupt olarak saklandı.")
+                    except Exception:
+                        pass
+                    return data
+        except (json.JSONDecodeError, OSError):
+            pass
+        try:
+            launcher_log(
+                f"⚠ jobs.json BOZUK ve .bak kurtarılamadı ({why}). "
+                f"Bozuk kopya: {corrupt_dst.name if corrupt_dst else 'saklanamadı'}")
+            send_slack_message(
+                f"🚨 *jobs.json bozuk ve backup yok* ({why}) — boş liste ile "
+                f"devam ediliyor. Bozuk dosya .corrupt olarak saklandı, elle "
+                f"incele.")
+        except Exception:
+            pass
         return []
 
 
@@ -623,6 +654,15 @@ def _requeue_job(job_id: str) -> None:
                 j.harvest_attempts = 0
                 j.next_harvest_at = 0.0
                 j.auth_retry_count = 0
+                # Video alanlarını da temizle. Aksi halde upload sonrası
+                # 'failed' olmuş bir işi requeue edince Step-B dedup işin
+                # kendi video_remote_url'ünü görüp onu 'stopped' yapıyor
+                # (buton sessizce "tekrar dene" yerine "durdur" oluyordu).
+                # + eski lokal MP4 yanlış gösterilmesin.
+                j.video_remote_url = ""
+                j.video_local_path = ""
+                j.video_url = ""
+                j.harvest_error = ""
                 break
         return jobs
 
@@ -1108,10 +1148,16 @@ def azure_blob_basename_for_job(job_id: str,
         return job_id
     title = (target.title or "").strip()
     stem = _sanitize_blob_stem(title)
-    # Aynı title'ın gerçek çıktıları (done ya da video'su olan)
+    # Aynı title'ın gerçek çıktıları (done ya da video'su olan).
+    # ENV filtresi: blob path zaten 'videos/<env>/' ile ayrık, _closed_job_url
+    # da env-filtreli rank hesaplıyor. Burada env filtresi YOKKEN bir dev-test
+    # job'u aynı title'da prod job'un rank'ını kaydırıp 'X.mp4' yerine 'X_v2.mp4'
+    # yazdırıyordu (link uyumsuzluğu). Aynı env içinde rank → tutarlı.
+    _tenv = (target.environment or "prod").strip().lower()
     siblings = [
         j for j in jobs
         if (j.title or "").strip() == title
+        and (j.environment or "prod").strip().lower() == _tenv
         and (j.status == "done" or j.video_remote_url or j.video_local_path)
     ]
     if len(siblings) <= 1:
@@ -1163,6 +1209,15 @@ def upload_to_azure(local_path: Path, job_id: str,
             )
 
         base_url = blob.url
+        # GÜVENLİK: Paylaşılan video linki READ-ONLY SAS taşısın. Upload AZURE_CONN
+        # (rwdla, 2-yıl) ile yapılır AMA döndürülen URL'e — varsa — AZURE_READONLY_SAS
+        # (yalnız Read+List) eklenir. Böylece Slack'te/link'te paylaşılan URL ile
+        # kimse container'a yazamaz/silemez. .env'e AZURE_READONLY_SAS koyulunca
+        # otomatik devreye girer; yoksa eski (rwdla) davranışa düşer.
+        ro_sas = os.environ.get("AZURE_READONLY_SAS", "").strip().lstrip("?")
+        if ro_sas:
+            clean = base_url.split("?", 1)[0]  # blob.url'deki mevcut (rwdla) SAS'i at
+            return True, f"{clean}?{ro_sas}", ""
         # azure-storage-blob SAS-based credential ile init edildiğinde blob.url
         # zaten SAS içerebilir. Duplicate eklemekten kaçın: ?sv= veya &sig=
         # zaten varsa olduğu gibi döndür.
@@ -1171,9 +1226,8 @@ def upload_to_azure(local_path: Path, job_id: str,
         sas = _extract_sas_from_conn(AZURE_CONN)
         if sas:
             # SAS-based connection: URL'e ekle → tarayıcıda direkt oynanabilir.
-            # Note: Bu URL'i alan kişi SAS'in tüm scope'u (rwdla) ile erişir,
-            # SAS expire'a kadar (2-yıl). Daha sıkı izolasyon için per-blob
-            # read-only SAS gerekir (bu account key gerektirir, biz SAS-only).
+            # Note: AZURE_READONLY_SAS koyulmadıysa bu URL SAS'in tüm scope'u
+            # (rwdla) ile erişir → read-only SAS ekle (yukarıda) önerilir.
             sep = "&" if "?" in base_url else "?"
             return True, f"{base_url}{sep}{sas}", ""
         # Account-key veya public container: base URL yeterli
@@ -1927,8 +1981,12 @@ _AUTH_FAIL_PATTERNS = (
     "login required",
     "session expired",
     "unauthorized",
-    "401",
-    "403",
+    # 401/403: bare substring "403"/"401" notebook/task ID'lerinin içinde
+    # tesadüfen geçip FALSE auth-fail (auth.json silme + re-login) tetikliyordu.
+    # HTTP-bağlamı zorunlu kıl → sadece gerçek HTTP hataları yakalanır.
+    "http 401", "http 403", "status 401", "status 403",
+    "401 unauthorized", "403 forbidden", "error 401", "error 403",
+    " 401:", " 403:", "(401)", "(403)",
 )
 
 
@@ -1940,6 +1998,24 @@ def is_auth_failure(stage: str, error_msg: str) -> bool:
     return any(pat in msg for pat in _AUTH_FAIL_PATTERNS)
 
 
+# Kota/rate-limit token'ları — bare "limit" YERİNE spesifik. Geniş "limit"
+# ("character limit", alakasız bir API'nin "rate limit"i vb.) bir hesabı 8 saat
+# bloklayabiliyordu. Pipeline'daki is_quota (run_full_pipeline) ile aynı küme +
+# "kota" (quota marker'ının error metni Türkçe "kotası" içerir).
+_QUOTA_PATTERNS = (
+    "kota", "quota", "429", "resource_exhausted", "too many requests",
+    "rate limit", "rate-limit", "rate_limit",
+    "daily limit", "limit reached", "limit exceeded",
+    "featureunavailable", "feature unavailable", "generation is unavailable",
+)
+
+
+def _is_quota_error(error_msg: str) -> bool:
+    """Kota/rate-limit hatası mı? (spesifik token — bare 'limit' değil)."""
+    msg = (error_msg or "").lower()
+    return any(pat in msg for pat in _QUOTA_PATTERNS)
+
+
 # ---------------------------------------------------------------------------
 # Worker — background dispatcher thread
 # ---------------------------------------------------------------------------
@@ -1949,6 +2025,10 @@ class Worker:
         self._thread = threading.Thread(target=self._loop, name="nbworker", daemon=True)
         self._procs: dict[str, subprocess.Popen] = {}  # job_id -> Popen
         self._proc_lock = threading.Lock()
+        # ensure_alive() her render'da (çok session paralel) çağrılır; check+restart
+        # lock'suz olursa iki session aynı anda "ölü" görüp İKİ thread başlatır →
+        # iki dispatch loop → aynı iş 2× submit. Lock bunu serileştirir.
+        self._ensure_lock = threading.Lock()
         # Stale-resume sweeper: aktif resume thread'lerini takip et ki aynı
         # job için birden fazla resume thread spawn etmeyelim.
         self._resume_threads: dict[str, threading.Thread] = {}
@@ -1972,20 +2052,29 @@ class Worker:
         try:
             if self._thread.is_alive():
                 return
-            now = time.time()
-            if now - getattr(self, "_last_restart", 0.0) < 60:
+            # Stop() çağrılmışsa (kasıtlı kapatma) diriltme — yoksa sonsuz
+            # restart+alarm döngüsü olur.
+            if self._stop_evt.is_set():
                 return
-            self._last_restart = now
-            launcher_log("⚠ Worker thread ÖLÜ bulundu — yeniden başlatılıyor.")
-            try:
-                send_slack_message(
-                    "🚨 *Worker thread ölmüştü* — otomatik yeniden başlatıldı. "
-                    "Kuyruk bir süre donmuş olabilir; durumu kontrol et.")
-            except Exception:
-                pass
-            self._thread = threading.Thread(
-                target=self._loop, name="nbworker", daemon=True)
-            self._thread.start()
+            # check-and-restart'ı serileştir: iki session aynı anda girip
+            # iki thread başlatmasın (çift dispatch loop → çift submit).
+            with self._ensure_lock:
+                if self._thread.is_alive():
+                    return
+                now = time.time()
+                if now - getattr(self, "_last_restart", 0.0) < 60:
+                    return
+                self._last_restart = now
+                launcher_log("⚠ Worker thread ÖLÜ bulundu — yeniden başlatılıyor.")
+                try:
+                    send_slack_message(
+                        "🚨 *Worker thread ölmüştü* — otomatik yeniden başlatıldı. "
+                        "Kuyruk bir süre donmuş olabilir; durumu kontrol et.")
+                except Exception:
+                    pass
+                self._thread = threading.Thread(
+                    target=self._loop, name="nbworker", daemon=True)
+                self._thread.start()
         except Exception as e:
             launcher_log(f"ensure_alive error: {e!r}")
 
@@ -2120,8 +2209,7 @@ class Worker:
             for j in jobs:
                 if not j.error:
                     continue
-                el = j.error.lower()
-                if "kota" not in el and "limit" not in el:
+                if not _is_quota_error(j.error):
                     continue
                 ts = j.finished_at or j.started_at or j.created_at
                 if ts and ts > cutoff and j.profile_name:
@@ -2372,6 +2460,40 @@ class Worker:
                     f"Stale-resume: {_n} tükenen iş failed yapıldı "
                     f"(artık 'generating'de sonsuz takılı kalmıyor)")
 
+        # B4: 'submitted' kara-deliği. Automation exit_code=0 ama notebook_url
+        # döndürmediğinde iş 'submitted' kalır: harvest'lenmez (URL yok),
+        # stale-resume edilmez (generating değil), requeue edilmez (failed değil)
+        # → _busy_count_for onu sonsuza dek 'busy' sayar, max_concurrent=1 hesap
+        # bir daha dispatch ETMEZ (sessiz slot sızıntısı). Yaşı eşiği geçmiş +
+        # URL'süz submitted işleri 'failed' yap → slot serbest + 'Tekrar dene' çıkar.
+        stuck_submitted = [
+            j.id for j in jobs
+            if j.status == "submitted"
+            and not (j.notebook_url or "").strip()
+            and (now - (j.started_at or j.created_at)) >= STALE_RESUME_MIN_AGE_SEC
+        ]
+        if stuck_submitted:
+            _ss = set(stuck_submitted)
+
+            def _term_sub(js):
+                n = 0
+                for j in js:
+                    if j.id in _ss and j.status == "submitted":
+                        j.status = "failed"
+                        if not (j.error or "").strip():
+                            j.error = ("submitted ama notebook_url yok "
+                                       "(automation URL döndürmedi, stuck)")
+                        if not j.finished_at:
+                            j.finished_at = time.time()
+                        n += 1
+                return n
+
+            _ns = mutate_jobs(_term_sub)
+            if _ns:
+                launcher_log(
+                    f"Stuck-submitted: {_ns} iş failed yapıldı "
+                    f"(slot serbest bırakıldı, requeue edilebilir)")
+
         if not candidates:
             return
 
@@ -2438,6 +2560,36 @@ class Worker:
             launcher_log(
                 f"MP4 cleanup: {len(cleaned)} lokal dosya silindi "
                 f"({freed // 1024 // 1024}MB boşaltıldı)")
+
+        # B6: Revize parent video sızıntısı. Revize işleri parent'ın tam MP4'ünü
+        # job_assets/<id>/_parent_video.mp4'e indiriyor (revize için source).
+        # done+uploaded olunca artık gereksiz ama hiç silinmiyordu (her revize
+        # tam-boy video sızdırır). done revize işlerinin parent videosunu sil.
+        pfreed = 0
+        pcleaned: set = set()
+        for j in jobs:
+            if not (j.parent_job_id and j.status == "done"
+                    and (j.video_remote_url or "").strip()):
+                continue
+            pv = JOB_ASSETS_DIR / j.id / "_parent_video.mp4"
+            if pv.exists():
+                try:
+                    pfreed += pv.stat().st_size
+                    pv.unlink()
+                    pcleaned.add(j.id)
+                except OSError:
+                    pass
+        if pcleaned:
+            def _mp(js):
+                for j in js:
+                    if j.id in pcleaned:
+                        j.revision_video_local = ""
+                return js
+
+            mutate_jobs(_mp)
+            launcher_log(
+                f"Parent-video cleanup: {len(pcleaned)} revize parent MP4 silindi "
+                f"({pfreed // 1024 // 1024}MB boşaltıldı)")
 
     def _run_stale_resume(self, job_id: str, attempt: int) -> None:
         """resume_via_notebooklm thread wrapper. Log + state cleanup."""
@@ -2636,11 +2788,28 @@ class Worker:
         initialized = [p for p in ps if p.initialized]
         if not initialized:
             return
+        # B8: Aktif gen'i olan profili smoke-test ETME. smoke_test ayrı bir
+        # client açar; library cookie rotasyonu auth.json'a geri yazıyor
+        # (per-client lock, dosyada yarış) → in-flight pipeline'ın cookie zincirini
+        # clobber edip mid-gen 401'e yol açabilir. İş bitince sonraki round test eder.
+        try:
+            in_flight_pids = {
+                j.profile_id for j in load_jobs()
+                if j.status in ("running", "generating", "submitted")
+                and (j.profile_id or "")
+            }
+        except Exception:
+            in_flight_pids = set()
         launcher_log(
             f"Auth health check başladı — {len(initialized)} initialized profile"
         )
         flagged = 0
         for p in initialized:
+            if p.id in in_flight_pids:
+                launcher_log(
+                    f"Auth health: {p.name} aktif gen var → smoke atlandı "
+                    f"(cookie clobber / mid-gen 401 önleme)")
+                continue
             try:
                 ok, msg = _nlm_smoke(p.id)
             except Exception as e:
@@ -2790,8 +2959,7 @@ class Worker:
                 continue
             if not j.error:
                 continue
-            err_lower = j.error.lower()
-            if "kota" not in err_lower and "limit" not in err_lower:
+            if not _is_quota_error(j.error):
                 continue
             ts = j.finished_at or j.started_at or j.created_at
             if ts > cutoff:
@@ -3310,7 +3478,7 @@ class Worker:
                     custom_prompt=custom_prompt,  # User'ın yazdığı, guide yok
                     on_event=on_event,
                     language="tr",  # script Türkçe ağırlıklı
-                    video_timeout_sec=3600.0,  # 1h Cinematic Veo 3
+                    video_timeout_sec=7200.0,  # 2h — Cinematic gerçekte 60-90dk sürebiliyor; 1h timeout false-failed üretiyordu
                 )
             except NotebookLMClientError as e:
                 log_fp.write(f"## NotebookLMClientError [{e.stage}]: {e}\n")
@@ -4532,7 +4700,10 @@ import secrets  # noqa: E402
 # düşüyordu = "refresh'te logout". Şimdi data/.session_tokens.json'da tutulur.
 # Format: {token: {"auth": {...}, "expires": epoch_ts}}. 30 gün TTL.
 SESSION_TOKEN_FILE = DATA_DIR / ".session_tokens.json"
-SESSION_TOKEN_TTL_SEC = 30 * 24 * 3600  # 30 gün
+SESSION_TOKEN_TTL_SEC = 7 * 24 * 3600  # 7 gün (token URL'de ?t= ile taşınıyor →
+# tarayıcı history + reverse-proxy loglarına düşer; URL paylaşmak = hesap devri.
+# TTL kısaltıldı. KALICI çözüm: token'ı cookie'ye taşı (Streamlit cookie component)
+# — ayrı iş. O zamana kadar TTL düşük tutulur.
 
 
 @st.cache_resource
@@ -4697,10 +4868,32 @@ def render_login_view() -> None:
                 password = st.text_input("Şifre", type="password")
                 submitted = st.form_submit_button("Giriş yap →", type="primary", use_container_width=True)
                 if submitted:
-                    user = authenticate(username, password)
-                    if user is None:
-                        st.error("Kullanıcı adı veya şifre hatalı.")
+                    # Login rate-limit (per-session): brute-force'u yavaşlat.
+                    # 5 hatalı denemeden sonra 5 dk kilit.
+                    _lock_until = st.session_state.get("_login_lock_until", 0.0)
+                    _now = time.time()
+                    if _lock_until > _now:
+                        st.error(
+                            f"Çok fazla hatalı deneme. "
+                            f"{int(_lock_until - _now)} sn sonra tekrar dene.")
+                        user = None
+                        submitted = False
                     else:
+                        user = authenticate(username, password)
+                    if submitted and user is None:
+                        _fails = st.session_state.get("_login_fails", 0) + 1
+                        st.session_state["_login_fails"] = _fails
+                        if _fails >= 5:
+                            st.session_state["_login_lock_until"] = time.time() + 300
+                            st.session_state["_login_fails"] = 0
+                            st.error("Çok fazla hatalı deneme — 5 dk kilitlendi.")
+                        else:
+                            st.error(
+                                f"Kullanıcı adı veya şifre hatalı. "
+                                f"({_fails}/5 deneme)")
+                    elif submitted and user is not None:
+                        st.session_state["_login_fails"] = 0
+                        st.session_state.pop("_login_lock_until", None)
                         auth = {
                             "username": user.username,
                             "role": user.role,
@@ -5040,9 +5233,9 @@ def render_bulk_drive_section(*, key_prefix: str = "blk") -> None:
                         )
                     st.markdown(
                         f"<div style='font-size:0.88rem; font-weight:500;'>"
-                        f"📄 {it['name']}{lo_badge}</div>"
+                        f"📄 {_esc(it['name'])}{lo_badge}</div>"
                         + (f"<div style='font-size:0.72rem; opacity:0.55;'>"
-                           f"↳ {it['lo_name']}</div>" if it.get("lo_name") else ""),
+                           f"↳ {_esc(it['lo_name'])}</div>" if it.get("lo_name") else ""),
                         unsafe_allow_html=True,
                     )
                 with cs[2]:
@@ -5050,7 +5243,7 @@ def render_bulk_drive_section(*, key_prefix: str = "blk") -> None:
                     author = it.get("author") or "—"
                     st.markdown(
                         f"<div style='font-size:0.78rem; opacity:0.75;'>"
-                        f"📅 {mod} &nbsp;·&nbsp; ✍️ {author[:30]}</div>",
+                        f"📅 {mod} &nbsp;·&nbsp; ✍️ {_esc(author[:30])}</div>",
                         unsafe_allow_html=True,
                     )
                 with cs[3]:
@@ -5452,7 +5645,7 @@ def render_user_view() -> None:
                     f'background:rgba(99,102,241,0.06); border-radius:6px; margin-bottom:8px;">'
                     f'<b>📹 Revize edilecek video:</b><br>'
                     f'<span style="font-size:0.78rem; opacity:0.85; font-style:italic;">'
-                    f'{(_target_job.title or "(başlıksız)")[:80]}</span><br>'
+                    f'{_esc((_target_job.title or "(başlıksız)")[:80])}</span><br>'
                     f'<a href="{_target_job.video_remote_url}" target="_blank" '
                     f'style="font-size:0.8rem;">☁️ Mevcut videoyu oynat</a>'
                     f'</div>',
@@ -7022,6 +7215,12 @@ def render_user_view() -> None:
         section_header("🎬 Toplu videolar (Drive klasörüne göre)",
                        f"{len(_fold_order)} klasör · {_total_videos} video")
 
+        # 3B: Başlık/klasör arama — 100+ videoda gerekli. Eşleşen klasör+başlık
+        # filtrelenir, eşleşen klasörler açık gelir.
+        _q = st.text_input(
+            "Ara", value="", placeholder="🔍 Başlık veya klasör ara…",
+            label_visibility="collapsed", key="_folder_search").strip().lower()
+
         _CHIP_BASE = ("display:inline-block; margin:2px 5px 2px 0; padding:3px 9px;"
                       "border-radius:10px; font-size:0.78rem; font-weight:600;")
 
@@ -7029,6 +7228,15 @@ def render_user_view() -> None:
             _ent = _by_folder[_fk]
             _src = _ent["url"]
             _titles = _ent["titles"]
+            if _q:
+                # Klasör adı/URL eşleşiyorsa tüm başlıkları göster; yoksa sadece
+                # başlığı eşleşenleri. Hiç eşleşme yoksa klasörü atla.
+                _lbl_match = _q in (_fk or "").lower() or _q in (_src or "").lower()
+                if not _lbl_match:
+                    _titles = {t: jl for t, jl in _titles.items()
+                               if _q in (t or "").lower()}
+                    if not _titles:
+                        continue
             _all_jobs = [j for tj in _titles.values() for j in tj]
             _f_tot = len(_all_jobs)
             _f_done = sum(1 for j in _all_jobs
@@ -7045,8 +7253,9 @@ def render_user_view() -> None:
             _fhead = (f"📁 {_flabel}  ·  {len(_titles)} video  ·  ✅ {_f_done}/{_f_tot}"
                       + (f"  ·  🎬 {_f_gen}" if _f_gen else "")
                       + (f"  ·  ⏳ {_f_q}" if _f_q else ""))
-            # Aktif iş olan klasör açık başlar; tamamen bitmiş klasör kapalı
-            with st.expander(_fhead, expanded=(_f_gen + _f_q > 0)):
+            # Aktif iş olan klasör açık başlar; tamamen bitmiş klasör kapalı.
+            # Arama varsa eşleşen klasör açık gelsin.
+            with st.expander(_fhead, expanded=(bool(_q) or _f_gen + _f_q > 0)):
                 if _src:
                     st.markdown(
                         f"📎 <a href='{_src}' target='_blank' "
@@ -7173,12 +7382,12 @@ def render_user_view() -> None:
                         sub = "📤 Tetiklendi (notebook URL'i yok). Admin loga baksın."
                     elif j.status == "failed":
                         err = j.error.lower() if j.error else ""
-                        if "kota" in err or "limit" in err:
+                        if _is_quota_error(j.error or ""):
                             sub = "🚫 Kota dolu — yarın otomatik denenir"
                         elif "login" in err or "giriş" in err:
                             sub = "🔓 Hesap login süresi geçmiş — yöneticiye haber ver"
                         else:
-                            sub = f"⚠ Hata: {(j.error or 'bilinmiyor')[:120]}"
+                            sub = f"⚠ Hata: {_esc((j.error or 'bilinmiyor')[:120])}"
                     elif j.status == "stopped":
                         sub = "⏹ Durduruldu"
                     else:
@@ -8034,7 +8243,7 @@ with tab_status:
                 f'gönderen: <b>{_esc(submitter)}</b></div>'
             ) if submitter else ""
             cs[3].markdown(
-                f'<div style="font-size:0.85rem; opacity:0.85;" title="{j.profile_name}">{profile_short}</div>'
+                f'<div style="font-size:0.85rem; opacity:0.85;" title="{_esc(j.profile_name)}">{_esc(profile_short)}</div>'
                 f'{submitter_html}',
                 unsafe_allow_html=True,
             )
@@ -8081,12 +8290,12 @@ with tab_status:
                                     f'<div style="display:flex; gap:8px; align-items:center; '
                                     f'margin-top:6px; padding:6px; background:rgba(16,185,129,0.08); '
                                     f'border-left:3px solid #10B981; border-radius:4px;">'
-                                    f'<img src="{thumb}" style="width:64px; height:48px; '
+                                    f'<img src="{_esc(thumb)}" style="width:64px; height:48px; '
                                     f'object-fit:cover; border-radius:4px;" '
                                     f'onerror="this.style.display=\'none\'"/>'
                                     f'<div style="font-size:0.75rem;">'
-                                    f'<b>✅ Seçili</b> · {src_emoji} {sel.get("source","?")}<br>'
-                                    f'<span style="opacity:0.7;">📜 {lic}</span></div>'
+                                    f'<b>✅ Seçili</b> · {src_emoji} {_esc(sel.get("source","?"))}<br>'
+                                    f'<span style="opacity:0.7;">📜 {_esc(lic)}</span></div>'
                                     f'</div>'
                                 )
                             st.markdown(
@@ -8094,11 +8303,11 @@ with tab_status:
                                 f'background:rgba(99,102,241,0.05); border-radius:6px;">'
                                 f'<div style="font-size:0.78rem; opacity:0.65; '
                                 f'margin-bottom:2px;">{icon} #{k+1} · '
-                                f'<i>{pos}</i></div>'
-                                f'<div style="font-size:0.85rem;">{desc}</div>'
+                                f'<i>{_esc(pos)}</i></div>'
+                                f'<div style="font-size:0.85rem;">{_esc(desc)}</div>'
                                 f'<div style="font-size:0.75rem; opacity:0.7; '
                                 f'margin-top:4px; font-family:monospace;">'
-                                f'🔍 <code>{query}</code></div>'
+                                f'🔍 <code>{_esc(query)}</code></div>'
                                 f'{sel_html}'
                                 f'</div>',
                                 unsafe_allow_html=True,
@@ -8125,7 +8334,7 @@ with tab_status:
                             mdl = (it.get("model") or "?").split("/")[-1].replace(":free", "")
                             st.markdown(
                                 f"<small style='opacity:0.7; font-weight:600;'>"
-                                f"v{k+1} · <code>{mdl}</code></small>",
+                                f"v{k+1} · <code>{_esc(mdl)}</code></small>",
                                 unsafe_allow_html=True,
                             )
                             fb = it.get("feedback", "").strip()
@@ -8134,7 +8343,7 @@ with tab_status:
                                     f"<div style='font-size:0.8rem; opacity:0.85; "
                                     f"padding:6px 10px; background:rgba(99,102,241,0.08); "
                                     f"border-left:2px solid #6366F1; border-radius:4px; "
-                                    f"margin-bottom:4px;'>💬 {fb}</div>",
+                                    f"margin-bottom:4px;'>💬 {_esc(fb)}</div>",
                                     unsafe_allow_html=True,
                                 )
                             with st.expander(f"v{k+1} senaryosu", expanded=False):
@@ -8158,20 +8367,19 @@ with tab_status:
                         st.code(j.video_url, language=None)
                         st.caption("Bu URL signed/short-lived olabilir — paylaşım için Azure URL daha güvenilir.")
                 if j.error:
-                    err_lower = j.error.lower()
-                    is_quota = "kota" in err_lower or "limit" in err_lower
+                    is_quota = _is_quota_error(j.error)
                     if is_quota:
                         st.markdown(
                             f'<div style="font-size:0.78rem; color:#991B1B; '
                             f'background:#FEE2E2; padding:4px 8px; border-radius:6px; '
                             f'margin-top:4px; border-left:3px solid #EF4444;">'
-                            f'🚫 <b>Kota dolu</b> — {j.error[:180]}</div>',
+                            f'🚫 <b>Kota dolu</b> — {_esc(j.error[:180])}</div>',
                             unsafe_allow_html=True,
                         )
                     else:
                         st.markdown(
                             f'<div style="font-size:0.78rem; opacity:0.7; margin-top:2px;">'
-                            f'⚠ {j.error[:160]}</div>',
+                            f'⚠ {_esc(j.error[:160])}</div>',
                             unsafe_allow_html=True,
                         )
 
@@ -8199,11 +8407,20 @@ with tab_status:
                     st.link_button("🌐 Aç", j.notebook_url, help="Notebook'u tarayıcıda aç", use_container_width=True)
                 # Manuel topla: notebooklm-py path'i (harvest=skip) → resume_download
                 # legacy path → eski harvest cycle tetikleme
-                if (j.status in ("generating", "done", "submitted")
-                    and not j.video_local_path
-                    and not j.video_url
-                    and j.harvest_status not in ("checking", "uploaded", "downloaded")):
-                    is_nbpy = j.harvest_status == "skip"
+                # 2A ile 'failed/expired' yapılmış (ama notebook_url'ü duran)
+                # işler de manuel resume edilebilsin — full regen yerine ucuz
+                # toplama. Aksi halde tek seçenek 'Tekrar dene' (baştan üretim).
+                _can_resume = (
+                    (j.status in ("generating", "done", "submitted")
+                     and not j.video_local_path
+                     and not j.video_url
+                     and j.harvest_status not in ("checking", "uploaded", "downloaded"))
+                    or (j.status == "failed" and j.harvest_status == "expired"
+                        and (j.notebook_url or "").strip()
+                        and not (j.video_remote_url or "").strip())
+                )
+                if _can_resume:
+                    is_nbpy = j.harvest_status in ("skip", "expired")
                     btn_label = "🛟 Manuel topla" if is_nbpy else "🔍 Şimdi tara"
                     btn_help = (
                         "notebooklm-py path: notebook'a yeniden bağlanır, "

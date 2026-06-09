@@ -196,34 +196,15 @@ async def _submit_job_async(
                 instructions=(custom_prompt or None),
             )
         except Exception as e:
-            # Bazı hesaplarda 'Cinematic' Ultra subscription gerektirir → fallback.
-            # ESKİDEN bare "403" da fallback tetikliyordu — ama 403 genelde
-            # auth-expired/kota demek; o durumda sessizce STANDART (Explainer)
-            # video üretip bir generation harcıyorduk (yanlış ürün + kota israfı).
-            # Artık sadece açık subscription/ultra sinyalinde fallback; diğer 403'ler
-            # raise → auth/kota handler doğru şekilde yakalar.
-            err_msg = str(e).lower()
-            if "ultra" in err_msg or "subscription" in err_msg:
-                on_event("cinematic_unavailable_fallback_to_standard")
-                try:
-                    from notebooklm import VideoFormat, VideoStyle
-                    gen = await c.artifacts.generate_video(
-                        nb_id,
-                        video_format=VideoFormat.EXPLAINER,
-                        video_style=VideoStyle.AUTO_SELECT,
-                        language=language,
-                        instructions=(custom_prompt or None),
-                    )
-                except Exception as e2:
-                    raise NotebookLMClientError(
-                        f"video gen (standard fallback): {type(e2).__name__}: {e2}",
-                        stage="video_gen", cause=e2,
-                    )
-            else:
-                raise NotebookLMClientError(
-                    f"video gen: {type(e).__name__}: {e}",
-                    stage="video_gen", cause=e,
-                )
+            # TÜM videolar KESİNLİKLE Cinematic olmalı — Explainer/standart
+            # fallback YOK. Cinematic üretilemiyorsa (Ultra/subscription/403/kota)
+            # iş gürültülü fail eder → başka hesaba requeue olur / kota handler
+            # yakalar. ESKİDEN "ultra"/"subscription"/403'te sessizce EXPLAINER
+            # (yanlış format) üretip bir generation harcıyordu — kaldırıldı.
+            raise NotebookLMClientError(
+                f"cinematic video gen: {type(e).__name__}: {e}",
+                stage="video_gen", cause=e,
+            )
         task_id = gen.task_id
         on_event("video_gen_started", task_id=task_id)
 

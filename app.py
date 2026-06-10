@@ -2039,6 +2039,11 @@ class Worker:
         # lock'suz olursa iki session aynı anda "ölü" görüp İKİ thread başlatır →
         # iki dispatch loop → aynı iş 2× submit. Lock bunu serileştirir.
         self._ensure_lock = threading.Lock()
+        # Startup reconciliation 1× / PROCESS çalışsın. ensure_alive sadece
+        # thread'i yeniden yaratır (aynı Worker instance, eski pipeline
+        # thread'leri yaşıyor olabilir) → o yolda reconciliation YAPILMAMALI,
+        # yoksa canlı gen'le paralel resume (aynı MP4'e çift yazma) riski doğar.
+        self._startup_reconciled = False
         # Stale-resume sweeper: aktif resume thread'lerini takip et ki aynı
         # job için birden fazla resume thread spawn etmeyelim.
         self._resume_threads: dict[str, threading.Thread] = {}
@@ -2136,6 +2141,14 @@ class Worker:
             self._cleanup_uploaded_mp4s()
         except Exception as e:
             launcher_log(f"startup mp4 cleanup error: {e!r}")
+        # Boot'ta bir kez (PROCESS başına): restart'ın öksüz bıraktığı
+        # 'generating' işleri sweeper'a arm et (self-healing, elle müdahale yok).
+        if not self._startup_reconciled:
+            self._startup_reconciled = True
+            try:
+                self._reconcile_orphans_on_start()
+            except Exception as e:
+                launcher_log(f"startup reconciliation error: {e!r}")
         while not self._stop_evt.is_set():
             try:
                 self._auto_init_check()
@@ -2433,7 +2446,11 @@ class Worker:
             if existing and existing.is_alive():
                 continue
             age = now - (j.started_at or j.created_at)
-            if age < STALE_RESUME_MIN_AGE_SEC:
+            # 90dk yaş eşiği canlı pipeline thread'iyle çakışmayı önler.
+            # ARM edilmiş işler (next_harvest_at>0 — artifact-removed handler /
+            # startup reconciliation; ikisinde de orijinal thread ölü) bu
+            # eşiği BEKLEMEZ: zamanlamayı aşağıdaki next_harvest_at kontrolü yönetir.
+            if age < STALE_RESUME_MIN_AGE_SEC and not (j.next_harvest_at or 0):
                 continue
             if j.harvest_attempts >= STALE_RESUME_MAX_ATTEMPTS:
                 exhausted.append(j.id)
@@ -2442,33 +2459,54 @@ class Worker:
                 continue
             candidates.append(j)
 
-        # 2A: MAX deneme tükenmiş + hâlâ "generating"de takılı işleri TERMINAL
-        # (failed) yap. Eskiden sonsuza dek "generating"de kalıp manuel müdahale
-        # gerektiriyorlardı (bugün elle düzelttik). status=3-fix'li resume 3
-        # denemede video çekemediyse notebook'ta tamamlanmış video yoktur → failed.
-        # Admin'de ❌ + requeue butonu görünür (auth-pattern ise B auto-requeue alır).
+        # 2A: MAX deneme tükenmiş + hâlâ "generating"de takılı işler:
+        # notebook'ta GERÇEKTEN video yok (3 kontrol boş döndü — gen hiç
+        # kalıcılaşmamış, tipik burst kurbanı). Eskiden direkt failed olup elle
+        # '🔄 Tekrar dene' bekliyordu. Şimdi: transient_retry_count bütçesi
+        # varsa OTOMATİK taze deneme (notebook temiz, 15dk dispatch backoff →
+        # round-robin farklı hesaba düşer); bütçe bittiyse failed (elle buton).
         if exhausted:
             _ex = set(exhausted)
 
             def _term(js):
-                n = 0
+                rq, fl = 0, 0
+                now3 = time.time()
                 for j in js:
-                    if j.id in _ex and j.status == "generating":
+                    if j.id not in _ex or j.status != "generating":
+                        continue
+                    n = getattr(j, "transient_retry_count", 0)
+                    if n < 2:
+                        j.status = "queued"
+                        j.profile_id = ""
+                        j.profile_name = ""
+                        j.notebook_url = ""
+                        j.error = ""
+                        j.started_at = 0.0
+                        j.finished_at = 0.0
+                        j.pid = 0
+                        j.harvest_status = "pending"
+                        j.harvest_attempts = 0
+                        j.next_harvest_at = 0.0
+                        j.transient_retry_count = n + 1
+                        j.next_dispatch_at = now3 + 900  # 15dk sonra, sakin başla
+                        rq += 1
+                    else:
                         j.status = "failed"
                         j.harvest_status = "expired"
                         if not (j.error or "").strip():
-                            j.error = ("stale-resume tükendi "
-                                       "(3 deneme, tamamlanmış video yok)")
+                            j.error = ("video kalıcılaşmadı: 3 notebook kontrolü "
+                                       "boş + 2 taze deneme tükendi")
                         if not j.finished_at:
-                            j.finished_at = time.time()
-                        n += 1
-                return n
+                            j.finished_at = now3
+                        fl += 1
+                return (rq, fl)
 
-            _n = mutate_jobs(_term)
-            if _n:
+            _rq, _fl = mutate_jobs(_term) or (0, 0)
+            if _rq or _fl:
                 launcher_log(
-                    f"Stale-resume: {_n} tükenen iş failed yapıldı "
-                    f"(artık 'generating'de sonsuz takılı kalmıyor)")
+                    f"Stale-resume tükenen: {_rq} iş otomatik taze deneme "
+                    f"(15dk backoff, farklı hesap), {_fl} iş failed "
+                    f"(retry bütçesi bitti)")
 
         # B4: 'submitted' kara-deliği. Automation exit_code=0 ama notebook_url
         # döndürmediğinde iş 'submitted' kalır: harvest'lenmez (URL yok),
@@ -2534,6 +2572,33 @@ class Worker:
         )
         self._resume_threads[target.id] = t
         t.start()
+
+    def _reconcile_orphans_on_start(self) -> None:
+        """Restart sonrası öksüz kalan işleri otomatik kurtar.
+
+        systemctl restart anında pipeline thread'leri ölür ama job'lar
+        'generating' kalır (öksüz). Google tarafında gen sürüyor/bitti olabilir.
+        Eskiden bunlar 90dk yaş eşiğini bekliyordu (veya elle started_at geri
+        alınıyordu). Şimdi: process başlangıcında (hiçbir pipeline thread'i
+        yaşamıyor — güvenli) hepsini sweeper'a arm et → 2dk içinde notebook
+        kontrol edilip video indirilmeye başlanır."""
+        def _m(jobs_all):
+            n = 0
+            now2 = time.time()
+            for j in jobs_all:
+                if (j.status == "generating" and j.harvest_status == "skip"
+                        and (j.notebook_url or "").strip()
+                        and not (j.video_local_path or "").strip()):
+                    j.harvest_attempts = 0
+                    j.next_harvest_at = now2 + 120  # 2dk sonra ilk kontrol
+                    n += 1
+            return n
+
+        n = mutate_jobs(_m)
+        if n:
+            launcher_log(
+                f"Startup reconciliation: {n} öksüz 'generating' iş sweeper'a "
+                f"arm edildi (restart self-healing)")
 
     def _cleanup_uploaded_mp4s(self) -> None:
         """Azure'a yüklenmiş job'ların lokal MP4'lerini sil — disk sızıntısı önler.
@@ -3526,28 +3591,35 @@ class Worker:
                          or "disappeared from list" in err_msg)
                 )
                 if ambiguous_transient:
-                    # BACKOFF'lu retry. "artifact removed" çoğu zaman Google'ın
-                    # anlık yoğunluk/rate-limit'i (11 hesap tek proxy IP'den aynı
-                    # anda Cinematic isteyince artifact'lar siliniyor). Hemen-tekrar
-                    # (eski davranış) bu kısa yoğunluğu atlatamadan 2 denemeyi
-                    # dakikalar içinde tüketip fail ediyordu. Artık her denemeden
-                    # önce BEKLET (15/15/30/45dk) → yoğunluk geçsin; 4 denemede de
-                    # olmazsa gerçekten failed. next_dispatch_at dispatcher tarafından
-                    # uygulanır (o ana kadar bu queued iş dispatch edilmez).
-                    _BACKOFF = (900, 900, 1800, 2700)  # 15,15,30,45 dk
-                    _MAXR = len(_BACKOFF)
-
-                    def _m_transient(jobs_all, _e=e):
+                    # YENİ ÜRETİM BAŞLATMA — mevcut notebook'u KONTROL ETTİR.
+                    # Kanıt (2026-06-10): "artifact removed" diyen işlerin bir
+                    # kısmında video aslında TAMAMLANDI (resume MP4 buldu).
+                    # Eski davranış (hemen yeni notebook+gen) sorunu amplifiye
+                    # ediyordu: her hata → yeni gen → yük düşmüyor → kaskad +
+                    # kota israfı. Şimdi: job generating+skip kalır, sweeper
+                    # 10dk sonra notebook'a bakar (10/30/60dk backoff'la 3 kez).
+                    # Video geldiyse indirir → done (kota İSRAF EDİLMEDİ).
+                    # 3 kontrol de boşsa 2A bounded taze deneme yapar (max 2,
+                    # 15dk backoff, farklı hesap), o da biterse failed.
+                    def _m_arm(jobs_all, _e=e):
                         for j in jobs_all:
                             if j.id != job_id:
                                 continue
+                            if (j.notebook_url or "").strip():
+                                j.status = "generating"
+                                j.harvest_status = "skip"
+                                j.harvest_attempts = 0
+                                j.next_harvest_at = time.time() + 600  # 10dk
+                                j.error = ""
+                                return "sweeper-armed (notebook korundu, 10dk sonra kontrol)"
+                            # Notebook URL'i yok (çok erken patladı) → kontrol
+                            # edilecek bir şey yok; 2A'daki bounded taze deneme
+                            # mantığının aynısı:
                             n = getattr(j, "transient_retry_count", 0)
-                            if n < _MAXR:
-                                wait = _BACKOFF[n]
+                            if n < 2:
                                 j.status = "queued"
                                 j.profile_id = ""
                                 j.profile_name = ""
-                                j.notebook_url = ""
                                 j.error = ""
                                 j.started_at = 0.0
                                 j.finished_at = 0.0
@@ -3556,19 +3628,18 @@ class Worker:
                                 j.harvest_attempts = 0
                                 j.next_harvest_at = 0.0
                                 j.transient_retry_count = n + 1
-                                j.next_dispatch_at = time.time() + wait
-                                return f"requeue ({n + 1}/{_MAXR}, {wait // 60}dk sonra)"
+                                j.next_dispatch_at = time.time() + 900
+                                return f"taze deneme ({n + 1}/2, 15dk sonra)"
                             j.status = "failed"
                             j.error = (f"{_e.stage}: artifact removed "
-                                       f"(geçici hata, {n} backoff retry tükendi)")
+                                       f"(notebook'suz, retry bütçesi bitti)")
                             j.finished_at = time.time()
-                            j.next_dispatch_at = 0.0
                             return "failed (retry tükendi)"
                         return None
-                    _r = mutate_jobs(_m_transient)
+                    _r = mutate_jobs(_m_arm)
                     log_fp.write(
-                        f"## 'artifact removed' GEÇİCİ hata (kota DEĞİL) → {_r} "
-                        f"— hesap bloklanmadı, backoff'lu retry\n")
+                        f"## 'artifact removed' (kota DEĞİL) → {_r} — yeni gen "
+                        f"BAŞLATILMADI, hesap bloklanmadı\n")
                     log_fp.flush()
                     return
                 is_quota = (

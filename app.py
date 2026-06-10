@@ -7890,9 +7890,9 @@ st.markdown(
 
 
 # ===== ANA PANEL — TAB'LAR =====
-tab_prep, tab_bulk, tab_status, tab_videos, tab_log, tab_users = st.tabs(
+tab_prep, tab_bulk, tab_status, tab_videos, tab_uretim, tab_log, tab_users = st.tabs(
     ["📝  Hazırla", "🗂️  Drive Toplu", "📊  Durum",
-     "🎬  Videolar", "📜  Log", "👥  Kullanıcılar"]
+     "🎬  Videolar", "📈  Üretim", "📜  Log", "👥  Kullanıcılar"]
 )
 
 
@@ -8558,6 +8558,114 @@ with tab_videos:
                             )
                     except OSError:
                         st.caption("okuma hatası")
+
+
+# -------------------- TAB: ÜRETİM (hesap × gün) --------------------
+def render_production_stats() -> None:
+    """Hesap × gün üretilen (done) video matrisi — canlı, jobs.json'dan.
+    Sunucu saati Türkiye (UTC+3) olduğu için gün ayrımı doğrudan local date."""
+    from collections import defaultdict, Counter
+    section_header("📈 Üretim istatistikleri",
+                   "Hangi hesap hangi gün kaç video üretti (tamamlanan)")
+    jobs = load_jobs()
+    profiles = load_profiles()
+
+    def _short(name: str) -> str:
+        n = (name or "—").split("@")[0]
+        for s in (".ho", ".twin.ai"):
+            n = n.replace(s, "")
+        return n or "—"
+
+    current_names = {(p.name or "") for p in profiles}
+    cell: dict = defaultdict(int)
+    acct_tot: Counter = Counter()
+    day_tot: Counter = Counter()
+    days_set: set = set()
+    accts_set: set = set()
+    for j in jobs:
+        if j.status != "done":
+            continue
+        ts = j.finished_at or j.started_at or j.created_at
+        if not ts:
+            continue
+        try:
+            d = datetime.fromtimestamp(ts).strftime("%Y-%m-%d")
+        except (OSError, ValueError, OverflowError):
+            continue
+        raw = j.profile_name or "—"
+        key = _short(raw) if raw in current_names else "eski"
+        cell[(d, key)] += 1
+        acct_tot[key] += 1
+        day_tot[d] += 1
+        days_set.add(d)
+        accts_set.add(key)
+
+    if not acct_tot:
+        empty_state("📈", "Henüz üretim yok",
+                    "Tamamlanan video oldukça burada görünecek.")
+        return
+
+    cols = sorted([a for a in accts_set if a != "eski"], key=lambda a: -acct_tot[a])
+    if "eski" in accts_set:
+        cols.append("eski")
+    all_days = sorted(days_set)
+    days = sorted(days_set, reverse=True)[:45]  # en yeni üstte, son 45 gün
+    today = datetime.fromtimestamp(time.time()).strftime("%Y-%m-%d")
+    grand = sum(acct_tot.values())
+
+    mc = st.columns(4)
+    top_acct = cols[0] if cols else "—"
+    mc[0].metric("Toplam video", grand)
+    mc[1].metric("Aktif hesap", len([a for a in cols if a != "eski"]))
+    mc[2].metric("Bugün", day_tot.get(today, 0))
+    mc[3].metric(f"En çok · {top_acct}", acct_tot.get(top_acct, 0))
+
+    def _c(v):
+        a = min(0.75, 0.1 + 0.09 * v) if v else 0
+        bg = f"background:rgba(139,48,232,{a:.2f});" if v else ""
+        return (f'<td style="text-align:center;font-size:0.78rem;padding:4px 0;'
+                f'border-radius:4px;{bg}">{v or "·"}</td>')
+
+    h = ['<div style="overflow-x:auto;"><table style="border-collapse:separate;'
+         'border-spacing:2px;font-size:0.78rem;width:100%;">'
+         '<thead><tr><th style="text-align:left;padding:0 6px;font-weight:600;'
+         'opacity:0.7;">Gün</th>']
+    for c in cols:
+        h.append(f'<th style="font-weight:600;opacity:0.7;" title="{_esc(c)}">'
+                 f'{_esc(c[:7])}</th>')
+    h.append('<th style="font-weight:700;">Σ</th></tr></thead><tbody>')
+    for d in days:
+        label = d[5:].replace("-", "/") + (" •" if d == today else "")
+        h.append(f'<tr><td style="white-space:nowrap;opacity:0.7;padding:0 6px;">'
+                 f'{label}</td>')
+        for c in cols:
+            h.append(_c(cell.get((d, c), 0)))
+        h.append(f'<td style="text-align:center;font-weight:600;">'
+                 f'{day_tot.get(d, 0)}</td></tr>')
+    h.append('<tr><td style="padding:6px;font-weight:700;border-top:1px solid '
+             'rgba(0,0,0,0.12);">Σ</td>')
+    for c in cols:
+        h.append(f'<td style="text-align:center;font-weight:700;border-top:1px '
+                 f'solid rgba(0,0,0,0.12);">{acct_tot.get(c, 0)}</td>')
+    h.append(f'<td style="text-align:center;font-weight:700;border-top:1px solid '
+             f'rgba(0,0,0,0.12);">{grand}</td></tr></tbody></table></div>')
+    st.markdown("".join(h), unsafe_allow_html=True)
+    st.caption("Renk koyuluğu = o gün o hesabın ürettiği video. 'eski' = artık "
+               "kullanılmayan/test profil adları. Bugün (•) hâlâ devam ediyor.")
+
+    buf = io.StringIO()
+    buf.write("﻿")
+    w = csv.writer(buf)
+    w.writerow(["gün"] + cols + ["toplam"])
+    for d in all_days:
+        w.writerow([d] + [cell.get((d, c), 0) for c in cols] + [day_tot.get(d, 0)])
+    w.writerow(["TOPLAM"] + [acct_tot.get(c, 0) for c in cols] + [grand])
+    st.download_button("⬇️ CSV indir (tüm günler)", buf.getvalue(),
+                       "uretim_hesap_gun.csv", "text/csv")
+
+
+with tab_uretim:
+    render_production_stats()
 
 
 # -------------------- TAB 4: LOG --------------------

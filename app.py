@@ -151,6 +151,12 @@ DISPATCH_INTERVAL_SEC = 2.0
 # aktif submission fazı; generating (Google'da render, yük ~0) sayılmaz. Yani
 # çok video AYNI ANDA generating olabilir ama AYNI ANDA ≤N tanesi submit edilir.
 GLOBAL_MAX_SUBMITTING = int(os.environ.get("GLOBAL_MAX_SUBMITTING", "2"))
+# Aynı anda kaç video TOPLAM in-flight olabilir (running+generating+submitted).
+# GLOBAL_MAX_SUBMITTING sadece Chromium-submit fazını sınırlar; submit bitince iş
+# "generating"e geçip slotu boşaltıyordu → 11 hesap birden Google'a yüklenip tek
+# proxy IP'den burst → "artifact removed". Bu sınır eşzamanlı ÜRETİMİ kısar:
+# az-paralel = burst yok. (default 4)
+GLOBAL_MAX_INFLIGHT = int(os.environ.get("GLOBAL_MAX_INFLIGHT", "4"))
 # Profil NotebookLM kota hatası yedikten sonra kaç saat block kalır?
 # Google'ın gerçek reset zamanı Pacific time (~07-08:00 UTC) — bizim UTC date
 # rollover ile uyumsuz. 8h block + self-correct retry: max 8h overshoot,
@@ -3069,10 +3075,17 @@ class Worker:
         submitting_now = sum(
             1 for j in jobs if j.status in ("running", "submitted")
         )
+        # TOPLAM in-flight (running+generating+submitted) = Google'da eşzamanlı
+        # üretilen video sayısı. Bu sınır dolu ise yeni iş başlatma → burst yok.
+        inflight_now = sum(
+            1 for j in jobs if j.status in ("running", "generating", "submitted")
+        )
         any_dispatched = False
         for job in list(queued):
             if submitting_now >= GLOBAL_MAX_SUBMITTING:
                 break  # global submission limiti — gerisi sonraki round'da
+            if inflight_now >= GLOBAL_MAX_INFLIGHT:
+                break  # eşzamanlı üretim limiti — gerisi sonraki round'da
             job_env = (job.environment or "prod").strip().lower()
             if job_env not in ALLOWED_ENVS:
                 job_env = "prod"
@@ -3104,6 +3117,7 @@ class Worker:
             self._launch_job(job, target_profile)
             slot_map[target_profile.id] -= 1
             submitting_now += 1  # global submission sayacı
+            inflight_now += 1    # global eşzamanlı üretim sayacı
             target_profile.last_used = time.time()
             any_dispatched = True
 

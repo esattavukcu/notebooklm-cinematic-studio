@@ -318,7 +318,8 @@ class Job:
     batch_id: str = ""               # Toplu import batch'i (boş = tek job)
     version: int = 0                 # Bulk import versiyon no (1..N); 0 = legacy/tekil
     auth_retry_count: int = 0        # Auth-fail blip sonrası otomatik re-queue sayısı (bounded <3)
-    transient_retry_count: int = 0   # "artifact removed" muğlak hata sonrası bounded auto-requeue (max 2)
+    transient_retry_count: int = 0   # "artifact removed" muğlak hata sonrası bounded auto-requeue
+    next_dispatch_at: float = 0.0    # queued iş için "bu ana kadar dispatch etme" (transient backoff)
     # Audit trail — script iteration geçmişi (Phase A)
     original_script: str = ""        # Kullanıcının ilk yapıştırdığı versiyon (AI iterasyonundan önce)
     iterations: list = field(default_factory=list)  # [{script, feedback, model, ts}, ...]
@@ -664,6 +665,8 @@ def _requeue_job(job_id: str) -> None:
                 j.video_local_path = ""
                 j.video_url = ""
                 j.harvest_error = ""
+                j.transient_retry_count = 0
+                j.next_dispatch_at = 0.0
                 break
         return jobs
 
@@ -2972,7 +2975,10 @@ class Worker:
         if not profiles:
             return
         jobs = load_jobs()
-        queued = [j for j in jobs if j.status == "queued"]
+        _now = time.time()
+        # Backoff'ta olan (transient retry beklemede) queued işleri dispatch ETME.
+        queued = [j for j in jobs if j.status == "queued"
+                  and (getattr(j, "next_dispatch_at", 0) or 0) <= _now]
         if not queued:
             return
 
@@ -3028,7 +3034,8 @@ class Worker:
                     f"zaten üretiliyor)"
                 )
             jobs = load_jobs()
-            queued = [j for j in jobs if j.status == "queued"]
+            queued = [j for j in jobs if j.status == "queued"
+                      and (getattr(j, "next_dispatch_at", 0) or 0) <= time.time()]
             if not queued:
                 return
 
@@ -3505,12 +3512,24 @@ class Worker:
                          or "disappeared from list" in err_msg)
                 )
                 if ambiguous_transient:
+                    # BACKOFF'lu retry. "artifact removed" çoğu zaman Google'ın
+                    # anlık yoğunluk/rate-limit'i (11 hesap tek proxy IP'den aynı
+                    # anda Cinematic isteyince artifact'lar siliniyor). Hemen-tekrar
+                    # (eski davranış) bu kısa yoğunluğu atlatamadan 2 denemeyi
+                    # dakikalar içinde tüketip fail ediyordu. Artık her denemeden
+                    # önce BEKLET (15/15/30/45dk) → yoğunluk geçsin; 4 denemede de
+                    # olmazsa gerçekten failed. next_dispatch_at dispatcher tarafından
+                    # uygulanır (o ana kadar bu queued iş dispatch edilmez).
+                    _BACKOFF = (900, 900, 1800, 2700)  # 15,15,30,45 dk
+                    _MAXR = len(_BACKOFF)
+
                     def _m_transient(jobs_all, _e=e):
                         for j in jobs_all:
                             if j.id != job_id:
                                 continue
                             n = getattr(j, "transient_retry_count", 0)
-                            if n < 2:
+                            if n < _MAXR:
+                                wait = _BACKOFF[n]
                                 j.status = "queued"
                                 j.profile_id = ""
                                 j.profile_name = ""
@@ -3523,17 +3542,19 @@ class Worker:
                                 j.harvest_attempts = 0
                                 j.next_harvest_at = 0.0
                                 j.transient_retry_count = n + 1
-                                return f"requeue ({n + 1}/2)"
+                                j.next_dispatch_at = time.time() + wait
+                                return f"requeue ({n + 1}/{_MAXR}, {wait // 60}dk sonra)"
                             j.status = "failed"
                             j.error = (f"{_e.stage}: artifact removed "
-                                       f"(geçici hata, {n}x retry tükendi)")
+                                       f"(geçici hata, {n} backoff retry tükendi)")
                             j.finished_at = time.time()
+                            j.next_dispatch_at = 0.0
                             return "failed (retry tükendi)"
                         return None
                     _r = mutate_jobs(_m_transient)
                     log_fp.write(
                         f"## 'artifact removed' GEÇİCİ hata (kota DEĞİL) → {_r} "
-                        f"— hesap bloklanmadı\n")
+                        f"— hesap bloklanmadı, backoff'lu retry\n")
                     log_fp.flush()
                     return
                 is_quota = (

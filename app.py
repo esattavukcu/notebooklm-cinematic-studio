@@ -2225,43 +2225,25 @@ class Worker:
             env_done[e] = env_done.get(e, 0) + 1
         env_line = " · ".join(f"{e}: {n}" for e, n in sorted(env_done.items())) or "—"
 
-        # Kota-block profiller (son 8h)
-        try:
-            cutoff = time.time() - QUOTA_BLOCK_HOURS * 3600
-            quota_profiles = set()
-            for j in jobs:
-                if not j.error:
-                    continue
-                if not _is_quota_error(j.error):
-                    continue
-                ts = j.finished_at or j.started_at or j.created_at
-                if ts and ts > cutoff and j.profile_name:
-                    quota_profiles.add(j.profile_name)
-        except Exception:
-            quota_profiles = set()
-
         # Expired (initialized=False) profiller
         try:
             expired = [p.name for p in load_profiles() if not p.initialized]
         except Exception:
             expired = []
 
+        # Kullanıcı tercihi (2026-06-10): Slack'e HATA DETAYI gitmesin —
+        # sadece üretim sayısı + login gereken hesaplar (logout = aksiyon).
+        # Hata/kota detayları admin panelde (Durum + Üretim sekmeleri).
         lines = [
             f"📅 *Günsonu Özet — {today_str}*",
-            f"✅ Üretilen video: *{len(done)}*  ❌ Hatalı: *{len(failed)}*",
+            f"✅ Üretilen video: *{len(done)}*",
             f"🌍 Env: {env_line}",
         ]
-        if quota_profiles:
-            lines.append(f"🛑 Kota dolu profiller: {', '.join(sorted(quota_profiles))}")
         if expired:
             lines.append(
                 f"🔑 Login gereken profiller: {', '.join(expired)} "
                 f"→ `./deploy/login.sh`"
             )
-        if failed:
-            fl = "\n".join(f"  • {j.title[:55]}" for j in failed[:5])
-            extra = f" (+{len(failed)-5})" if len(failed) > 5 else ""
-            lines.append(f"*Hatalılar{extra}:*\n{fl}")
 
         send_slack_message("\n".join(lines))
         try:
@@ -2360,18 +2342,13 @@ class Worker:
             threshold = max(5, batch.total // 3)
             if (n_term >= batch.last_notified_terminal + threshold
                     and n_q > 0):   # hâlâ bekleyen var → dalga arası güncelleme
-                fail_lines = ""
-                if n_fail > 0:
-                    recent_fails = [j for j in failed_jobs][-3:]
-                    fail_lines = "\n" + "\n".join(
-                        f"  • {j.title[:60]} — {(j.error or '?')[:60]}"
-                        for j in recent_fails
-                    )
+                # Kullanıcı tercihi (2026-06-10): hata DETAYI Slack'e gitmez
+                # (sadece sayı); detay admin panelde.
                 send_slack_message(
                     f"📊 *İlerleme: {n_term}/{batch.total}*\n"
                     f"📁 {batch.name}\n"
                     f"✅ {n_done} başarılı · ❌ {n_fail} hatalı · "
-                    f"⏳ {n_q} sırada · ⚙️ {n_ip} işleniyor{fail_lines}"
+                    f"⏳ {n_q} sırada · ⚙️ {n_ip} işleniyor"
                 )
                 batch.last_notified_terminal = n_term
                 changed = True
@@ -2382,24 +2359,18 @@ class Worker:
                 batch.notified_complete = True
                 dur_str = _fmt_duration_batch(batch.completed_at - batch.created_at)
 
-                fail_section = ""
-                if n_fail > 0:
-                    fail_lines = "\n".join(
-                        f"  • {j.title[:70]} — {(j.error or '?')[:80]}"
-                        for j in failed_jobs[:10]
-                    )
-                    fail_section = f"\n\n*Hatalı projeler:*\n{fail_lines}"
-
                 source_line = (
                     f"\n📎 Drive: {batch.source}"
                     if batch.source.startswith("http") else ""
                 )
 
+                # Kullanıcı tercihi (2026-06-10): hata DETAYI Slack'e gitmez
+                # (sadece sayı); detay admin panelde.
                 send_slack_message(
                     f"🏁 *Oturum Tamamlandı*\n"
                     f"📁 {batch.name} · {batch.total} proje\n"
                     f"✅ Başarılı: {n_done}   ❌ Hatalı: {n_fail}\n"
-                    f"⏱ Süre: {dur_str}{source_line}{fail_section}"
+                    f"⏱ Süre: {dur_str}{source_line}"
                 )
                 changed = True
 
@@ -3787,11 +3758,8 @@ class Worker:
                     if not j.error:
                         j.error = f"{type(e).__name__}: {str(e)[:240]}"
                     j.finished_at = time.time()
-                    send_slack_message(
-                        f"❌ *Job başarısız!*\n"
-                        f"📹 {j.title[:120]}\n"
-                        f"⚠️ {j.error[:200]}"
-                    )
+                    # Kullanıcı tercihi (2026-06-10): per-job hata Slack'i YOK —
+                    # hata detayı panelde; Slack sadece login/logout uyarısı.
                     break
             save_jobs(jobs_all)
         finally:

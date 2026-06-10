@@ -318,6 +318,7 @@ class Job:
     batch_id: str = ""               # Toplu import batch'i (boş = tek job)
     version: int = 0                 # Bulk import versiyon no (1..N); 0 = legacy/tekil
     auth_retry_count: int = 0        # Auth-fail blip sonrası otomatik re-queue sayısı (bounded <3)
+    transient_retry_count: int = 0   # "artifact removed" muğlak hata sonrası bounded auto-requeue (max 2)
     # Audit trail — script iteration geçmişi (Phase A)
     original_script: str = ""        # Kullanıcının ilk yapıştırdığı versiyon (AI iterasyonundan önce)
     iterations: list = field(default_factory=list)  # [{script, feedback, model, ts}, ...]
@@ -3489,6 +3490,52 @@ class Worker:
                 # bu profili pas geçsin, ASIL job'u queued'a geri alır → yarın
                 # otomatik retry edilir veya başka profile dispatch olur).
                 err_msg = str(e).lower()
+                # MUĞLAK "artifact was removed from the list" / "disappeared" hatası:
+                # library bunu "quota/rate limit VEYA invalid notebook VEYA GEÇİCİ
+                # API sorunu olabilir" diye açıklıyor. Bu disclaimer metnindeki
+                # 'quota/rate limit' kelimeleri yüzünden EskidEN günlük-kota sanılıp
+                # hesap 8h bloklanıyordu → FALSE-POSITIVE (hesap dakikalar sonra
+                # üretebiliyor; tech'te bizzat görüldü). Artık kota SAYMA: geçici
+                # hata kabul et → bounded auto-requeue (max 2), hesabı BLOKLAMA,
+                # [KOTA] marker YARATMA. Gerçek günlük kota zaten "quota"/"limit
+                # reached"/"featureunavailable" gibi NET token'larla geliyor.
+                ambiguous_transient = (
+                    e.stage in ("video_wait", "video_download")
+                    and ("artifact was removed" in err_msg
+                         or "disappeared from list" in err_msg)
+                )
+                if ambiguous_transient:
+                    def _m_transient(jobs_all, _e=e):
+                        for j in jobs_all:
+                            if j.id != job_id:
+                                continue
+                            n = getattr(j, "transient_retry_count", 0)
+                            if n < 2:
+                                j.status = "queued"
+                                j.profile_id = ""
+                                j.profile_name = ""
+                                j.notebook_url = ""
+                                j.error = ""
+                                j.started_at = 0.0
+                                j.finished_at = 0.0
+                                j.pid = 0
+                                j.harvest_status = "pending"
+                                j.harvest_attempts = 0
+                                j.next_harvest_at = 0.0
+                                j.transient_retry_count = n + 1
+                                return f"requeue ({n + 1}/2)"
+                            j.status = "failed"
+                            j.error = (f"{_e.stage}: artifact removed "
+                                       f"(geçici hata, {n}x retry tükendi)")
+                            j.finished_at = time.time()
+                            return "failed (retry tükendi)"
+                        return None
+                    _r = mutate_jobs(_m_transient)
+                    log_fp.write(
+                        f"## 'artifact removed' GEÇİCİ hata (kota DEĞİL) → {_r} "
+                        f"— hesap bloklanmadı\n")
+                    log_fp.flush()
+                    return
                 is_quota = (
                     e.stage in ("video_gen", "video_wait", "video_download")
                     and any(k in err_msg for k in (
@@ -3509,21 +3556,6 @@ class Worker:
                     # koru ki stale-resume sweeper kurtarabilsin. Sadece profile'ı
                     # blokla (yeni iş düşmesin).
                     mid_flight = e.stage in ("video_wait", "video_download")
-                    # Edge case: kota reset anında library video_wait stage'inde
-                    # "artifact was removed by the server" / "disappeared" hatası
-                    # raise edebilir — bu durumda artifact aslında hiç oluşmadı
-                    # (Google quota'ya takılıp sessizce sildi). Notebook boş kalır,
-                    # stale-resume'ın kurtaracağı bir şey yok. mid_flight=False
-                    # yap → job queued'a düşsün, başka profile dispatch edilsin.
-                    if mid_flight and (
-                        "artifact was removed" in err_msg
-                        or "disappeared from list" in err_msg
-                    ):
-                        mid_flight = False
-                        log_fp.write(
-                            "## artifact-never-persisted override → "
-                            "mid_flight=False (requeue to another profile)\n"
-                        )
                     log_fp.write(
                         f"## quota_exceeded detected (stage={e.stage}, "
                         f"mid_flight={mid_flight}) → "

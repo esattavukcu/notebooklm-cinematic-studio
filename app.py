@@ -6401,6 +6401,10 @@ def render_user_view() -> None:
              "kullanılıyor — varsayılan kapalı. Aç → 3-step akış görünür.",
     )
     if _show_single:
+        st.caption(
+            "⏸ Tekli mod açık — sayfa otomatik yenilenmiyor, rahatça yaz. "
+            "Videolarını canlı takip etmek istersen bu anahtarı kapat."
+        )
         # ===== 3-Step pipeline state =====
         ui_step = int(st.session_state.get("ui_step", 1))
 
@@ -7691,8 +7695,19 @@ if not is_logged_in():
 # Login + role=user → user view, çık.
 if not _is_admin():
     render_user_view()
+    # Auto-refresh (aktif iş varken canlı takip için ~4sn'de bir tüm sayfayı
+    # yeniler). ANCAK kullanıcı tekli senaryo yazarken / revize ederken bu rerun
+    # odağı kaçırıp yarım metni bozuyordu (şikayet). Compose modunda DURDUR →
+    # sayfa stabil; toggle/modal kapanınca canlı takip geri döner. (Streamlit
+    # tab'leri tüm sayfayı render ettiği için ayrı tab bunu çözmezdi; refresh'i
+    # mod-bazlı durdurmak gerçek izolasyon.)
+    _composing = (
+        st.session_state.get("show_single_flow", False)
+        or bool(st.session_state.get("revize_target_id", ""))
+    )
     _jobs_now = load_jobs()
-    if any(j.status in ("running", "queued", "generating") for j in _jobs_now):
+    if (not _composing
+            and any(j.status in ("running", "queued", "generating") for j in _jobs_now)):
         time.sleep(4)
         st.rerun()
     st.stop()

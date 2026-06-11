@@ -60,17 +60,30 @@ GEMINI_DEFAULT_MODEL: str = "flash"  # alias for gemini-2.5-flash
 
 # Model alias map (kısa ad → full API model name)
 GEMINI_MODEL_ALIAS: dict[str, str] = {
+    "flash-3.5": "gemini-3.5-flash",
     "flash": "gemini-2.5-flash",
     "pro": "gemini-2.5-pro",
     "flash-lite": "gemini-2.5-flash-lite",
 }
 
-# UI selectbox için
+# UI selectbox için (text görevleri — asset extraction vb.)
 GEMINI_MODELS: list[tuple[str, str]] = [
-    ("flash", "Gemini 2.5 Flash (varsayılan — hızlı, 5-30sn)"),
+    ("flash-3.5", "Gemini 3.5 Flash (en yeni — hızlı)"),
+    ("flash", "Gemini 2.5 Flash (hızlı, 5-30sn)"),
     ("flash-lite", "Gemini 2.5 Flash Lite (en hızlı, basit görevler için)"),
     ("pro", "Gemini 2.5 Pro (en kaliteli ama yavaş — 30-120sn)"),
 ]
+
+# Görsel üretim modelleri (generateContent + IMAGE modality → byte döner)
+GEMINI_IMAGE_ALIAS: dict[str, str] = {
+    "img-flash-2.5": "gemini-2.5-flash-image",
+    "img-flash-3.1": "gemini-3.1-flash-image",
+}
+GEMINI_IMAGE_MODELS: list[tuple[str, str]] = [
+    ("img-flash-2.5", "Gemini 2.5 Flash Image (hızlı ~5sn)"),
+    ("img-flash-3.1", "Gemini 3.1 Flash Image (kaliteli ~10sn)"),
+]
+GEMINI_IMAGE_DEFAULT: str = "img-flash-2.5"
 
 # SDK import — opsiyonel, sadece API mode için
 try:
@@ -137,6 +150,40 @@ def _get_genai_client():
             raise GeminiError("GEMINI_API_KEY env değişkeni boş.")
         _CLIENT_CACHE = _genai.Client(api_key=GEMINI_API_KEY)
     return _CLIENT_CACHE
+
+
+def generate_image(prompt: str, *, model: str = GEMINI_IMAGE_DEFAULT,
+                   timeout: int = 120) -> bytes:
+    """Gemini ile tek görsel üret → ham byte (PNG/JPEG) döndür.
+
+    API mode gerektirir (GEMINI_API_KEY). generateContent + IMAGE modality;
+    model image-capable olmalı (gemini-2.5-flash-image / gemini-3.1-flash-image).
+    Görsel dönmezse GeminiError fırlatır.
+    """
+    if not _api_mode_active():
+        raise GeminiError("Görsel üretimi API mode gerektirir (GEMINI_API_KEY yok/SDK yok).")
+    client = _get_genai_client()
+    real_model = GEMINI_IMAGE_ALIAS.get(model, model)
+    try:
+        resp = client.models.generate_content(
+            model=real_model,
+            contents=prompt,
+            config=_genai_types.GenerateContentConfig(
+                response_modalities=["IMAGE"],
+                http_options=_genai_types.HttpOptions(timeout=timeout * 1000),
+            ),
+        )
+    except Exception as e:
+        raise GeminiError(f"görsel üretim hatası ({real_model}): {type(e).__name__}: {e}",
+                          status_code=getattr(e, "code", None))
+    cands = getattr(resp, "candidates", None) or []
+    for cand in cands:
+        content = getattr(cand, "content", None)
+        for part in (getattr(content, "parts", None) or []):
+            inline = getattr(part, "inline_data", None)
+            if inline and getattr(inline, "data", None):
+                return inline.data
+    raise GeminiError(f"model görsel döndürmedi ({real_model}) — sadece metin?")
 
 
 def _gemini_chat_api(prompt: str, *,

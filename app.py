@@ -82,15 +82,17 @@ except ImportError as _nlm_imp_err:
     _NLM_AVAILABLE = False
     _nlm_imp_err_msg = str(_nlm_imp_err)
 
-# Gemini CLI wrapper — text gen için kullanılır (OpenRouter yerine).
-# Image gen halen Pollinations (OAuth tier'da nano-banana 404 dönüyor).
+# Gemini wrapper — text gen (asset extraction) + görsel üretim (API mode).
 try:
     from gemini_client import (
         GeminiError,
         gemini_chat,
         gemini_smoke_test,
+        generate_image as gemini_generate_image,
         GEMINI_MODELS,
         GEMINI_DEFAULT_MODEL,
+        GEMINI_IMAGE_MODELS,
+        GEMINI_IMAGE_DEFAULT,
     )
     _GEMINI_AVAILABLE = True
 except ImportError as _gemini_imp_err:
@@ -127,6 +129,7 @@ USERS_FILE = DATA_DIR / "users.json"
 SCRIPT_DRAFTS_FILE = DATA_DIR / "script_drafts.json"  # Phase A in-progress drafts
 JOB_ASSETS_DIR = DATA_DIR / "job_assets"  # Phase E: per-job indirilen görseller
 STYLE_GUIDES_DIR = DATA_DIR / "style_guides"  # Phase E: admin-managed reusable source dosyaları
+GEN_IMAGES_DIR = DATA_DIR / "gen_images"  # Gemini ile üretilen görseller (job'a kopyalanana kadar)
 LAUNCHER_LOG = LOGS_DIR / "launcher.log"
 
 # Bugünkü kullanım sayımına dahil olan job durumları. Failed da sayılır —
@@ -241,7 +244,7 @@ PYTHON_BIN = sys.executable  # venv'in içindeki python
 # Klasörleri ve dosyaları hazırla
 # ---------------------------------------------------------------------------
 for d in (DATA_DIR, LOGS_DIR, SCREENSHOTS_DIR, DOWNLOADS_DIR, PROFILES_DIR,
-          JOB_ASSETS_DIR, STYLE_GUIDES_DIR):
+          JOB_ASSETS_DIR, STYLE_GUIDES_DIR, GEN_IMAGES_DIR):
     d.mkdir(parents=True, exist_ok=True)
 
 
@@ -1835,12 +1838,18 @@ def download_job_images(job_id: str, assets: list) -> list[Path]:
     selected = []
     for i, a in enumerate(assets):
         sel = a.get("selected_image") or {}
-        url = sel.get("full_url") or sel.get("thumb_url") or ""
-        if not url:
+        # Gemini üretimi → local_path (diskte). HTTP url yerine kopyalanır.
+        local_path = sel.get("local_path") or ""
+        url = sel.get("full_url") or ""
+        # thumb_url sadece http ise indirme fallback'i olur (data: URI atlanır)
+        _t = sel.get("thumb_url") or ""
+        if not url and _t.startswith(("http://", "https://")):
+            url = _t
+        if not local_path and not url:
             continue
         # Anlamlı dosya adı: indeks + asset id (sıralı upload için)
         name = f"{i+1:02d}_{a.get('id','asset')[:8]}"
-        selected.append((url, name))
+        selected.append((local_path, url, name))
     if not selected:
         return []
 
@@ -1851,9 +1860,20 @@ def download_job_images(job_id: str, assets: list) -> list[Path]:
     from concurrent.futures import ThreadPoolExecutor
 
     def _dl(idx: int) -> None:
-        url, name = selected[idx]
-        p = download_image(url, job_dir, name)
-        paths[idx] = p
+        local_path, url, name = selected[idx]
+        # Önce lokal (Gemini-üretimi) → kopyala, HTTP'ye gitme
+        if local_path:
+            src = Path(local_path)
+            if src.exists():
+                try:
+                    dst = job_dir / f"{name}{src.suffix or '.png'}"
+                    shutil.copyfile(src, dst)
+                    paths[idx] = dst
+                    return
+                except OSError:
+                    pass
+        if url:
+            paths[idx] = download_image(url, job_dir, name)
 
     # Pollinations gen 5-15s × N parallel; max 4 thread iyi denge
     with ThreadPoolExecutor(max_workers=4) as ex:
@@ -1928,6 +1948,76 @@ def generate_images(prompt: str, count: int = 4, model: str = "flux",
             "_prompt": full_prompt,
         })
     return out
+
+
+def _make_thumb_datauri(data: bytes, size: int = 240) -> str:
+    """Görsel byte'larından küçük JPEG thumbnail data-URI üret (HTML <img> için).
+    Tam çözünürlük diskte; bu sadece UI önizleme (jobs.json'u şişirmesin diye küçük)."""
+    try:
+        from PIL import Image
+        im = Image.open(io.BytesIO(data))
+        im.thumbnail((size, size))
+        if im.mode in ("RGBA", "P", "LA"):
+            im = im.convert("RGB")
+        buf = io.BytesIO()
+        im.save(buf, format="JPEG", quality=70)
+        return "data:image/jpeg;base64," + base64.b64encode(buf.getvalue()).decode()
+    except Exception:
+        return ""
+
+
+def generate_images_gemini(prompt: str, count: int = 4, model: str = "img-flash-2.5",
+                           style: str = "photo") -> list[dict]:
+    """Gemini ile N görsel varyantı üret. Byte'ları GEN_IMAGES_DIR'e kaydeder,
+    candidate dict listesi döndürür (local_path = tam çözünürlük disk, thumb_url =
+    küçük data-URI önizleme). Pollinations'tan farkı: gerçek üretim (key/maliyet).
+
+    download_job_images local_path'i görünce HTTP indirme yerine kopyalar.
+    """
+    if not prompt.strip() or not _GEMINI_AVAILABLE:
+        return []
+    suffix = _STYLE_SUFFIX.get(style, _STYLE_SUFFIX["photo"])
+    full_prompt = f"{prompt.strip()}, {suffix}"
+    GEN_IMAGES_DIR.mkdir(parents=True, exist_ok=True)
+
+    def _one(i: int) -> Optional[dict]:
+        try:
+            # variation hint → her çağrı biraz farklı sonuç
+            data = gemini_generate_image(
+                f"{full_prompt}. Variation {i + 1}: distinct composition.",
+                model=model,
+            )
+        except Exception as e:
+            launcher_log(f"Gemini image gen fail (variation {i+1}): {e}")
+            return None
+        if not data or len(data) < 100:
+            return None
+        ext = ".png" if data[:4] == b"\x89PNG" else (".jpg" if data[:2] == b"\xff\xd8" else ".png")
+        fpath = GEN_IMAGES_DIR / f"{uuid.uuid4().hex[:12]}{ext}"
+        try:
+            fpath.write_bytes(data)
+        except OSError as e:
+            launcher_log(f"Gemini image save fail: {e}")
+            return None
+        return {
+            "source": "gemini",
+            "thumb_url": _make_thumb_datauri(data),  # küçük data-URI (HTML preview)
+            "full_url": "",                          # HTTP yok — local_path kullanılır
+            "local_path": str(fpath),                # tam çözünürlük (grid + pipeline)
+            "title": full_prompt[:120],
+            "license": f"AI · {model}",
+            "attribution": f"Gemini · {model}",
+            "page_url": "",
+            "_model": model,
+            "_prompt": full_prompt,
+        }
+
+    from concurrent.futures import ThreadPoolExecutor
+    out: list = [None] * count
+    with ThreadPoolExecutor(max_workers=min(4, count)) as ex:
+        for idx, res in enumerate(ex.map(_one, range(count))):
+            out[idx] = res
+    return [r for r in out if r]
 
 
 def search_images(query: str, limit: int = 12,
@@ -2638,6 +2728,28 @@ class Worker:
             launcher_log(
                 f"Parent-video cleanup: {len(pcleaned)} revize parent MP4 silindi "
                 f"({pfreed // 1024 // 1024}MB boşaltıldı)")
+
+        # Gemini ile üretilen ama seçilmeyen görseller (gen_images/) 2 günden
+        # eskiyse sil — seçilenler zaten job_assets'e kopyalanıyor, orijinal
+        # disposable. Aksi halde disk sızıntısı (her üretim 4×~400KB).
+        try:
+            _cut = time.time() - 2 * 24 * 3600
+            _gfreed = 0
+            _gn = 0
+            for f in GEN_IMAGES_DIR.glob("*"):
+                try:
+                    if f.is_file() and f.stat().st_mtime < _cut:
+                        _gfreed += f.stat().st_size
+                        f.unlink()
+                        _gn += 1
+                except OSError:
+                    pass
+            if _gn:
+                launcher_log(
+                    f"gen_images cleanup: {_gn} eski üretilen görsel silindi "
+                    f"({_gfreed // 1024 // 1024}MB)")
+        except Exception:
+            pass
 
     def _run_stale_resume(self, job_id: str, attempt: int) -> None:
         """resume_via_notebooklm thread wrapper. Log + state cleanup."""
@@ -6241,7 +6353,7 @@ def render_user_view() -> None:
                 break
 
     def _cb_generate_images(asset_id: str) -> None:
-        """Phase D: Pollinations.ai ile 4 varyant üret, candidates'e koy."""
+        """Gemini ile 4 görsel varyantı üret, candidates'e koy."""
         for a in st.session_state.get("script_assets", []):
             if a.get("id") != asset_id:
                 continue
@@ -6254,16 +6366,17 @@ def render_user_view() -> None:
                     "err", "Üretim için query ya da description gerek."
                 )
                 return
-            model = st.session_state.get(f"asset_genmodel_{asset_id}") or "flux"
+            model = st.session_state.get(f"asset_genmodel_{asset_id}") or GEMINI_IMAGE_DEFAULT
             style = a.get("style", "photo")
-            results = generate_images(prompt, count=4, model=model, style=style)
+            results = generate_images_gemini(prompt, count=4, model=model, style=style)
             if not results:
-                st.session_state["_script_msg"] = ("err", "Üretim başlatılamadı.")
+                st.session_state["_script_msg"] = (
+                    "err", "Gemini görsel üretemedi (key/model/limit?). Loglara bak.")
                 return
             a["candidates"] = results
             a["search_done_at"] = time.time()
             st.session_state["_script_msg"] = (
-                "ok", f"{len(results)} AI varyant hazır. Yüklemesi 5-15 sn sürebilir."
+                "ok", f"{len(results)} Gemini varyant hazır."
             )
             _persist_draft()
             break
@@ -6605,18 +6718,18 @@ def render_user_view() -> None:
                     unsafe_allow_html=True,
                 )
 
-                # Gemini model selector — asset extraction için, Step 1'le ortak key
+                # Gemini model selector — asset extraction için (default: 3.5 Flash)
                 _s2_model_ids = [m[0] for m in GEMINI_MODELS]
                 _s2_model_labels = {m[0]: m[1] for m in GEMINI_MODELS}
                 if "script_model" not in st.session_state or st.session_state["script_model"] not in _s2_model_ids:
-                    st.session_state["script_model"] = GEMINI_DEFAULT_MODEL
+                    st.session_state["script_model"] = "flash-3.5"
                 st.selectbox(
                     "AI Model (asset extraction için)",
                     options=_s2_model_ids,
                     format_func=lambda mid: _s2_model_labels.get(mid, mid).split(" — ")[0],
                     key="script_model",
-                    help="Flash önerilir (5-30sn). Pro daha kaliteli ama uzun script'lerde "
-                         "2-5dk sürebilir — gerçekten gerekirse seç.",
+                    help="Gemini 3.5 Flash (yeni) önerilir. Pro daha kaliteli ama "
+                         "uzun script'lerde yavaş olabilir.",
                 )
                 # Pro seçildiyse uyar
                 if st.session_state.get("script_model") == "pro":
@@ -6852,22 +6965,22 @@ def render_user_view() -> None:
                                         on_click=_cb_generate_images,
                                         args=(aid,),
                                         use_container_width=True,
-                                        help="Pollinations.ai ile 4 varyant üret (free, key gerek yok)",
+                                        help="Gemini ile 4 varyant üret (API key kullanır)",
                                     )
                                 with search_cs[2]:
-                                    # Pollinations model selector
-                                    _pmodel_ids = [m[0] for m in POLLINATIONS_MODELS]
-                                    _pmodel_lbls = {m[0]: m[1] for m in POLLINATIONS_MODELS}
+                                    # Gemini görsel model selector
+                                    _pmodel_ids = [m[0] for m in GEMINI_IMAGE_MODELS]
+                                    _pmodel_lbls = {m[0]: m[1] for m in GEMINI_IMAGE_MODELS}
                                     _pmkey = f"asset_genmodel_{aid}"
-                                    if _pmkey not in st.session_state:
-                                        st.session_state[_pmkey] = "flux"
+                                    if _pmkey not in st.session_state or st.session_state[_pmkey] not in _pmodel_ids:
+                                        st.session_state[_pmkey] = GEMINI_IMAGE_DEFAULT
                                     st.selectbox(
-                                        "AI modeli",
+                                        "Görsel modeli",
                                         options=_pmodel_ids,
                                         format_func=lambda m: _pmodel_lbls.get(m, m).split(" — ")[0],
                                         key=_pmkey,
                                         label_visibility="collapsed",
-                                        help="AI üretim modeli (üret butonunda kullanılır)",
+                                        help="Gemini görsel üretim modeli (üret butonunda kullanılır)",
                                     )
 
                                 # Aktif kaynak listesi
@@ -6878,7 +6991,7 @@ def render_user_view() -> None:
                                     _active.append("Pexels")
                                 st.caption(
                                     f"Arama kaynakları: **{' · '.join(_active)}** "
-                                    f"&nbsp;·&nbsp; AI üretim: **Pollinations.ai** (free)"
+                                    f"&nbsp;·&nbsp; AI üretim: **Gemini**"
                                 )
 
                                 # Manuel URL paste — kullanıcı kendisi URL bulup yapıştırabilir
@@ -6914,7 +7027,7 @@ def render_user_view() -> None:
                                 n_cands = len(candidates)
                                 # Tipini belirt (gerçek arama sonuçları mı, AI üretim mi)
                                 sources_in_cands = {c.get("source", "?") for c in candidates}
-                                is_all_ai = sources_in_cands == {"pollinations"}
+                                is_all_ai = sources_in_cands <= {"pollinations", "gemini"}
                                 label_kind = "AI varyant" if is_all_ai else "aday görsel"
                                 head_cs = st.columns([3, 1.3, 1.3])
                                 with head_cs[0]:
@@ -6939,7 +7052,7 @@ def render_user_view() -> None:
                                         on_click=_cb_generate_images,
                                         args=(aid,),
                                         use_container_width=True,
-                                        help="Beğenmediysen Pollinations'la 4 varyant üret",
+                                        help="Beğenmediysen Gemini ile 4 varyant üret",
                                     )
 
                                 # Thumbnail grid — 4 sütun
@@ -6952,8 +7065,9 @@ def render_user_view() -> None:
                                         cand_idx = row_start + j
                                         with grid_cs[j]:
                                             try:
+                                                # Gemini = local_path (disk), arama = thumb_url (http)
                                                 st.image(
-                                                    cand.get("thumb_url"),
+                                                    cand.get("local_path") or cand.get("thumb_url"),
                                                     use_container_width=True,
                                                 )
                                             except Exception:
@@ -6964,6 +7078,7 @@ def render_user_view() -> None:
                                                 "pixabay": "🎯 pix",
                                                 "pexels": "📸 pex",
                                                 "pollinations": "🤖 AI",
+                                                "gemini": "✨ Gemini",
                                                 "manual": "✏ man",
                                             }.get(cand.get("source", ""), "?")
                                             license_short = (cand.get("license") or "")[:14]

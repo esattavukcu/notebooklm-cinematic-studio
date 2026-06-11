@@ -231,6 +231,11 @@ LOCAL_INIT_REMOTE_PATH = os.environ.get(
 # kayıt + key alımı gerekir. Set edilmezse o kaynak skip edilir.
 PIXABAY_API_KEY = os.environ.get("PIXABAY_API_KEY", "").strip()
 PEXELS_API_KEY = os.environ.get("PEXELS_API_KEY", "").strip()
+# Shutterstock: lisanslı stok arama + lisansla/indir. SHUTTERSTOCK_TOKEN =
+# licenses.create + purchases.view scope'lu OAuth access token. Set edilmezse
+# Shutterstock kaynağı UI'da görünmez (graceful).
+SHUTTERSTOCK_TOKEN = os.environ.get("SHUTTERSTOCK_TOKEN", "").strip()
+SHUTTERSTOCK_ENABLED = bool(SHUTTERSTOCK_TOKEN)
 
 # Text gen: Gemini CLI üzerinden (Sign-in with Google OAuth).
 # UI'da AI özellikleri (script iteration, asset extraction) sadece
@@ -1838,18 +1843,22 @@ def download_job_images(job_id: str, assets: list) -> list[Path]:
     selected = []
     for i, a in enumerate(assets):
         sel = a.get("selected_image") or {}
+        # Shutterstock → sstk_id (pipeline'da lisanslanır; filigranlı thumb İNDİRİLMEZ).
+        sstk_id = sel.get("sstk_id") or ""
         # Gemini üretimi → local_path (diskte). HTTP url yerine kopyalanır.
         local_path = sel.get("local_path") or ""
-        url = sel.get("full_url") or ""
-        # thumb_url sadece http ise indirme fallback'i olur (data: URI atlanır)
-        _t = sel.get("thumb_url") or ""
-        if not url and _t.startswith(("http://", "https://")):
-            url = _t
-        if not local_path and not url:
+        url = ""
+        if not sstk_id:
+            url = sel.get("full_url") or ""
+            # thumb_url sadece http ise indirme fallback'i olur (data: URI atlanır)
+            _t = sel.get("thumb_url") or ""
+            if not url and _t.startswith(("http://", "https://")):
+                url = _t
+        if not sstk_id and not local_path and not url:
             continue
         # Anlamlı dosya adı: indeks + asset id (sıralı upload için)
         name = f"{i+1:02d}_{a.get('id','asset')[:8]}"
-        selected.append((local_path, url, name))
+        selected.append((sstk_id, local_path, url, name))
     if not selected:
         return []
 
@@ -1860,8 +1869,12 @@ def download_job_images(job_id: str, assets: list) -> list[Path]:
     from concurrent.futures import ThreadPoolExecutor
 
     def _dl(idx: int) -> None:
-        local_path, url, name = selected[idx]
-        # Önce lokal (Gemini-üretimi) → kopyala, HTTP'ye gitme
+        sstk_id, local_path, url, name = selected[idx]
+        # Shutterstock → şimdi lisansla (1 indirme harcar) + temiz indir
+        if sstk_id:
+            paths[idx] = shutterstock_license_download(sstk_id, job_dir, name)
+            return
+        # Lokal (Gemini-üretimi) → kopyala, HTTP'ye gitme
         if local_path:
             src = Path(local_path)
             if src.exists():
@@ -2018,6 +2031,116 @@ def generate_images_gemini(prompt: str, count: int = 4, model: str = "img-flash-
         for idx, res in enumerate(ex.map(_one, range(count))):
             out[idx] = res
     return [r for r in out if r]
+
+
+# ---------------------------------------------------------------------------
+# Shutterstock — lisanslı stok arama + lisansla/indir (paralı abonelik)
+# ---------------------------------------------------------------------------
+_SSTK_BASE = "https://api.shutterstock.com"
+_sstk_sub_cache: dict = {}
+
+
+def _shutterstock_headers() -> dict:
+    return {"Authorization": "Bearer " + SHUTTERSTOCK_TOKEN}
+
+
+def shutterstock_subscription() -> Optional[dict]:
+    """Lisanslamaya uygun ilk image aboneliği (5dk cache). {id,downloads_left,...} ya da None."""
+    if not SHUTTERSTOCK_ENABLED:
+        return None
+    if _sstk_sub_cache.get("sub") and (time.time() - _sstk_sub_cache.get("ts", 0) < 300):
+        return _sstk_sub_cache["sub"]
+    try:
+        req = urllib.request.Request(_SSTK_BASE + "/v2/user/subscriptions",
+                                     headers=_shutterstock_headers())
+        with urllib.request.urlopen(req, timeout=20) as r:
+            data = json.loads(r.read().decode())
+        for s in data.get("data", []):
+            if s.get("asset_type") == "images":
+                al = s.get("allotment") or {}
+                sub = {"id": s.get("id"),
+                       "downloads_left": al.get("downloads_left", 0),
+                       "downloads_limit": al.get("downloads_limit", 0)}
+                _sstk_sub_cache.update(sub=sub, ts=time.time())
+                return sub
+    except Exception as e:
+        launcher_log(f"shutterstock subscription fetch fail: {e}")
+    return None
+
+
+def shutterstock_search(query: str, limit: int = 8, style: str = "photo") -> list[dict]:
+    """Shutterstock'ta ara → candidate listesi (FİLİGRANLI önizleme + sstk_id).
+    Arama ücretsiz; lisanslama pipeline'da (seçilen + job çalışınca) yapılır."""
+    if not SHUTTERSTOCK_ENABLED or not query.strip():
+        return []
+    img_type = "illustration" if style in ("illustration", "diagram") else "photo"
+    params = {"query": query.strip(), "per_page": min(max(limit, 1), 20),
+              "image_type": img_type, "sort": "relevance", "safe": "true"}
+    url = _SSTK_BASE + "/v2/images/search?" + urllib.parse.urlencode(params)
+    try:
+        req = urllib.request.Request(url, headers=_shutterstock_headers())
+        with urllib.request.urlopen(req, timeout=20) as r:
+            data = json.loads(r.read().decode())
+    except Exception as e:
+        launcher_log(f"shutterstock search fail: {e}")
+        return []
+    out = []
+    for a in data.get("data", []):
+        assets = a.get("assets") or {}
+        prev = ((assets.get("preview") or {}).get("url")
+                or (assets.get("preview_1000") or {}).get("url")
+                or (assets.get("preview_1500") or {}).get("url") or "")
+        if not prev:
+            continue
+        out.append({
+            "source": "shutterstock",
+            "thumb_url": prev,        # filigranlı önizleme (HTML <img>)
+            "full_url": "",           # pipeline'da lisanslanıp indirilecek
+            "sstk_id": str(a.get("id")),
+            "needs_license": True,
+            "title": (a.get("description") or "")[:120],
+            "license": "Shutterstock · seçim = 1 indirme",
+            "attribution": "Shutterstock",
+            "page_url": "",
+        })
+    return out
+
+
+def shutterstock_license_download(sstk_id: str, dest_dir: Path,
+                                  name: str) -> Optional[Path]:
+    """Shutterstock görselini LİSANSLA (1 indirme harcar) + temiz (filigransız) indir.
+    Pipeline'da (job çalışırken) çağrılır → seçilip iptal edilen draft'lar kredi harcamaz.
+    Doğru format (doğrulandı): subscription_id query'de, body sadece image_id."""
+    if not SHUTTERSTOCK_ENABLED or not sstk_id:
+        return None
+    sub = shutterstock_subscription()
+    if not sub or not sub.get("id"):
+        launcher_log(f"shutterstock: kullanılabilir abonelik yok (id={sstk_id})")
+        return None
+    body = json.dumps({"images": [{"image_id": str(sstk_id)}]}).encode()
+    url = _SSTK_BASE + "/v2/images/licenses?subscription_id=" + urllib.parse.quote(sub["id"])
+    try:
+        req = urllib.request.Request(
+            url, data=body, method="POST",
+            headers={**_shutterstock_headers(), "Content-Type": "application/json"})
+        with urllib.request.urlopen(req, timeout=40) as r:
+            lic = json.loads(r.read().decode())
+    except Exception as e:
+        launcher_log(f"shutterstock license fail (id={sstk_id}): {e}")
+        return None
+    d0 = (lic.get("data") or [{}])[0]
+    if d0.get("error"):
+        launcher_log(f"shutterstock license error (id={sstk_id}): {d0.get('error')}")
+        return None
+    dl_url = (d0.get("download") or {}).get("url", "")
+    if not dl_url:
+        launcher_log(f"shutterstock no download url (id={sstk_id}): {str(lic)[:160]}")
+        return None
+    _sstk_sub_cache.clear()  # kota değişti → cache invalidate
+    p = download_image(dl_url, dest_dir, name, timeout=90)
+    launcher_log(f"shutterstock lisanslandı + indirildi (id={sstk_id}) → "
+                 f"{'OK' if p else 'indirme hatası'}")
+    return p
 
 
 def search_images(query: str, limit: int = 12,
@@ -6335,6 +6458,29 @@ def render_user_view() -> None:
             _persist_draft()
             break
 
+    def _cb_search_shutterstock(asset_id: str) -> None:
+        """Shutterstock'ta ara (lisanslı stok). Sonuçlar filigranlı önizleme;
+        seçilen görsel video üretilirken lisanslanır (1 indirme)."""
+        for a in st.session_state.get("script_assets", []):
+            if a.get("id") != asset_id:
+                continue
+            q = (a.get("query") or "").strip() or (a.get("description") or "").strip()
+            if not q:
+                st.session_state["_script_msg"] = ("err", "Arama için query/description gerek.")
+                return
+            results = shutterstock_search(q, limit=8, style=(a.get("style") or "photo").lower())
+            a["candidates"] = results
+            a["search_done_at"] = time.time()
+            if not results:
+                st.session_state["_script_msg"] = (
+                    "err", "Shutterstock sonuç yok / arama hatası (loga bak).")
+            else:
+                st.session_state["_script_msg"] = (
+                    "ok", f"{len(results)} Shutterstock sonucu — filigranlı önizleme; "
+                          f"seçince video üretilirken lisanslanır (1 indirme).")
+            _persist_draft()
+            break
+
     def _cb_select_image(asset_id: str, cand_index: int) -> None:
         for a in st.session_state.get("script_assets", []):
             if a.get("id") != asset_id:
@@ -6983,12 +7129,28 @@ def render_user_view() -> None:
                                         help="Gemini görsel üretim modeli (üret butonunda kullanılır)",
                                     )
 
+                                # Shutterstock (lisanslı stok) — ayrı buton (paralı)
+                                if SHUTTERSTOCK_ENABLED:
+                                    _ssub = shutterstock_subscription()
+                                    _sleft = _ssub.get("downloads_left", "?") if _ssub else "?"
+                                    st.button(
+                                        f"🛒 Shutterstock'ta ara · {_sleft} indirme kaldı",
+                                        key=f"asset_sstk_{aid}",
+                                        on_click=_cb_search_shutterstock,
+                                        args=(aid,),
+                                        use_container_width=True,
+                                        help="Lisanslı stok. Sonuçlar filigranlı önizleme; "
+                                             "seçtiğin görsel video üretilirken lisanslanır (1 indirme).",
+                                    )
+
                                 # Aktif kaynak listesi
                                 _active = ["Wikimedia", "Openverse"]
                                 if PIXABAY_API_KEY:
                                     _active.append("Pixabay")
                                 if PEXELS_API_KEY:
                                     _active.append("Pexels")
+                                if SHUTTERSTOCK_ENABLED:
+                                    _active.append("Shutterstock(lisanslı)")
                                 st.caption(
                                     f"Arama kaynakları: **{' · '.join(_active)}** "
                                     f"&nbsp;·&nbsp; AI üretim: **Gemini**"
@@ -7079,6 +7241,7 @@ def render_user_view() -> None:
                                                 "pexels": "📸 pex",
                                                 "pollinations": "🤖 AI",
                                                 "gemini": "✨ Gemini",
+                                                "shutterstock": "🛒 SS",
                                                 "manual": "✏ man",
                                             }.get(cand.get("source", ""), "?")
                                             license_short = (cand.get("license") or "")[:14]

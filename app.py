@@ -733,7 +733,8 @@ def load_script_draft(username: str) -> Optional[dict]:
 def save_script_draft(username: str, script: str, iterations: list,
                       assets: Optional[list] = None,
                       custom_prompt: Optional[str] = None,
-                      custom_prompt_edited: bool = False) -> None:
+                      custom_prompt_edited: bool = False,
+                      learning_objectives: Optional[str] = None) -> None:
     """Kullanıcının draft'ını disk'e yaz."""
     if not username:
         return
@@ -744,6 +745,7 @@ def save_script_draft(username: str, script: str, iterations: list,
         "assets": assets or [],
         "custom_prompt": custom_prompt or "",
         "custom_prompt_edited": bool(custom_prompt_edited),
+        "learning_objectives": learning_objectives or "",
         "updated_at": time.time(),
     }
     _atomic_write_json(SCRIPT_DRAFTS_FILE, all_drafts)
@@ -5923,6 +5925,7 @@ def render_user_view() -> None:
         st.session_state["script_custom_prompt_user_edited"] = False
         st.session_state["script_title_override"] = ""
         st.session_state["script_n_versions"] = 1
+        st.session_state["script_lo"] = ""
         st.session_state["ui_step"] = 1  # baştan başla
 
     # İlk yüklemede disk'ten restore (refresh / yeni sekme / başka cihazdan
@@ -5938,6 +5941,7 @@ def render_user_view() -> None:
             st.session_state["script_custom_prompt_user_edited"] = bool(
                 _saved.get("custom_prompt_edited", False)
             )
+            st.session_state["script_lo"] = _saved.get("learning_objectives", "")
             if _saved.get("script"):
                 # Kullanıcıya bildir — bilinmeyen yerden draft gelmesin
                 st.session_state["_script_msg"] = (
@@ -5949,6 +5953,7 @@ def render_user_view() -> None:
             st.session_state["script_assets"] = []
             st.session_state["script_custom_prompt"] = ""
             st.session_state["script_custom_prompt_user_edited"] = False
+            st.session_state["script_lo"] = ""
         st.session_state["script_feedback"] = ""
         st.session_state["_script_draft_initialized"] = True
 
@@ -6008,6 +6013,7 @@ def render_user_view() -> None:
                 custom_prompt=st.session_state.get("script_custom_prompt", ""),
                 custom_prompt_edited=bool(st.session_state.get(
                     "script_custom_prompt_user_edited", False)),
+                learning_objectives=st.session_state.get("script_lo", ""),
             )
 
     # --- Callbacks ---
@@ -6274,7 +6280,9 @@ def render_user_view() -> None:
         # Sadece selected_image olan asset'leri prompt'a koy
         sel_assets = [a for a in assets_full if a.get("selected_image")]
         rendered = render_custom_prompt(
-            DEFAULT_CUSTOM_PROMPT_TEMPLATE, title, sel_assets
+            DEFAULT_CUSTOM_PROMPT_TEMPLATE, title, sel_assets,
+            has_learning_objectives=bool(
+                (st.session_state.get("script_lo", "") or "").strip())
         )
         st.session_state["script_custom_prompt"] = rendered
         st.session_state["script_custom_prompt_user_edited"] = False
@@ -6439,110 +6447,43 @@ def render_user_view() -> None:
         if ui_step == 1:
             st.markdown(
                 '<div style="font-size:1.05rem; font-weight:700; margin-bottom:0.2rem;">'
-                '1️⃣ Senaryonu Hazırla</div>'
+                '1️⃣ Senaryo + Learning Objectives</div>'
                 '<div style="font-size:0.8rem; opacity:0.7; margin-bottom:0.5rem;">'
-                'Aşağıya ya hazır <b>script</b>\'i yapıştır → <b>Çıktıyı kullan</b>, '
-                'ya da <b>prompt</b>\'u yapıştır → <b>Çıktı oluştur</b> (LLM script üretir). '
-                'Yardımcı: <b>🤖 Weird Facts template</b>\'ini aşağıdaki form\'la doldurabilirsin.</div>',
+                'Hazır <b>senaryonu</b> ve (varsa) <b>Learning Objectives</b>\'ini yapıştır — '
+                'tıpkı Drive toplu akışındaki <code>senaryo.docx</code> + '
+                '<code>senaryo_lo.docx</code> gibi. Custom prompt ve 4 sabit guide '
+                'otomatik eklenir.</div>',
                 unsafe_allow_html=True,
             )
 
-            # --- Weird Facts template form (opsiyonel, kolay prompt üretme) ---
-            if LLM_ENABLED:
-                with st.expander("🤖 Weird Facts template kullan", expanded=False):
-                    st.caption(
-                        "Bu form, Twin Learning Vision'ın Weird Facts script writer "
-                        "prompt'unu inşa eder ve text alanına yapıştırır. Sonra "
-                        "'Çıktı oluştur' butonuna bas."
-                    )
-                    wf_cs = st.columns(2)
-                    with wf_cs[0]:
-                        st.text_input(
-                            "Konu (TOPIC)",
-                            key="wf_topic",
-                            placeholder="örn. Işığın madde ile etkileşimi sonucunda soğurulma",
-                        )
-                        st.text_input(
-                            "Sınıf seviyesi (GRADE)",
-                            key="wf_grade",
-                            placeholder="örn. 7",
-                        )
-                    with wf_cs[1]:
-                        st.selectbox(
-                            "Dil",
-                            options=["TR", "EN"],
-                            key="wf_language",
-                        )
-                        st.text_area(
-                            "Kazanım (LEARNING OBJECTIVE)",
-                            key="wf_lo",
-                            height=80,
-                            placeholder="a) ...\nb) ...\nc) ...",
-                        )
-                    st.button(
-                        "📋 Template'i text alanına yapıştır",
-                        on_click=_cb_apply_wf_template,
-                        use_container_width=True,
-                        key="btn_wf_apply",
-                    )
-
             st.text_area(
-                "Senaryo / Prompt",
-                height=360,
-                placeholder="Senaryo veya prompt'u yapıştır...\n\n"
-                            "Hazır script'in varsa direkt yapıştır + 'Çıktıyı kullan'.\n"
-                            "Prompt yapıştırırsan + 'Çıktı oluştur' → LLM script üretecek.",
-                label_visibility="collapsed",
+                "Senaryo (hazır script)",
+                height=300,
+                placeholder="Bitmiş senaryonu buraya yapıştır...",
                 key="script_draft",
                 on_change=_cb_text_changed,
             )
+            st.text_area(
+                "🎯 Learning Objectives (opsiyonel)",
+                height=110,
+                placeholder=(
+                    "a) ...\nb) ...\nc) ...\n\n"
+                    "Boş bırakılabilir. Doluysa <Title>_LearningObjectives.txt "
+                    "olarak notebook'a source eklenir (toplu akıştaki _lo gibi)."
+                ),
+                key="script_lo",
+                on_change=_persist_draft,
+            )
 
-            # --- Step 1 action buttons ---
-            if LLM_ENABLED:
-                # Gemini model selector — sadece "Çıktı oluştur" için kullanılır
-                model_ids = [m[0] for m in GEMINI_MODELS]
-                model_labels = {m[0]: m[1] for m in GEMINI_MODELS}
-                if "script_model" not in st.session_state or st.session_state["script_model"] not in model_ids:
-                    st.session_state["script_model"] = GEMINI_DEFAULT_MODEL
-
-                cs_s1 = st.columns([1.2, 1.4, 1.4])
-                with cs_s1[0]:
-                    st.selectbox(
-                        "AI Model",
-                        options=model_ids,
-                        format_func=lambda mid: model_labels.get(mid, mid).split(" — ")[0],
-                        key="script_model",
-                        label_visibility="collapsed",
-                        help="Flash önerilir. Pro uzun script'lerde 2-5dk sürebilir.",
-                    )
-                with cs_s1[1]:
-                    st.button(
-                        "🤖 Çıktı oluştur",
-                        type="secondary",
-                        use_container_width=True,
-                        on_click=_cb_generate_output,
-                        key="btn_generate_output",
-                        help="Text alandaki PROMPT'u Gemini'ye gönder, script üret. "
-                             "Flash ~5-30sn, Pro 2-5dk olabilir.",
-                    )
-                with cs_s1[2]:
-                    st.button(
-                        "✓ Çıktıyı kullan",
-                        type="primary",
-                        use_container_width=True,
-                        on_click=_cb_use_output,
-                        key="btn_use_output",
-                        help="Text alandaki SCRIPT'i kabul et, Step 2'ye geç.",
-                    )
-            else:
-                # LLM kapalıysa sadece "kullan" butonu
-                st.button(
-                    "✓ Çıktıyı kullan ve devam et",
-                    type="primary",
-                    use_container_width=True,
-                    on_click=_cb_use_output,
-                    key="btn_use_output_only",
-                )
+            # AI script üretimi/refine kaldırıldı → tek "devam" butonu.
+            # Senaryo (+ opsiyonel LO) hazır, sonraki adım görseller.
+            st.button(
+                "Devam → Görseller",
+                type="primary",
+                use_container_width=True,
+                on_click=_cb_use_output,
+                key="btn_use_output",
+            )
 
         else:
             # ui_step > 1 → Step 1 collapsed summary
@@ -6567,10 +6508,12 @@ def render_user_view() -> None:
                     key="btn_back_step1",
                 )
 
-        # ===== AI Editor (LLM aktifse, sadece Step 1'de görünür) =====
-        # Script üretildikten sonra feedback'le ince ayar (eski Phase A iter loop).
-        # Model selector Step 1 ana row'da zaten var — burada dup eklemiyoruz.
-        if LLM_ENABLED and ui_step == 1:
+        # ===== AI Editor (KALDIRILDI) =====
+        # Kullanıcı tercihi (2026-06-10): hazır senaryo + LO modeli — AI feedback/
+        # refine döngüsü kullanılmıyor. Blok `if False` ile devre dışı (ölü kod;
+        # ileride tamamen silinebilir). _cb_regenerate/_cb_revert/_cb_reset_history
+        # ve regenerate_script de artık çağrılmıyor.
+        if False and ui_step == 1:
             iter_count = len(st.session_state["script_iterations"])
             # Sadece initial-generation dışı gerçek iterasyon varsa label'da göster
             real_iters = sum(
@@ -7074,7 +7017,9 @@ def render_user_view() -> None:
             or derive_title(st.session_state.get("script_draft", ""))
             or "Untitled"
         )
-        _src_listing, _src_names = build_source_listing(_title_now, _selected_assets)
+        _has_lo = bool((st.session_state.get("script_lo", "") or "").strip())
+        _src_listing, _src_names = build_source_listing(
+            _title_now, _selected_assets, has_learning_objectives=_has_lo)
         _total_sources = len(_src_names)
 
         # Eğer custom prompt boşsa ve script var ve "user edited" değilse, otomatik doldur
@@ -7084,7 +7029,8 @@ def render_user_view() -> None:
             and not st.session_state.get("script_custom_prompt_user_edited", False)
         ):
             st.session_state["script_custom_prompt"] = render_custom_prompt(
-                DEFAULT_CUSTOM_PROMPT_TEMPLATE, _title_now, _selected_assets
+                DEFAULT_CUSTOM_PROMPT_TEMPLATE, _title_now, _selected_assets,
+                has_learning_objectives=_has_lo
             )
 
         if ui_step >= 3:
@@ -7222,6 +7168,7 @@ def render_user_view() -> None:
     if st.session_state.get("_pending_submit"):
         st.session_state["_pending_submit"] = False
         text_submit = st.session_state.get("script_draft", "").strip()
+        lo_at_submit = (st.session_state.get("script_lo", "") or "").strip()
         iterations_at_submit = list(st.session_state.get("script_iterations", []))
         assets_at_submit = list(st.session_state.get("script_assets", []))
         custom_prompt_submit = (
@@ -7259,6 +7206,7 @@ def render_user_view() -> None:
                     iterations=iterations_at_submit,
                     assets=assets_at_submit,
                     custom_prompt=custom_prompt_submit,
+                    learning_objectives=lo_at_submit,
                     version=(_v if n_ver > 1 else 0),
                     created_at=_base_ts + (_v - 1) * 0.001,
                     # Env URL param'dan (default prod). Dispatcher buna uygun

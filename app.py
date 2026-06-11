@@ -5761,10 +5761,13 @@ def render_user_view() -> None:
                 # Session_state key — modal kapatınca temizle
                 if "revize_instructions" not in st.session_state:
                     st.session_state["revize_instructions"] = ""
+                if "revize_image_urls" not in st.session_state:
+                    st.session_state["revize_image_urls"] = ""
 
                 def _cb_revize_cancel() -> None:
                     st.session_state["revize_target_id"] = ""
                     st.session_state["revize_instructions"] = ""
+                    st.session_state["revize_image_urls"] = ""
 
                 def _cb_revize_submit() -> None:
                     instr = (st.session_state.get("revize_instructions", "") or "").strip()
@@ -5780,6 +5783,31 @@ def render_user_view() -> None:
                             "err", "Parent video bulunamadı veya Azure URL eksik."
                         )
                         return
+                    # Opsiyonel yeni görseller: her satıra bir URL. Asset
+                    # formatına çevrilir → pipeline download_job_images ile
+                    # indirip notebook'a source olarak ekler (bozuk URL atlanır).
+                    _img_urls = [
+                        u.strip() for u in
+                        (st.session_state.get("revize_image_urls", "") or "").splitlines()
+                        if u.strip()
+                    ]
+                    rev_assets: list = []
+                    for _i, _u in enumerate(_img_urls[:8], 1):
+                        if not _u.lower().startswith(("http://", "https://")):
+                            _u = "https://" + _u
+                        rev_assets.append({
+                            "id": uuid.uuid4().hex[:8],
+                            "position": "",
+                            "description": f"Revize görseli {_i}",
+                            "query": "",
+                            "style": "photo",
+                            "selected_image": {
+                                "full_url": _u,
+                                "thumb_url": _u,
+                                "source": "manual",
+                                "license": "?",
+                            },
+                        })
                     # Yeni revize job'u oluştur — text alanı revize talimatı
                     # (script yerine geçer; create-video custom prompt'u
                     # gerçek revize bilgisini içerir)
@@ -5805,6 +5833,7 @@ def render_user_view() -> None:
                         text=instr,  # script alanı revize talimatı
                         submitted_by=_user_name(),
                         custom_prompt=rev_custom_prompt,
+                        assets=rev_assets,  # opsiyonel yeni görseller
                         parent_job_id=parent.id,
                         revision_instructions=instr,
                         revision_video_url=parent.video_remote_url,
@@ -5817,8 +5846,10 @@ def render_user_view() -> None:
                     save_jobs(jobs_all)
                     st.session_state["revize_target_id"] = ""
                     st.session_state["revize_instructions"] = ""
+                    st.session_state["revize_image_urls"] = ""
+                    _img_note = f" (+{len(rev_assets)} görsel)" if rev_assets else ""
                     st.session_state["_script_msg"] = (
-                        "ok", f"Revize kuyruğa eklendi: {rev_title[:50]}"
+                        "ok", f"Revize kuyruğa eklendi: {rev_title[:50]}{_img_note}"
                     )
 
                 st.text_area(
@@ -5830,6 +5861,18 @@ def render_user_view() -> None:
                         "kapanış kısmını değiştir.' "
                         "Bu metin NotebookLM'e source olarak ek olarak custom "
                         "prompt'tan referans edilir."
+                    ),
+                )
+
+                st.text_area(
+                    "🖼 Yeni görsel URL'leri (opsiyonel — her satıra bir, max 8)",
+                    key="revize_image_urls",
+                    height=80,
+                    placeholder=(
+                        "https://upload.wikimedia.org/...jpg\n"
+                        "https://...png\n"
+                        "Boş bırakılabilir. URL'ler indirilip yeni notebook'a "
+                        "görsel source olarak eklenir (bozuk URL atlanır)."
                     ),
                 )
 
@@ -5878,6 +5921,8 @@ def render_user_view() -> None:
         st.session_state["script_assets"] = []
         st.session_state["script_custom_prompt"] = ""
         st.session_state["script_custom_prompt_user_edited"] = False
+        st.session_state["script_title_override"] = ""
+        st.session_state["script_n_versions"] = 1
         st.session_state["ui_step"] = 1  # baştan başla
 
     # İlk yüklemede disk'ten restore (refresh / yeni sekme / başka cihazdan
@@ -6220,7 +6265,11 @@ def render_user_view() -> None:
     # --- Phase E (custom prompt) callbacks ---
     def _cb_autofill_prompt() -> None:
         """Mevcut script title + selected assets'ten template doldur (image-script mapping)."""
-        title = derive_title(st.session_state.get("script_draft", "")) or "Untitled"
+        title = (
+            (st.session_state.get("script_title_override", "") or "").strip()
+            or derive_title(st.session_state.get("script_draft", ""))
+            or "Untitled"
+        )
         assets_full = st.session_state.get("script_assets", []) or []
         # Sadece selected_image olan asset'leri prompt'a koy
         sel_assets = [a for a in assets_full if a.get("selected_image")]
@@ -6527,7 +6576,14 @@ def render_user_view() -> None:
             expander_label = "✨ AI ile rafine et (feedback ver)"
             if real_iters:
                 expander_label += f" — {real_iters} iterasyon"
-            with st.expander(expander_label, expanded=False):
+            # Keşfedilebilirlik: script varsa ve henüz hiç rafine edilmediyse
+            # AÇIK başlat (kullanıcılar gömülü expander'ı fark etmiyordu);
+            # kullanmaya başlayınca (real_iters>0) kapalı başlar, yer kaplamaz.
+            _refine_open = bool(
+                (st.session_state.get("script_draft", "") or "").strip()
+                and not real_iters
+            )
+            with st.expander(expander_label, expanded=_refine_open):
                 st.caption(
                     "Script'i beğendinse atla. Beğenmediysen aşağıya 'ne değişsin' "
                     "yaz, üstteki model'le AI yeniden üretsin."
@@ -7006,7 +7062,14 @@ def render_user_view() -> None:
         # enumere edilir → NotebookLM hangi görseli script'in hangi anında göstereceğini bilir.
         _assets_now = st.session_state.get("script_assets", []) or []
         _selected_assets = [a for a in _assets_now if a.get("selected_image")]
-        _title_now = derive_title(st.session_state.get("script_draft", "")) or "Untitled"
+        # Başlık: kullanıcı elle girdiyse onu kullan; boşsa ilk satırdan türet.
+        # (İlk satır markdown/giriş cümlesi olunca bozuk başlık Azure blob adına
+        # kadar gidiyordu — elle alan bunu çözer.)
+        _title_now = (
+            (st.session_state.get("script_title_override", "") or "").strip()
+            or derive_title(st.session_state.get("script_draft", ""))
+            or "Untitled"
+        )
         _src_listing, _src_names = build_source_listing(_title_now, _selected_assets)
         _total_sources = len(_src_names)
 
@@ -7100,6 +7163,22 @@ def render_user_view() -> None:
         # ===== Submit button (ui_step >= 3) =====
         if ui_step >= 3:
             st.markdown("&nbsp;", unsafe_allow_html=True)
+            # Başlık + versiyon sayısı (toplu akışla eşitlik)
+            cs_t = st.columns([3, 1.2])
+            with cs_t[0]:
+                st.text_input(
+                    "🏷 Video başlığı",
+                    key="script_title_override",
+                    placeholder=f"Boş bırakılırsa ilk satırdan: {_title_now[:60]}",
+                    help="Azure dosya adı ve NotebookLM source isimleri bu başlıktan türetilir.",
+                )
+            with cs_t[1]:
+                st.number_input(
+                    "🎞 Kaç versiyon?",
+                    min_value=1, max_value=4, value=1, step=1,
+                    key="script_n_versions",
+                    help="Aynı senaryodan kaç Cinematic versiyon üretilsin (v1..vN).",
+                )
             cs = st.columns([2, 1.4, 1.4])
             with cs[0]:
                 st.markdown(
@@ -7151,22 +7230,37 @@ def render_user_view() -> None:
         else:
             original_at_submit = text_submit
         if text_submit:
-            title = derive_title(text_submit)
+            # Başlık: elle girilen öncelikli; boşsa ilk satırdan türet
+            title = (
+                (st.session_state.get("script_title_override", "") or "").strip()
+                or derive_title(text_submit)
+            )
+            # Versiyon sayısı (1..4) — toplu akışla aynı mantık: version=1..N,
+            # hafif artan created_at → azure _v1.._vN sıralaması tutarlı.
+            # N=1 ise version=0 (eski davranış, suffix'siz).
+            try:
+                n_ver = int(st.session_state.get("script_n_versions", 1) or 1)
+            except (TypeError, ValueError):
+                n_ver = 1
+            n_ver = max(1, min(4, n_ver))
+            _base_ts = time.time()
             jobs_all = load_jobs()
-            jobs_all.append(Job(
-                id=uuid.uuid4().hex[:12],
-                title=title,
-                text=text_submit,
-                submitted_by=_user_name(),
-                original_script=original_at_submit,
-                iterations=iterations_at_submit,
-                assets=assets_at_submit,
-                custom_prompt=custom_prompt_submit,
-                # Env URL param'dan (default prod). Dispatcher buna uygun
-                # profili seçer.
-                environment=current_env(),
-                # style_guides_used kaldırıldı (Phase E.3 — yanlış yorumdu)
-            ))
+            for _v in range(1, n_ver + 1):
+                jobs_all.append(Job(
+                    id=uuid.uuid4().hex[:12],
+                    title=title,
+                    text=text_submit,
+                    submitted_by=_user_name(),
+                    original_script=original_at_submit,
+                    iterations=iterations_at_submit,
+                    assets=assets_at_submit,
+                    custom_prompt=custom_prompt_submit,
+                    version=(_v if n_ver > 1 else 0),
+                    created_at=_base_ts + (_v - 1) * 0.001,
+                    # Env URL param'dan (default prod). Dispatcher buna uygun
+                    # profili seçer.
+                    environment=current_env(),
+                ))
             save_jobs(jobs_all)
             # Disk'teki yarım draft'ı temizle (artık jobs.json'da audit'le birlikte var)
             clear_script_draft(_user_name())
@@ -7175,7 +7269,8 @@ def render_user_view() -> None:
             # widget'lar zaten render edildi. Bu yüzden bayrak kullan: bir
             # sonraki run'ın başında temizle.
             st.session_state["_clear_after_submit"] = True
-            st.toast("Kuyruğa eklendi! Birkaç dakika içinde tetiklenecek.", icon="🚀")
+            _ver_note = f" ({n_ver} versiyon)" if n_ver > 1 else ""
+            st.toast(f"Kuyruğa eklendi{_ver_note}! Birkaç dakika içinde tetiklenecek.", icon="🚀")
             time.sleep(0.5)
             st.rerun()
 

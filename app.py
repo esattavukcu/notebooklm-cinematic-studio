@@ -9284,20 +9284,22 @@ with tab_users:
 # Init aktifken (VNC üzerinden login bekleniyor) refresh yapma — aksi hâlde
 # admin form doldurmaya çalışırken sayfa sürekli sıfırlanır.
 # ---------------------------------------------------------------------------
-_any_init_active = any(
-    st.session_state.get(f"init_started_{_p.id}", 0) > time.time() - 600
-    for _p in load_profiles()
-)
-jobs_now = load_jobs()
-if not _any_init_active:
-    _active_now = any(j.status in ("running", "submitted") for j in jobs_now)
-    _generating_now = any(j.status == "generating" for j in jobs_now)
-    if _active_now:
-        time.sleep(4)
-        st.rerun()
-    elif _generating_now:
-        # Uzun Cinematic gen sırasında da yenile → versiyon çipleri canlı
-        # güncellensin (🎬→▶). running'den uzun interval (t3 CPU-credit için
-        # ölçülü; GENERATING_REFRESH_SEC env ile ayarlanabilir).
-        time.sleep(max(8, int(os.environ.get("GENERATING_REFRESH_SEC", "15"))))
-        st.rerun()
+# NON-BLOCKING: eski `time.sleep()+st.rerun()` script'i 15sn açık tutuyordu →
+# o pencerede reconnect/DOM karışıp admin sayfasında LOGIN FORMU HAYALETİ
+# beliriyordu. st.fragment(run_every) frontend timer kullanır, script'i
+# BLOKLAMAZ; aktif iş varsa tüm sayfayı temiz yeniler. (Admin path'i; user view
+# zaten yukarıda st.stop ile kendi refresh'ini yapıyor.)
+@st.fragment(run_every=max(8, int(os.environ.get("GENERATING_REFRESH_SEC", "12"))))
+def _admin_auto_refresh():
+    _init_active = any(
+        st.session_state.get(f"init_started_{_p.id}", 0) > time.time() - 600
+        for _p in load_profiles()
+    )
+    if _init_active:
+        return  # init (VNC login) sırasında yenileme yok — form sıfırlanmasın
+    _jn = load_jobs()
+    if any(j.status in ("running", "submitted", "generating") for j in _jn):
+        st.rerun(scope="app")  # tüm sayfayı temiz yenile (bloklayan sleep YOK)
+
+
+_admin_auto_refresh()

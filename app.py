@@ -8312,157 +8312,122 @@ st.markdown(
 )
 
 
+def render_admin_overview() -> None:
+    """Admin gözlem paneli: kim ne üretti + hesap kotaları + canlı özet.
+    İçerik üretimi artık kullanıcı tarafında — admin sadece izler/yönetir."""
+    from collections import defaultdict
+    section_header("📊 Genel Bakış", "Kim ne üretti · hesap kotaları · canlı durum")
+    jobs = load_jobs()
+    profiles = load_profiles()
+    now = time.time()
+    today = date.today()
+
+    def _real(j):
+        return not (j.title or "").startswith("[KOTA]")
+
+    def _is_today(ts):
+        try:
+            return bool(ts) and datetime.fromtimestamp(ts).date() == today
+        except (OSError, ValueError, OverflowError):
+            return False
+
+    def _rel(ts):
+        if not ts:
+            return "—"
+        d = now - ts
+        if d < 3600:
+            return f"{int(d/60)}dk"
+        if d < 86400:
+            return f"{int(d/3600)}sa"
+        return f"{int(d/86400)}g"
+
+    done_all = [j for j in jobs if j.status == "done" and _real(j)]
+    done_today = [j for j in done_all if _is_today(j.finished_at or j.started_at)]
+    inflight = [j for j in jobs if j.status in ("running", "generating", "submitted")]
+    queued = [j for j in jobs if j.status == "queued"]
+    failed_today = [j for j in jobs if j.status == "failed" and _real(j) and _is_today(j.finished_at)]
+
+    mc = st.columns(4)
+    mc[0].metric("Bugün üretilen", len(done_today))
+    mc[1].metric("Şu an üretiliyor", len(inflight))
+    mc[2].metric("Kuyrukta", len(queued))
+    mc[3].metric("Bugün hata", len(failed_today))
+
+    # ---- Hesap kotaları ----
+    section_header("🔑 Hesap kotaları (bugün)", "Üretilen · durum · son aktivite")
+    cut = now - QUOTA_BLOCK_HOURS * 3600
+    init_p = [p for p in profiles if p.initialized]
+    h = ['<table style="width:100%;border-collapse:collapse;font-size:0.85rem;">'
+         '<tr style="text-align:left;opacity:0.55;border-bottom:1px solid rgba(0,0,0,0.12);">'
+         '<th style="padding:6px 8px;">Hesap</th><th>Bugün</th><th>Limit</th>'
+         '<th>Durum</th><th>Son üretim</th></tr>']
+    for p in sorted(init_p, key=lambda x: (x.name or "")):
+        pj = [j for j in jobs if j.profile_id == p.id]
+        tcount = sum(1 for j in pj if j.status in COUNTED_STATUSES and _real(j)
+                     and _is_today(j.started_at or j.created_at))
+        active = sum(1 for j in pj if j.status in ("running", "generating", "submitted"))
+        blocked = any(j.error and _is_quota_error(j.error)
+                      and ((j.finished_at or j.started_at or j.created_at) > cut) for j in pj)
+        last_done = max((j.finished_at or 0 for j in pj if j.status == "done"), default=0)
+        if blocked:
+            dlabel, dbg, dfg = "🛑 kota dolu", "#FEE2E2", "#991B1B"
+        elif active:
+            dlabel, dbg, dfg = f"🎬 üretiyor ({active})", "#EDE9FE", "#5B21B6"
+        else:
+            dlabel, dbg, dfg = "✅ açık", "#DCFCE7", "#166534"
+        h.append(
+            f'<tr style="border-bottom:1px solid rgba(0,0,0,0.05);">'
+            f'<td style="padding:6px 8px;font-weight:500;">{_esc(p.name)}</td>'
+            f'<td style="text-align:center;">{tcount}</td>'
+            f'<td style="text-align:center;opacity:0.55;">{p.daily_limit or "∞"}</td>'
+            f'<td><span style="background:{dbg};color:{dfg};padding:2px 9px;'
+            f'border-radius:10px;font-size:0.76rem;font-weight:500;">{dlabel}</span></td>'
+            f'<td style="opacity:0.7;">{_rel(last_done)}</td></tr>')
+    h.append('</table>')
+    st.markdown("".join(h), unsafe_allow_html=True)
+    if SHUTTERSTOCK_ENABLED:
+        _sub = shutterstock_subscription()
+        if _sub:
+            st.caption(f"🛒 Shutterstock: **{_sub.get('downloads_left','?')}**/"
+                       f"{_sub.get('downloads_limit','?')} lisans indirme kaldı (bu ay)")
+
+    # ---- Kim ne üretti ----
+    section_header("👤 Kim ne üretti", "Kullanıcı bazında üretilen video")
+    by_user = defaultdict(list)
+    for j in done_all:
+        by_user[((j.submitted_by or "").strip() or "—")].append(j)
+    if not by_user:
+        empty_state("👤", "Henüz üretim yok", "Kullanıcılar video ürettikçe burada görünür.")
+        return
+    h2 = ['<table style="width:100%;border-collapse:collapse;font-size:0.85rem;">'
+          '<tr style="text-align:left;opacity:0.55;border-bottom:1px solid rgba(0,0,0,0.12);">'
+          '<th style="padding:6px 8px;">Kullanıcı</th><th>Toplam</th><th>Bugün</th>'
+          '<th>Son video</th></tr>']
+    for user, js in sorted(by_user.items(), key=lambda kv: -len(kv[1])):
+        ut = sum(1 for j in js if _is_today(j.finished_at or j.started_at))
+        last = max(js, key=lambda x: x.created_at)
+        _t = _esc((last.title or "—")[:46])
+        last_cell = (f'<a href="{_esc(last.video_remote_url)}" target="_blank">{_t}</a>'
+                     if last.video_remote_url else _t)
+        h2.append(
+            f'<tr style="border-bottom:1px solid rgba(0,0,0,0.05);">'
+            f'<td style="padding:6px 8px;font-weight:500;">{_esc(user)}</td>'
+            f'<td style="text-align:center;">{len(js)}</td>'
+            f'<td style="text-align:center;">{ut}</td>'
+            f'<td style="opacity:0.85;">{last_cell}</td></tr>')
+    h2.append('</table>')
+    st.markdown("".join(h2), unsafe_allow_html=True)
+    st.caption("Detaylı gün/hesap kırılımı için 📈 Üretim sekmesi · iş bazında 📊 Durum.")
+
+
 # ===== ANA PANEL — TAB'LAR =====
-tab_prep, tab_bulk, tab_status, tab_videos, tab_uretim, tab_log, tab_users = st.tabs(
-    ["📝  Hazırla", "🗂️  Drive Toplu", "📊  Durum",
-     "🎬  Videolar", "📈  Üretim", "📜  Log", "👥  Kullanıcılar"]
+tab_overview, tab_status, tab_videos, tab_uretim, tab_log, tab_users = st.tabs(
+    ["📊  Genel Bakış", "📋  Durum", "🎬  Videolar",
+     "📈  Üretim", "📜  Log", "👥  Kullanıcılar"]
 )
 
-
-# -------------------- TAB 1: HAZIRLA --------------------
-with tab_prep:
-    section_header("✍️ Yeni içerik", "Senaryon, system prompt'un veya uzun metin")
-    with st.form("new_draft", clear_on_submit=True):
-        d_title = st.text_input("Başlık (opsiyonel)", placeholder="boş bırakırsan ilk satırdan türetilir")
-        d_content = st.text_area("İçerik", height=320, placeholder="Uzun video senaryon / system prompt'un...")
-        if st.form_submit_button("➕  İçerik ekle", type="primary"):
-            content = d_content.strip()
-            if not content:
-                st.error("İçerik boş olamaz.")
-            else:
-                title = d_title.strip() or derive_title(content)
-                drafts = load_drafts()
-                drafts.append(Draft(id=uuid.uuid4().hex[:10], title=title, content=content))
-                save_drafts(drafts)
-                st.toast("Kart oluşturuldu.", icon="✅")
-                st.rerun()
-
-    with st.expander("⚡ Hızlı yapıştır (her satır bir prompt)"):
-        bulk = st.text_area("Her satır ayrı bir prompt olur", height=160, key="bulk_paste", label_visibility="collapsed")
-        if st.button("Bulk içeriklere ekle"):
-            lines = [ln.strip() for ln in bulk.splitlines() if ln.strip()]
-            if not lines:
-                st.error("Boş.")
-            else:
-                drafts = load_drafts()
-                for ln in lines:
-                    drafts.append(Draft(id=uuid.uuid4().hex[:10], title=derive_title(ln), content=ln))
-                save_drafts(drafts)
-                st.toast(f"{len(lines)} kart eklendi.", icon="✅")
-                st.rerun()
-
-    st.markdown("&nbsp;", unsafe_allow_html=True)
-
-    drafts = load_drafts()
-    section_header("📚 Hazırlanmış içerikler", f"{len(drafts)} kart")
-
-    if not drafts:
-        empty_state(
-            "📝",
-            "Henüz içerik yok",
-            "Yukarıdaki formdan ya da hızlı yapıştır ile içerik ekle.",
-        )
-    else:
-        if "selected_draft_ids" not in st.session_state:
-            st.session_state.selected_draft_ids = set()
-
-        c1, c2, _ = st.columns([1.5, 1.5, 5])
-        with c1:
-            if st.button("☑️ Tümünü seç", use_container_width=True):
-                st.session_state.selected_draft_ids = {d.id for d in drafts}
-                st.rerun()
-        with c2:
-            if st.button("⊘ Seçimi temizle", use_container_width=True):
-                st.session_state.selected_draft_ids = set()
-                st.rerun()
-
-        for d in drafts:
-            is_sel = d.id in st.session_state.selected_draft_ids
-            with st.container(border=True):
-                cs = st.columns([0.4, 5, 0.7, 0.7, 0.7])
-                with cs[0]:
-                    checked = st.checkbox(
-                        "Seç",
-                        value=is_sel,
-                        key=f"chk_{d.id}",
-                        label_visibility="collapsed",
-                    )
-                    if checked:
-                        st.session_state.selected_draft_ids.add(d.id)
-                    else:
-                        st.session_state.selected_draft_ids.discard(d.id)
-                with cs[1]:
-                    words = len(d.content.split())
-                    chars = len(d.content)
-                    st.markdown(
-                        f'<div style="font-weight:600; font-size:0.98rem; line-height:1.3;">{d.title}</div>'
-                        f'<div style="font-size:0.78rem; opacity:0.65; margin-top:2px;">'
-                        f'{words} kelime · {chars} karakter</div>',
-                        unsafe_allow_html=True,
-                    )
-                    with st.expander("İçeriği gör"):
-                        st.text(d.content)
-                with cs[2]:
-                    if st.button("✎", key=f"edit_{d.id}", help="Düzenle", use_container_width=True):
-                        st.session_state[f"editing_{d.id}"] = True
-                with cs[3]:
-                    if st.button("➕", key=f"qadd_{d.id}", help="Tek başına kuyruğa", use_container_width=True):
-                        jobs = load_jobs()
-                        jobs.append(Job(id=uuid.uuid4().hex[:12], title=d.title, text=d.content))
-                        save_jobs(jobs)
-                        st.toast("Kuyruğa eklendi.", icon="✅")
-                        st.rerun()
-                with cs[4]:
-                    if st.button("🗑", key=f"ddel_{d.id}", help="Sil", use_container_width=True):
-                        ds = [x for x in load_drafts() if x.id != d.id]
-                        save_drafts(ds)
-                        st.session_state.selected_draft_ids.discard(d.id)
-                        st.rerun()
-
-                if st.session_state.get(f"editing_{d.id}"):
-                    new_t = st.text_input("Başlık", value=d.title, key=f"et_{d.id}")
-                    new_c = st.text_area("İçerik", value=d.content, height=200, key=f"ec_{d.id}")
-                    cs2 = st.columns(2)
-                    with cs2[0]:
-                        if st.button("Kaydet", key=f"esave_{d.id}"):
-                            ds = load_drafts()
-                            for x in ds:
-                                if x.id == d.id:
-                                    x.title = new_t.strip() or x.title
-                                    x.content = new_c
-                                    break
-                            save_drafts(ds)
-                            st.session_state[f"editing_{d.id}"] = False
-                            st.rerun()
-                    with cs2[1]:
-                        if st.button("İptal", key=f"ecancel_{d.id}"):
-                            st.session_state[f"editing_{d.id}"] = False
-                            st.rerun()
-
-        sel_count = len(st.session_state.selected_draft_ids)
-        st.markdown("&nbsp;", unsafe_allow_html=True)
-        if st.button(
-            f"🚀 Seçilenleri kuyruğa ekle  ({sel_count})",
-            disabled=sel_count == 0,
-            type="primary",
-            use_container_width=True,
-        ):
-            ds = load_drafts()
-            jobs = load_jobs()
-            n = 0
-            for d in ds:
-                if d.id in st.session_state.selected_draft_ids:
-                    jobs.append(Job(id=uuid.uuid4().hex[:12], title=d.title, text=d.content))
-                    n += 1
-            save_jobs(jobs)
-            st.session_state.selected_draft_ids = set()
-            st.toast(f"{n} job kuyruğa eklendi.", icon="✅")
-            st.rerun()
-
-
-# -------------------- TAB: DRIVE TOPLU --------------------
-with tab_bulk:
-    render_bulk_drive_section(key_prefix="adm")
+with tab_overview:
+    render_admin_overview()
 
 
 # -------------------- TAB 2: DURUM --------------------

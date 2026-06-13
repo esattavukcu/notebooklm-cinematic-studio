@@ -1058,23 +1058,41 @@ def cleanup_stale_jobs() -> int:
     for j in jobs:
         if j.status != "running":
             continue
+        stale = False
         if j.pid and j.pid > 0:
-            # Subprocess job — PID ölüyse stale (eski davranış)
-            if not _pid_alive(j.pid):
-                j.status = "failed"
-                j.error = j.error or "Process kayboldu (stale state)"
-                j.finished_at = time.time()
-                changed += 1
+            if not _pid_alive(j.pid):  # subprocess öldü
+                stale = True
         else:
-            # Thread-based notebooklm-py job (pid=0). Normalde running→generating
-            # saniyeler içinde geçer. 15dk+ running kaldıysa thread gerçekten
-            # öldü (restart) → stale. Kısa pencerede dokunma.
-            age = now - (j.started_at or j.created_at)
-            if age > STALE_THREAD_SEC:
-                j.status = "failed"
-                j.error = j.error or "Thread kayboldu (15dk+ running, stale)"
-                j.finished_at = time.time()
-                changed += 1
+            # Thread-based (pid=0): running→generating saniyeler sürer. 15dk+
+            # running kaldıysa thread gerçekten öldü (restart vb.) → stale.
+            if (now - (j.started_at or j.created_at)) > STALE_THREAD_SEC:
+                stale = True
+        if not stale:
+            continue
+        # Thread/process kayboldu = ALTYAPI hatası (restart/çökme), içerik/hesap
+        # hatası DEĞİL → hard-fail YERİNE taze retry farklı hesapta (kullanıcının
+        # "her hata → başka hesapla dene" mantığı). tried_profiles korunur.
+        n = getattr(j, "transient_retry_count", 0)
+        if n < TRANSIENT_RETRY_MAX:
+            j.status = "queued"
+            j.profile_id = ""
+            j.profile_name = ""
+            j.notebook_url = ""
+            j.error = ""
+            j.started_at = 0.0
+            j.finished_at = 0.0
+            j.pid = 0
+            j.harvest_status = "pending"
+            j.harvest_attempts = 0
+            j.next_harvest_at = 0.0
+            j.transient_retry_count = n + 1
+            j.next_dispatch_at = 0.0
+        else:
+            j.status = "failed"
+            j.error = (j.error or
+                       f"thread/process kayboldu ({TRANSIENT_RETRY_MAX} deneme tükendi)")
+            j.finished_at = time.time()
+        changed += 1
     if changed:
         save_jobs(jobs)
     return changed
@@ -2786,13 +2804,29 @@ class Worker:
                     j.harvest_attempts = 0
                     j.next_harvest_at = now2 + 120  # 2dk sonra ilk kontrol
                     n += 1
+                elif j.status in ("running", "submitted"):
+                    # Pipeline ortasında restart'la ölmüş (thread yok) → 15dk reaper'ı
+                    # BEKLEME, HEMEN taze retry farklı hesapta. tried_profiles korunur.
+                    j.status = "queued"
+                    j.profile_id = ""
+                    j.profile_name = ""
+                    j.notebook_url = ""
+                    j.error = ""
+                    j.started_at = 0.0
+                    j.finished_at = 0.0
+                    j.pid = 0
+                    j.harvest_status = "pending"
+                    j.harvest_attempts = 0
+                    j.next_harvest_at = 0.0
+                    j.next_dispatch_at = 0.0
+                    n += 1
             return n
 
         n = mutate_jobs(_m)
         if n:
             launcher_log(
-                f"Startup reconciliation: {n} öksüz 'generating' iş sweeper'a "
-                f"arm edildi (restart self-healing)")
+                f"Startup reconciliation: {n} öksüz iş kurtarıldı "
+                f"(generating→sweeper, running/submitted→taze retry farklı hesapta)")
 
     def _cleanup_uploaded_mp4s(self) -> None:
         """Azure'a yüklenmiş job'ların lokal MP4'lerini sil — disk sızıntısı önler.

@@ -160,6 +160,12 @@ GLOBAL_MAX_SUBMITTING = int(os.environ.get("GLOBAL_MAX_SUBMITTING", "2"))
 # proxy IP'den burst → "artifact removed". Bu sınır eşzamanlı ÜRETİMİ kısar:
 # az-paralel = burst yok. (default 4)
 GLOBAL_MAX_INFLIGHT = int(os.environ.get("GLOBAL_MAX_INFLIGHT", "4"))
+# "artifact removed" gibi GEÇİCİ Google hatalarında işi kaç kez TAZE (farklı
+# hesapta) yeniden deneyeceğiz. Hata olasılıksal (~%24; aynı script bir hesapta
+# oluyor, başka denemede olmuyor) → 8 denemede 0.25^8 ≈ %0.001 kalıcı-fail
+# (pratikte her iş eninde sonunda üretilir). tried_profiles her denemeyi farklı
+# hesaba yönlendirir.
+TRANSIENT_RETRY_MAX = int(os.environ.get("TRANSIENT_RETRY_MAX", "8"))
 # Profil NotebookLM kota hatası yedikten sonra kaç saat block kalır?
 # Google'ın gerçek reset zamanı Pacific time (~07-08:00 UTC) — bizim UTC date
 # rollover ile uyumsuz. 8h block + self-correct retry: max 8h overshoot,
@@ -332,8 +338,9 @@ class Job:
     batch_id: str = ""               # Toplu import batch'i (boş = tek job)
     version: int = 0                 # Bulk import versiyon no (1..N); 0 = legacy/tekil
     auth_retry_count: int = 0        # Auth-fail blip sonrası otomatik re-queue sayısı (bounded <3)
-    transient_retry_count: int = 0   # "artifact removed" muğlak hata sonrası bounded auto-requeue
+    transient_retry_count: int = 0   # "artifact removed" geçici hata sonrası taze-retry sayacı
     next_dispatch_at: float = 0.0    # queued iş için "bu ana kadar dispatch etme" (transient backoff)
+    tried_profiles: list = field(default_factory=list)  # bu iş için denenmiş profil id'leri (farklı-hesap rotasyonu)
     # Audit trail — script iteration geçmişi (Phase A)
     original_script: str = ""        # Kullanıcının ilk yapıştırdığı versiyon (AI iterasyonundan önce)
     iterations: list = field(default_factory=list)  # [{script, feedback, model, ts}, ...]
@@ -681,6 +688,7 @@ def _requeue_job(job_id: str) -> None:
                 j.harvest_error = ""
                 j.transient_retry_count = 0
                 j.next_dispatch_at = 0.0
+                j.tried_profiles = []
                 break
         return jobs
 
@@ -2661,7 +2669,7 @@ class Worker:
                     if j.id not in _ex or j.status != "generating":
                         continue
                     n = getattr(j, "transient_retry_count", 0)
-                    if n < 2:
+                    if n < TRANSIENT_RETRY_MAX:
                         j.status = "queued"
                         j.profile_id = ""
                         j.profile_name = ""
@@ -3384,9 +3392,15 @@ class Worker:
                 # Bu env için profil yok veya tüm slot'lar dolu —
                 # job kuyrukta bekler, sonraki round'da tekrar denenir
                 continue
-            # En eski kullanılan profili seç (round-robin)
-            matching.sort(key=lambda p: p.last_used)
-            target_profile = matching[0]
+            # Bu iş için DENENMEMİŞ profilleri tercih et → transient retry farklı
+            # hesaba düşer (kullanıcının "hata aldıysan başka hesapla dene" akışı).
+            # Hepsi denendiyse round-robin'e düş (tekrar denenebilir). En eski
+            # kullanılan önce (round-robin).
+            _tried = set(getattr(job, "tried_profiles", None) or [])
+            _untried = [p for p in matching if p.id not in _tried]
+            _pool = _untried if _untried else matching
+            _pool.sort(key=lambda p: p.last_used)
+            target_profile = _pool[0]
             self._launch_job(job, target_profile)
             slot_map[target_profile.id] -= 1
             submitting_now += 1  # global submission sayacı
@@ -3405,6 +3419,11 @@ class Worker:
         job.status = "running"
         job.started_at = time.time()
         job.error = ""
+        # Bu profil bu iş için denendi → transient retry'da farklı hesaba gidilsin.
+        _tp = list(job.tried_profiles or [])
+        if profile.id not in _tp:
+            _tp.append(profile.id)
+        job.tried_profiles = _tp
 
         # Phase E: Job paketini hazırla (script.txt + style guides + images)
         # Tek temp klasörde topla, automator'a path listeleri olarak ver.
@@ -3799,35 +3818,29 @@ class Worker:
                          or "disappeared from list" in err_msg)
                 )
                 if ambiguous_transient:
-                    # YENİ ÜRETİM BAŞLATMA — mevcut notebook'u KONTROL ETTİR.
-                    # Kanıt (2026-06-10): "artifact removed" diyen işlerin bir
-                    # kısmında video aslında TAMAMLANDI (resume MP4 buldu).
-                    # Eski davranış (hemen yeni notebook+gen) sorunu amplifiye
-                    # ediyordu: her hata → yeni gen → yük düşmüyor → kaskad +
-                    # kota israfı. Şimdi: job generating+skip kalır, sweeper
-                    # 10dk sonra notebook'a bakar (10/30/60dk backoff'la 3 kez).
-                    # Video geldiyse indirir → done (kota İSRAF EDİLMEDİ).
-                    # 3 kontrol de boşsa 2A bounded taze deneme yapar (max 2,
-                    # 15dk backoff, farklı hesap), o da biterse failed.
-                    def _m_arm(jobs_all, _e=e):
+                    # KÖKLÜ ÇÖZÜM (2026-06-12 veri analizi). "artifact was removed
+                    # from the list" = Google Cinematic'i BAŞLATIP artifact'ı
+                    # tamamlamadan SİLDİ → o notebook'ta video ASLA gelmez
+                    # (resume futile: 17/17 list-verify boş döndü). Hata OLASILIKSAL
+                    # (~%24), İÇERİĞE/HESABA BAĞLI DEĞİL (aynı script bir hesapta
+                    # oluyor, başka denemede olmuyor; aynı hesap hem ✅ hem ❌).
+                    #
+                    # Eski davranış (aynı notebook'u 10/30/60dk resume + sonra 2 taze)
+                    # ~80dk boşa harcayıp 0.25^2≈%6 kalıcı-fail bırakıyordu (5/80).
+                    #
+                    # Yeni: aynı notebook'u resume ETME → HEMEN farklı hesapta TAZE
+                    # dene (tried_profiles rotasyonu + cap=4 throttle), cömert bütçe.
+                    # 0.25^8 ≈ %0.001 → pratikte her iş eninde sonunda üretilir.
+                    def _m_transient(jobs_all, _e=e):
                         for j in jobs_all:
                             if j.id != job_id:
                                 continue
-                            if (j.notebook_url or "").strip():
-                                j.status = "generating"
-                                j.harvest_status = "skip"
-                                j.harvest_attempts = 0
-                                j.next_harvest_at = time.time() + 600  # 10dk
-                                j.error = ""
-                                return "sweeper-armed (notebook korundu, 10dk sonra kontrol)"
-                            # Notebook URL'i yok (çok erken patladı) → kontrol
-                            # edilecek bir şey yok; 2A'daki bounded taze deneme
-                            # mantığının aynısı:
                             n = getattr(j, "transient_retry_count", 0)
-                            if n < 2:
+                            if n < TRANSIENT_RETRY_MAX:
                                 j.status = "queued"
                                 j.profile_id = ""
                                 j.profile_name = ""
+                                j.notebook_url = ""   # artifact silinmiş notebook'u bırak
                                 j.error = ""
                                 j.started_at = 0.0
                                 j.finished_at = 0.0
@@ -3836,18 +3849,18 @@ class Worker:
                                 j.harvest_attempts = 0
                                 j.next_harvest_at = 0.0
                                 j.transient_retry_count = n + 1
-                                j.next_dispatch_at = time.time() + 900
-                                return f"taze deneme ({n + 1}/2, 15dk sonra)"
+                                j.next_dispatch_at = 0.0   # HEMEN (cap=4 zaten throttle)
+                                return f"taze deneme {n + 1}/{TRANSIENT_RETRY_MAX} (farklı hesap, hemen)"
                             j.status = "failed"
-                            j.error = (f"{_e.stage}: artifact removed "
-                                       f"(notebook'suz, retry bütçesi bitti)")
+                            j.error = (f"{_e.stage}: Google artifact removed — "
+                                       f"{TRANSIENT_RETRY_MAX} ayrı denemede de üretmedi")
                             j.finished_at = time.time()
-                            return "failed (retry tükendi)"
+                            return f"failed ({TRANSIENT_RETRY_MAX} deneme tükendi)"
                         return None
-                    _r = mutate_jobs(_m_arm)
+                    _r = mutate_jobs(_m_transient)
                     log_fp.write(
-                        f"## 'artifact removed' (kota DEĞİL) → {_r} — yeni gen "
-                        f"BAŞLATILMADI, hesap bloklanmadı\n")
+                        f"## 'artifact removed' GEÇİCİ (kota DEĞİL) → {_r} — "
+                        f"resume YOK, hemen farklı hesapta taze gen\n")
                     log_fp.flush()
                     return
                 is_quota = (

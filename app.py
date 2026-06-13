@@ -337,6 +337,7 @@ class Job:
     submitted_by: str = ""           # Kullanıcının kendi adı (user view session_state'inden)
     batch_id: str = ""               # Toplu import batch'i (boş = tek job)
     version: int = 0                 # Bulk import versiyon no (1..N); 0 = legacy/tekil
+    priority: float = 0.0            # Dispatch önceliği — yüksek önce. Öncelikli batch=time.time() (yeni=üstte); 0=normal FIFO
     auth_retry_count: int = 0        # Auth-fail blip sonrası otomatik re-queue sayısı (bounded <3)
     transient_retry_count: int = 0   # "artifact removed" geçici hata sonrası taze-retry sayacı
     next_dispatch_at: float = 0.0    # queued iş için "bu ana kadar dispatch etme" (transient backoff)
@@ -3300,6 +3301,9 @@ class Worker:
         # Backoff'ta olan (transient retry beklemede) queued işleri dispatch ETME.
         queued = [j for j in jobs if j.status == "queued"
                   and (getattr(j, "next_dispatch_at", 0) or 0) <= _now]
+        # ÖNCELİK sırası: yüksek priority önce (öncelikli batch sıranın başına),
+        # eşitlikte FIFO (created_at). priority=0 normal işler en sonda.
+        queued.sort(key=lambda j: (-(getattr(j, "priority", 0) or 0), j.created_at))
         if not queued:
             return
 
@@ -3357,6 +3361,7 @@ class Worker:
             jobs = load_jobs()
             queued = [j for j in jobs if j.status == "queued"
                       and (getattr(j, "next_dispatch_at", 0) or 0) <= time.time()]
+            queued.sort(key=lambda j: (-(getattr(j, "priority", 0) or 0), j.created_at))
             if not queued:
                 return
 
@@ -5457,6 +5462,16 @@ def render_bulk_drive_section(*, key_prefix: str = "blk") -> None:
         "Kaç versiyon üretilsin? (her dosya bu kadar kez → v1..vN)",
         min_value=1, max_value=8, value=1, step=1, key=versions_key,
     ))
+    # Öncelik: işaretliyse bu batch sıranın BAŞINA geçer (bekleyen normal işler
+    # durur gibi bekler), bitince eski işler kaldığı yerden devam eder. Çalışan
+    # işler öldürülmez (boşa gitmez) — yeni dispatch'ler bu batch'e gider.
+    _priority_key = f"{key_prefix}_bulk_priority"
+    _is_priority = st.checkbox(
+        "⚡ Öncelikli — bu linki sıranın başına al",
+        key=_priority_key,
+        help="Bekleyen diğer toplu işler beklemeye geçer, önce bu link üretilir. "
+             "Bitince diğerleri kaldığı yerden devam eder. Çalışan videolar kesilmez.",
+    )
 
     # Drive Toplu default: tek bir script + guide kullanıldığında {{SOURCES_LIST}}
     # bulk submit anında render edilemiyor (asset listesi yok). Statik versiyon —
@@ -5762,6 +5777,9 @@ def render_bulk_drive_section(*, key_prefix: str = "blk") -> None:
             if result:
                 existing = load_jobs()
                 created_jobs: list = []
+                # Öncelikli batch → priority=now (yeni öncelikli batch'ler eskinin
+                # de üstüne çıkar). Normal=0 (FIFO en sonda).
+                _batch_priority = time.time() if st.session_state.get(_priority_key) else 0.0
                 # Batch oluştur — tüm job'lar (tüm versiyonlar) aynı oturuma bağlı
                 _batch_id = uuid.uuid4().hex[:12]
                 _n_files = len(result["created"])
@@ -5790,6 +5808,7 @@ def render_bulk_drive_section(*, key_prefix: str = "blk") -> None:
                                 environment=jd.get("environment", "prod"),
                                 batch_id=_batch_id,
                                 version=_v,
+                                priority=_batch_priority,
                             )
                             j.assets = []
                             created_jobs.append(j)
@@ -7728,7 +7747,11 @@ def render_user_view() -> None:
                 _flabel = _fk[:30] + ("…" if len(_fk) > 30 else "")
             else:
                 _flabel = _fk[:16] + ("…" if len(_fk) > 16 else "")
-            _fhead = (f"📁 {_flabel}  ·  {len(_titles)} video  ·  ✅ {_f_done}/{_f_tot}"
+            # Öncelikli batch (bekleyen işi priority>0) → ⚡ rozeti
+            _f_prio = any((getattr(j, "priority", 0) or 0) > 0 and j.status == "queued"
+                          for j in _all_jobs)
+            _fhead = ((f"⚡ " if _f_prio else "")
+                      + f"📁 {_flabel}  ·  {len(_titles)} video  ·  ✅ {_f_done}/{_f_tot}"
                       + (f"  ·  🎬 {_f_gen}" if _f_gen else "")
                       + (f"  ·  ⏳ {_f_q}" if _f_q else ""))
             # Aktif iş olan klasör açık başlar; tamamen bitmiş klasör kapalı.

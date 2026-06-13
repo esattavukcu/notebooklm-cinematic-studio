@@ -166,6 +166,12 @@ GLOBAL_MAX_INFLIGHT = int(os.environ.get("GLOBAL_MAX_INFLIGHT", "4"))
 # (pratikte her iş eninde sonunda üretilir). tried_profiles her denemeyi farklı
 # hesaba yönlendirir.
 TRANSIENT_RETRY_MAX = int(os.environ.get("TRANSIENT_RETRY_MAX", "8"))
+# "artifact removed" retry'larında ARTAN backoff (saniye). İlk 1 deneme HEMEN
+# (bağımsız flake'i hızlı yakala), sonrakiler aralıklı → SÜREKLİ kötü pencereyi
+# (Google'ın dakikalarca reddettiği anlar; tek proxy IP burst) atlatır. Kanıt:
+# 8 hemen-retry 3 dakikada aynı kötü pencerede tükendi → pencere geçince bütçe
+# bitmişti. Bu schedule 8 denemeyi ~1.5 saate yayar (pencereyi bekler).
+TRANSIENT_BACKOFF_SEC = [0, 60, 180, 600, 1200, 1800, 2700, 3600]
 # Profil NotebookLM kota hatası yedikten sonra kaç saat block kalır?
 # Google'ın gerçek reset zamanı Pacific time (~07-08:00 UTC) — bizim UTC date
 # rollover ile uyumsuz. 8h block + self-correct retry: max 8h overshoot,
@@ -3876,6 +3882,8 @@ class Worker:
                                 continue
                             n = getattr(j, "transient_retry_count", 0)
                             if n < TRANSIENT_RETRY_MAX:
+                                _wait = TRANSIENT_BACKOFF_SEC[
+                                    min(n, len(TRANSIENT_BACKOFF_SEC) - 1)]
                                 j.status = "queued"
                                 j.profile_id = ""
                                 j.profile_name = ""
@@ -3888,8 +3896,10 @@ class Worker:
                                 j.harvest_attempts = 0
                                 j.next_harvest_at = 0.0
                                 j.transient_retry_count = n + 1
-                                j.next_dispatch_at = 0.0   # HEMEN (cap=4 zaten throttle)
-                                return f"taze deneme {n + 1}/{TRANSIENT_RETRY_MAX} (farklı hesap, hemen)"
+                                # Artan backoff → kötü pencereyi atlat (ilk=hemen)
+                                j.next_dispatch_at = time.time() + _wait
+                                _wlbl = "hemen" if _wait == 0 else f"{_wait // 60}dk sonra"
+                                return f"taze deneme {n + 1}/{TRANSIENT_RETRY_MAX} (farklı hesap, {_wlbl})"
                             j.status = "failed"
                             j.error = (f"{_e.stage}: Google artifact removed — "
                                        f"{TRANSIENT_RETRY_MAX} ayrı denemede de üretmedi")

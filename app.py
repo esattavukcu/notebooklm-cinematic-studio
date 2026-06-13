@@ -7713,28 +7713,40 @@ def render_user_view() -> None:
                     _n_tot = len(_vjobs)
                     _n_ok = sum(1 for j in _vjobs
                                 if j.status == "done" or (j.video_remote_url or "").strip())
+                    def _short_acct(nm):
+                        nm = (nm or "").split("@")[0]
+                        for s in (".ho", ".twin.ai"):
+                            nm = nm.replace(s, "")
+                        return nm
+
                     _chips = []
                     for _i, j in enumerate(_vjobs, 1):
+                        # Üreten hesabı çipe yaz (atanmışsa) → hangi NotebookLM'de
+                        # bakacağını görsün. Hover'da tam hesap adı.
+                        _acct = _short_acct(j.profile_name)
+                        _albl = f" {_esc(_acct)}" if _acct else ""
+                        _tip = (f"hesap: {_esc(j.profile_name)}" if j.profile_name
+                                else "hesap atanmadı")
                         _url = j.video_remote_url
                         if not _url and j.status == "stopped":
                             _url = _closed_job_url(j)
                         if _url:
                             _chips.append(
-                                f"<a href='{_url}' target='_blank' style='{_CHIP_BASE}"
+                                f"<a href='{_url}' target='_blank' title='{_tip}' style='{_CHIP_BASE}"
                                 f"background:rgba(22,137,62,0.14); color:#16893E; "
-                                f"text-decoration:none;'>v{_i} ▶</a>")
+                                f"text-decoration:none;'>v{_i}{_albl} ▶</a>")
                         elif j.status in ("generating", "running"):
                             _chips.append(
-                                f"<span style='{_CHIP_BASE}background:rgba(37,99,235,0.14); "
-                                f"color:#2563EB;'>v{_i} 🎬</span>")
+                                f"<span title='{_tip}' style='{_CHIP_BASE}background:rgba(37,99,235,0.14); "
+                                f"color:#2563EB;'>v{_i}{_albl} 🎬</span>")
                         elif j.status in ("queued", "submitted"):
                             _chips.append(
-                                f"<span style='{_CHIP_BASE}background:rgba(251,191,36,0.18); "
+                                f"<span title='{_tip}' style='{_CHIP_BASE}background:rgba(251,191,36,0.18); "
                                 f"color:#9A6B00;'>v{_i} ⏳</span>")
                         elif j.status == "failed":
                             _chips.append(
-                                f"<span style='{_CHIP_BASE}background:rgba(239,68,68,0.14); "
-                                f"color:#DC2626;'>v{_i} ❌</span>")
+                                f"<span title='{_tip}' style='{_CHIP_BASE}background:rgba(239,68,68,0.14); "
+                                f"color:#DC2626;'>v{_i}{_albl} ❌</span>")
                         else:
                             _chips.append(
                                 f"<span style='{_CHIP_BASE}background:rgba(148,163,184,0.16); "
@@ -7779,12 +7791,15 @@ def render_user_view() -> None:
                         f'title="{_esc(j.title)}">{_esc(title_short)}</div>',
                         unsafe_allow_html=True,
                     )
-                    # Gönderen etiketi — kim oluşturdu (paylaşımlı görünüm için)
+                    # Gönderen + ÜRETEN HESAP (hangi NotebookLM'de bakacağını görsün)
                     _sb = (j.submitted_by or "").strip() or "?"
                     _who = "👤 sen" if mine else f"👤 {_esc(_sb)}"
+                    _pacct = (j.profile_name or "").split("@")[0].replace(".ho", "").replace(".twin.ai", "")
+                    _acct_part = (f" &nbsp;·&nbsp; 🤖 <b>{_esc(_pacct)}</b>"
+                                  if _pacct else "")
                     st.markdown(
                         f'<div style="font-size:0.72rem; opacity:0.6; margin-top:1px;">'
-                        f'{_who}</div>',
+                        f'{_who}{_acct_part}</div>',
                         unsafe_allow_html=True,
                     )
                     # Status'a göre alt-açıklama
